@@ -1,0 +1,113 @@
+<div class="analytics-page">
+  <div class="header-row">
+    <h1 class="page-title">Performance Analytics</h1>
+    <div class="tab-switcher">
+      <button [class.active]="activeTab==='paper'" (click)="activeTab='paper'" class="tab-btn paper-tab">Paper</button>
+      <button [class.active]="activeTab==='live'" (click)="activeTab='live'" class="tab-btn live-tab">Live</button>
+    </div>
+    <div class="date-filter">
+      <label class="date-label">From:</label>
+      <input type="date" [(ngModel)]="dateFrom" (change)="loadAnalytics()" class="date-input" />
+      <label class="date-label">To:</label>
+      <input type="date" [(ngModel)]="dateTo" (change)="loadAnalytics()" class="date-input" />
+    </div>
+    <button class="btn-refresh" (click)="loadAnalytics()">Refresh</button>
+  </div>
+
+  <!-- LOADING SPINNER -->
+  <div class="loading-overlay" *ngIf="loading">
+    <div class="spinner"></div>
+    <span class="loading-text">Loading analytics...</span>
+  </div>
+
+  <div *ngIf="!loading && analytics">
+    <div class="stats-grid">
+      <div class="glass-card stat-card">
+        <div class="stat-label">Total Trades</div>
+        <div class="stat-value">{{ analytics.total_trades }}</div>
+        <div class="stat-sub">{{ analytics.open_trades }} open / {{ analytics.closed_trades }} closed</div>
+      </div>
+      <div class="glass-card stat-card">
+        <div class="stat-label">Win Rate</div>
+        <div class="stat-value" [ngClass]="analytics.win_rate >= 50 ? 'positive' : 'negative'">
+          {{ analytics.win_rate | number:'1.1-1' }}%
+        </div>
+        <div class="stat-sub">{{ analytics.wins }}W / {{ analytics.losses }}L</div>
+      </div>
+      <div class="glass-card stat-card">
+        <div class="stat-label">Total P&amp;L</div>
+        <div class="stat-value" [ngClass]="getPnlClass(analytics.total_pnl)">
+          &#8377;{{ analytics.total_pnl | number:'1.2-2' }}
+        </div>
+      </div>
+      <div class="glass-card stat-card">
+        <div class="stat-label">Profit Factor</div>
+        <div class="stat-value" [ngClass]="profitFactor >= 1 ? 'positive' : 'negative'">
+          {{ profitFactor | number:'1.2-2' }}
+        </div>
+      </div>
+    </div>
+
+    <div class="stats-grid secondary">
+      <div class="glass-card stat-card">
+        <div class="stat-label">Avg Profit</div>
+        <div class="stat-value positive">+{{ analytics.avg_profit | number:'1.2-2' }}%</div>
+      </div>
+      <div class="glass-card stat-card">
+        <div class="stat-label">Avg Loss</div>
+        <div class="stat-value negative">{{ analytics.avg_loss | number:'1.2-2' }}%</div>
+      </div>
+      <div class="glass-card stat-card">
+        <div class="stat-label">Avg Duration</div>
+        <div class="stat-value">{{ formatDuration(analytics.avg_duration_minutes) }}</div>
+      </div>
+      <div class="glass-card stat-card">
+        <div class="stat-label">W/L Ratio</div>
+        <div class="stat-value">{{ winLossRatio | number:'1.2-2' }}</div>
+      </div>
+    </div>
+
+    <!-- Win/Loss Bar -->
+    <div class="glass-card visual-card" *ngIf="analytics.closed_trades > 0">
+      <h3 class="panel-title">Win/Loss Distribution</h3>
+      <div class="wl-bar">
+        <div class="wl-wins" [style.width.%]="analytics.win_rate">
+          <span>{{ analytics.wins }} Wins</span>
+        </div>
+        <div class="wl-losses" [style.width.%]="100 - analytics.win_rate">
+          <span>{{ analytics.losses }} Losses</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent Trades -->
+    <div class="glass-card recent-card" *ngIf="analytics.recent_trades?.length > 0">
+      <h3 class="panel-title">Recent Closed Trades</h3>
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr><th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th><th>P&amp;L %</th><th>Result</th><th>Duration</th><th>Reason</th></tr>
+          </thead>
+          <tbody>
+            <tr *ngFor="let t of analytics.recent_trades">
+              <td class="trade-symbol">{{ formatSymbol(t.symbol) }}</td>
+              <td><span class="badge" [ngClass]="t.side === 'BUY' ? 'badge-buy' : 'badge-sell'">{{ t.side || t.direction }}</span></td>
+              <td>&#8377;{{ t.entry_price | number:'1.2-2' }}</td>
+              <td>&#8377;{{ t.exit_price | number:'1.2-2' }}</td>
+              <td [ngClass]="getPnlClass(t.pnl_percent)">
+                {{ t.pnl_percent > 0 ? '+' : '' }}{{ t.pnl_percent | number:'1.2-2' }}%
+              </td>
+              <td><span class="badge" [ngClass]="getResultClass(t.result)">{{ t.result }}</span></td>
+              <td>{{ formatDuration(t.duration_minutes) }}</td>
+              <td>{{ t.exit_reason || '-' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div *ngIf="!loading && !analytics" class="no-data">
+    No {{ activeTab }} trading analytics available yet.
+  </div>
+</div>

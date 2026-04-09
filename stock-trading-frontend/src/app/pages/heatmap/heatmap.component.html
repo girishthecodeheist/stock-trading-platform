@@ -1,0 +1,58 @@
+<div class="heatmap-page">
+  <div class="header-row">
+    <h2 class="page-title">NSE Heatmap</h2>
+    <div class="header-info">
+      <span class="stock-count">{{ totalStocks }} stocks</span>
+      <span class="last-poll" *ngIf="lastPoll">{{ backdateMode ? 'Date: ' + lastPoll : 'Last: ' + lastPoll }}</span>
+      <button class="btn-refresh" (click)="refreshHeatmap()" [disabled]="loading" *ngIf="!backdateMode">
+        {{ loading ? 'Fetching...' : 'Refresh from NSE' }}
+      </button>
+      <button class="btn-refresh btn-live" (click)="loadHeatmap()" *ngIf="backdateMode">
+        Back to Live
+      </button>
+    </div>
+  </div>
+
+  <!-- Backdate Simulation Panel -->
+  <div class="glass-card backdate-panel">
+    <div class="backdate-row">
+      <span class="backdate-label">Load Historical Data:</span>
+      <input type="date" [(ngModel)]="selectedDate" class="date-input" [max]="getTodayStr()" />
+      <button class="btn-backdate" (click)="loadBackdate()" [disabled]="loading">
+        {{ loading ? 'Loading...' : 'Load Date' }}
+      </button>
+    </div>
+    <div class="backdate-info" *ngIf="backdateMode">
+      <span class="backdate-badge">SIMULATION MODE</span>
+      <span class="source-badge">Source: {{ backdateSource === 'database' ? 'Cached' : 'Fyers Historical' }}</span>
+    </div>
+    <div class="backdate-error" *ngIf="backdateError">{{ backdateError }}</div>
+  </div>
+
+  <div class="sector-row">
+    <div *ngFor="let sec of sectors" class="sector-chip"
+         [class.bullish]="sec.avg_change > 0" [class.bearish]="sec.avg_change < 0"
+         [class.selected]="selectedSector === sec.name"
+         (click)="filterBySector(sec.name)">
+      <div class="sector-name">{{ sec.name }}</div>
+      <div class="sector-change" [class.pos]="sec.avg_change > 0" [class.neg]="sec.avg_change < 0">
+        {{ sec.avg_change > 0 ? '&#9650;' : '&#9660;' }} {{ sec.avg_change }}%
+      </div>
+      <div class="sector-count">{{ sec.stock_count }} stocks</div>
+    </div>
+  </div>
+  <div class="glass-card">
+    <div class="heatmap-grid" *ngIf="filteredStocks.length > 0">
+      <div *ngFor="let s of filteredStocks" class="heat-tile" [ngClass]="getChangeClass(s.change_pct)"
+           [routerLink]="['/chart']" [queryParams]="{symbol: s.symbol}">
+        <div class="tile-sym">{{ s.display_symbol || s.display_sym }}</div>
+        <div class="tile-change">{{ s.change_pct > 0 ? '+' : '' }}{{ s.change_pct }}%</div>
+        <div class="tile-price">&#8377;{{ s.ltp }}</div>
+        <div class="tile-sector">{{ s.sector }}</div>
+      </div>
+    </div>
+    <div class="no-data" *ngIf="filteredStocks.length === 0 && !loading">
+      No heatmap data. Click "Refresh from NSE" to fetch live data or select a past date.
+    </div>
+  </div>
+</div>

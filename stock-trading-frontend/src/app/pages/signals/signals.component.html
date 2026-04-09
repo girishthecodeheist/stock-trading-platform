@@ -1,0 +1,98 @@
+<div class="signals-page fade-in">
+  <!-- LOADING SPINNER -->
+  <div class="loading-overlay" *ngIf="loading">
+    <div class="spinner"></div>
+    <span class="loading-text">Scanning signals...</span>
+  </div>
+
+  <div class="header-row">
+    <h2 class="page-title">Live Signals</h2>
+    <div class="header-right">
+      <span class="market-badge" [class.open]="marketOpen">
+        {{marketOpen ? 'MARKET OPEN' : 'MARKET CLOSED'}}
+      </span>
+      <span class="last-update-badge" *ngIf="lastUpdate">Updated: {{ lastUpdate }}</span>
+      <button class="btn-refresh" (click)="refreshNow()" [disabled]="refreshing">
+        {{ refreshing ? 'Refreshing...' : 'Refresh Now' }}
+      </button>
+      <div class="scanner-controls">
+        <span class="scanner-badge" [class.running]="scannerStatus?.scanner_running">
+          Scanner: {{ scannerStatus?.scanner_running ? 'RUNNING' : 'PAUSED' }}
+        </span>
+        <button class="btn-toggle" (click)="toggleScanner()">
+          {{ scannerStatus?.scanner_running ? 'Pause' : 'Start' }}
+        </button>
+        <button class="btn-toggle auto-trade-btn" [class.enabled]="scannerStatus?.auto_trade_enabled" (click)="toggleAutoTrade()">
+          Auto-Trade: {{ scannerStatus?.auto_trade_enabled ? 'ON' : 'OFF' }}
+        </button>
+        <span class="universe-count" *ngIf="scannerStatus?.universe_size">
+          {{ scannerStatus?.universe_size }} stocks
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Timeframe Selector -->
+  <div class="timeframe-row glass-card">
+    <span class="control-label">Timeframe:</span>
+    <button class="tf-btn" [class.active]="timeframe === '1m'" (click)="setTimeframe('1m')">1m</button>
+    <button class="tf-btn" [class.active]="timeframe === '5m'" (click)="setTimeframe('5m')">5m</button>
+    <button class="tf-btn" [class.active]="timeframe === '15m'" (click)="setTimeframe('15m')">15m</button>
+    <button class="tf-btn" [class.active]="timeframe === '1D'" (click)="setTimeframe('1D')">1D</button>
+  </div>
+
+  <!-- Filter & Sort Controls -->
+  <div class="controls-row glass-card">
+    <div class="filter-group">
+      <span class="control-label">Filter:</span>
+      <button class="filter-btn" [class.active]="filterType === 'ALL'" (click)="setFilter('ALL')">All</button>
+      <button class="filter-btn buy" [class.active]="filterType === 'BUY'" (click)="setFilter('BUY')">Buy</button>
+      <button class="filter-btn sell" [class.active]="filterType === 'SELL'" (click)="setFilter('SELL')">Sell</button>
+      <button class="filter-btn neutral" [class.active]="filterType === 'NEUTRAL'" (click)="setFilter('NEUTRAL')">Neutral</button>
+    </div>
+    <div class="sort-group">
+      <span class="control-label">Sort:</span>
+      <button class="sort-btn" [class.active]="sortBy === 'score'" (click)="setSort('score')">Score</button>
+      <button class="sort-btn" [class.active]="sortBy === 'confidence'" (click)="setSort('confidence')">Confidence</button>
+      <button class="sort-btn" [class.active]="sortBy === 'change'" (click)="setSort('change')">Change%</button>
+    </div>
+    <div class="signal-count">
+      {{filteredSignals.length}} signal{{filteredSignals.length !== 1 ? 's' : ''}}
+      <span class="live-dot" *ngIf="marketOpen"></span>
+    </div>
+  </div>
+
+  <div class="glass-card">
+    <div class="signals-table" *ngIf="filteredSignals.length > 0">
+      <table>
+        <thead>
+          <tr><th>Symbol</th><th>Signal</th><th>Change%</th><th>Confidence</th><th>Score</th><th>LTP</th><th>SL</th><th>Target</th><th>Time</th><th>Action</th></tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let s of filteredSignals" [class.highlight-buy]="(s.signal || '').includes('BUY')" [class.highlight-sell]="(s.signal || '').includes('SELL')">
+            <td class="sym-cell">{{ s.name || s.symbol }}</td>
+            <td><span class="signal-badge" [ngClass]="getSignalClass(s.signal || s.signal_type)">{{ s.signal || s.signal_type }}</span></td>
+            <td [ngClass]="{'positive': (s.change_pct || 0) > 0, 'negative': (s.change_pct || 0) < 0}">{{ s.change_pct | number:'1.2-2' }}%</td>
+            <td>
+              <div class="conf-mini-bar">
+                <div class="conf-mini-fill" [style.width.%]="s.confidence || 0"
+                     [ngClass]="{'green': (s.score || 0) > 0, 'red': (s.score || 0) < 0}"></div>
+              </div>
+              <span class="conf-text-sm">{{s.confidence || 0}}%</span>
+            </td>
+            <td [ngClass]="{'positive': (s.score || 0) > 0, 'negative': (s.score || 0) < 0}">{{ s.score }}</td>
+            <td class="ltp-cell">&#8377;{{ s.ltp | number:'1.2-2' }}</td>
+            <td class="negative">&#8377;{{ s.stop_loss | number:'1.2-2' }}</td>
+            <td class="positive">&#8377;{{ s.target_1 | number:'1.2-2' }}</td>
+            <td class="time-cell">{{ s.signal_time || '—' }}</td>
+            <td><a [routerLink]="['/chart']" [queryParams]="{symbol: s.symbol}" class="btn-chart">Analyze</a></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="no-data" *ngIf="filteredSignals.length === 0">
+      <p>No {{filterType !== 'ALL' ? filterType + ' ' : ''}}signals found.</p>
+      <p *ngIf="!scannerStatus?.scanner_running">Start the scanner to generate new signals.</p>
+    </div>
+  </div>
+</div>

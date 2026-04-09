@@ -1,0 +1,63 @@
+.trades-page { padding: 20px; max-width: 1400px; margin: 0 auto; }
+.page-title { font-size: 1.5rem; font-weight: 700; margin-bottom: 20px; color: #e0e0e0; }
+.filters {
+  display: flex; gap: 16px; align-items: center; margin-bottom: 16px; flex-wrap: wrap;
+  .filter-group {
+    display: flex; align-items: center; gap: 6px;
+    label { font-size: 0.8rem; color: #999; }
+    select {
+      background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+      color: #e0e0e0; padding: 6px 10px; border-radius: 6px; font-size: 0.8rem;
+    }
+  }
+  .trade-summary { margin-left: auto; font-size: 0.8rem; color: #888; }
+}
+.glass-card { padding: 16px; border-radius: 16px; }
+.trades-table {
+  overflow-x: auto;
+  table {
+    width: 100%; border-collapse: collapse;
+    th, td { padding: 10px 12px; text-align: left; font-size: 0.8rem; white-space: nowrap; }
+    th { color: #888; font-weight: 500; border-bottom: 1px solid rgba(255,255,255,0.08); }
+    td { color: #ccc; border-bottom: 1px solid rgba(255,255,255,0.04); }
+    .paper-row { border-left: 3px solid #42a5f5; }
+    .live-row { border-left: 3px solid #ffa726; }
+    .sym-cell { font-weight: 600; }
+  }
+}
+.badge {
+  padding: 2px 6px; border-radius: 4px; font-size: 0.65rem; font-weight: 700;
+  &.paper { background: rgba(66,165,245,0.15); color: #42a5f5; }
+  &.live { background: rgba(255,167,38,0.15); color: #ffa726; }
+  &.auto { background: rgba(171,71,188,0.18); color: #ce93d8; }
+  &.manual { background: rgba(120,144,156,0.15); color: #90a4ae; }
+}
+.status-open { color: #42a5f5; font-weight: 600; }
+.status-closed { color: #888; }
+.positive { color: #66bb6a !important; font-weight: 600; }
+.negative { color: #ef5350 !important; font-weight: 600; }
+.btn-close-trade {
+  padding: 4px 10px; background: rgba(239,83,80,0.15); color: #ef5350;
+  border: 1px solid rgba(239,83,80,0.3); border-radius: 4px; cursor: pointer; font-size: 0.7rem;
+  &:hover { background: rgba(239,83,80,0.3); }
+}
+.no-data { text-align: center; padding: 24px; color: #666; font-size: 0.85rem; }
+/* Loading Spinner */
+.loading-overlay {
+  display: flex; align-items: center; justify-content: center; gap: 12px;
+  padding: 40px; margin-bottom: 20px;
+  .spinner {
+    width: 32px; height: 32px; border: 3px solid rgba(66,165,245,0.2);
+    border-top-color: #42a5f5; border-radius: 50%; animation: spin 0.8s linear infinite;
+  }
+  .loading-text { color: #888; font-size: 0.85rem; }
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.tf-badge {
+  padding: 2px 6px; border-radius: 4px; font-size: 0.65rem; font-weight: 600;
+  background: rgba(66,165,245,0.12); color: #64b5f6;
+}
+.analysis-badge {
+  padding: 2px 6px; border-radius: 4px; font-size: 0.65rem; font-weight: 600;
+  background: rgba(171,71,188,0.12); color: #ce93d8;
+}

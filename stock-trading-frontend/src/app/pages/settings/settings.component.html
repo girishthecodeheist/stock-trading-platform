@@ -1,0 +1,161 @@
+<div class="settings-page">
+  <h2 class="page-title">Settings</h2>
+
+  <div class="glass-card settings-section">
+    <h3 class="section-title">Paper Trade Engine</h3>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <label>Simulated Capital (&#8377;)</label>
+        <input type="number" [(ngModel)]="settings.simulated_capital" />
+      </div>
+      <div class="setting-row">
+        <label>Default SL %</label>
+        <input type="number" [(ngModel)]="settings.default_sl_percent" step="0.1" />
+      </div>
+      <div class="setting-row">
+        <label>Default Target %</label>
+        <input type="number" [(ngModel)]="settings.default_target_percent" step="0.1" />
+      </div>
+      <div class="setting-row">
+        <label>Default Quantity</label>
+        <input type="number" [(ngModel)]="settings.default_quantity" />
+      </div>
+      <div class="setting-row">
+        <label>Max Open Trades</label>
+        <input type="number" [(ngModel)]="settings.max_open_trades" />
+      </div>
+      <div class="setting-row toggle-row">
+        <label>Auto-Calculate Quantity</label>
+        <div class="toggle-switch">
+          <input type="checkbox" [(ngModel)]="settings.auto_quantity_enabled" id="autoQty" />
+          <label for="autoQty" class="toggle-label">
+            {{ settings.auto_quantity_enabled ? 'ON' : 'OFF' }}
+          </label>
+        </div>
+        <small class="toggle-hint">When ON, quantity is auto-calculated based on P&amp;L limits and share price</small>
+      </div>
+    </div>
+  </div>
+
+  <!-- Smart Quantity Calculator -->
+  <div class="glass-card settings-section calculator-section">
+    <h3 class="section-title">Smart Quantity Calculator</h3>
+    <p class="calc-desc">Enter a stock price to see the optimal quantity based on your P&amp;L limits.</p>
+    <div class="calc-row">
+      <div class="setting-row">
+        <label>Stock Entry Price (&#8377;)</label>
+        <input type="number" [(ngModel)]="calcEntryPrice" placeholder="e.g. 2500" />
+      </div>
+      <button class="btn-calc" (click)="calculateQuantity()" [disabled]="!calcEntryPrice">Calculate</button>
+    </div>
+    <div class="calc-result" *ngIf="calcResult?.success">
+      <div class="result-grid">
+        <div class="result-item highlight">
+          <span class="result-label">Optimal Quantity</span>
+          <span class="result-value big">{{ calcResult.quantity }}</span>
+        </div>
+        <div class="result-item">
+          <span class="result-label">Total Investment</span>
+          <span class="result-value">&#8377;{{ calcResult.total_investment }}</span>
+        </div>
+        <div class="result-item loss-item">
+          <span class="result-label">Potential Loss</span>
+          <span class="result-value negative">&#8377;{{ calcResult.potential_loss }}</span>
+        </div>
+        <div class="result-item profit-item">
+          <span class="result-label">Potential Profit</span>
+          <span class="result-value positive">&#8377;{{ calcResult.potential_profit }}</span>
+        </div>
+        <div class="result-item">
+          <span class="result-label">SL/Share</span>
+          <span class="result-value">&#8377;{{ calcResult.sl_per_share }}</span>
+        </div>
+        <div class="result-item">
+          <span class="result-label">Target/Share</span>
+          <span class="result-value">&#8377;{{ calcResult.target_per_share }}</span>
+        </div>
+      </div>
+      <div class="breakdown" *ngIf="calcResult.breakdown">
+        <span class="break-title">Breakdown:</span>
+        <span>Loss limit: {{ calcResult.breakdown.qty_from_loss_limit }} qty</span>
+        <span>Profit target: {{ calcResult.breakdown.qty_from_profit_target }} qty</span>
+        <span>Capital limit: {{ calcResult.breakdown.qty_from_capital }} qty</span>
+      </div>
+    </div>
+    <div class="calc-error" *ngIf="calcResult && !calcResult.success">{{ calcResult.error }}</div>
+  </div>
+
+  <div class="glass-card settings-section">
+    <h3 class="section-title">Day Limits - Paper</h3>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <label>Max Loss per Day (&#8377;)</label>
+        <input type="number" [(ngModel)]="settings.day_max_loss_paper" step="100" />
+      </div>
+      <div class="setting-row">
+        <label>Profit Target / Day (&#8377;)</label>
+        <input type="number" [(ngModel)]="settings.day_profit_target_paper" step="100" />
+      </div>
+    </div>
+  </div>
+
+  <div class="glass-card settings-section">
+    <h3 class="section-title">Day Limits - Live</h3>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <label>Max Loss per Day (&#8377;)</label>
+        <input type="number" [(ngModel)]="settings.day_max_loss_live" step="100" />
+      </div>
+      <div class="setting-row">
+        <label>Profit Target / Day (&#8377;)</label>
+        <input type="number" [(ngModel)]="settings.day_profit_target_live" step="100" />
+      </div>
+    </div>
+  </div>
+
+  <div class="glass-card settings-section">
+    <h3 class="section-title">Heatmap Scanner</h3>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <label>Scan Frequency (min)</label>
+        <input type="number" [(ngModel)]="settings.scan_frequency_minutes" />
+      </div>
+      <div class="setting-row">
+        <label>Top Movers Count</label>
+        <input type="number" [(ngModel)]="settings.top_movers_count" />
+      </div>
+      <div class="setting-row">
+        <label>Min Change %</label>
+        <input type="number" [(ngModel)]="settings.min_change_pct" step="0.1" />
+      </div>
+      <div class="setting-row">
+        <label>Min Volume</label>
+        <input type="number" [(ngModel)]="settings.min_volume" step="10000" />
+      </div>
+    </div>
+    <div class="scanner-status">
+      <span class="scanner-badge" [class.running]="scannerStatus?.scanner_running">
+        Scanner: {{ scannerStatus?.scanner_running ? 'RUNNING' : 'PAUSED' }}
+      </span>
+      <button class="btn-toggle" (click)="toggleScanner()">
+        {{ scannerStatus?.scanner_running ? 'Pause Scanner' : 'Start Scanner' }}
+      </button>
+    </div>
+  </div>
+
+  <div class="glass-card settings-section">
+    <h3 class="section-title">Fyers Connection</h3>
+    <div class="fyers-info">
+      <div class="connection-row">
+        <span class="dot" [class.connected]="fyersStatus?.authenticated"></span>
+        <span>{{ fyersStatus?.authenticated ? 'Connected' : 'Disconnected' }}</span>
+        <button *ngIf="!fyersStatus?.authenticated" class="btn-connect" (click)="connectFyers()">Connect Fyers</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="save-row">
+    <button class="btn-save" (click)="saveSettings()">Save Settings</button>
+    <span class="save-msg" *ngIf="saveMessage">{{ saveMessage }}</span>
+  </div>
+</div>

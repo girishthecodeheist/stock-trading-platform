@@ -1,0 +1,239 @@
+<div class="dashboard-page">
+  <h2 class="page-title">Dashboard</h2>
+
+  <!-- LOADING SPINNER -->
+  <div class="loading-overlay" *ngIf="loading">
+    <div class="spinner"></div>
+    <span class="loading-text">Loading dashboard data...</span>
+  </div>
+
+  <!-- TOAST NOTIFICATION -->
+  <div class="toast-notification" *ngIf="toastVisible" [class.success]="toastType === 'success'" [class.error]="toastType === 'error'" [class.info]="toastType === 'info'">
+    <span class="toast-icon" *ngIf="toastType === 'success'">&#x2714;</span>
+    <span class="toast-icon" *ngIf="toastType === 'error'">&#x2716;</span>
+    <span class="toast-icon" *ngIf="toastType === 'info'">&#x2139;</span>
+    <span class="toast-text">{{ toastMessage }}</span>
+    <button class="toast-close" (click)="toastVisible = false">&times;</button>
+  </div>
+
+  <!-- FUNDS PANEL -->
+  <div class="funds-grid">
+    <div class="glass-card funds-card paper-card">
+      <div class="card-header">
+        <span class="card-icon">&#x1F4CB;</span>
+        <span class="card-title">Paper Funds</span>
+        <span class="mode-badge paper">SIMULATED</span>
+      </div>
+      <div class="fund-rows">
+        <div class="fund-row main-row">
+          <span>Simulated Capital</span>
+          <strong>&#8377;{{ formatCurrency(paperFunds?.simulated_capital) }}</strong>
+        </div>
+        <div class="fund-row">
+          <span>Available Margin</span>
+          <strong class="green">&#8377;{{ formatCurrency(paperFunds?.available_margin) }}</strong>
+        </div>
+        <div class="fund-row">
+          <span>Open Exposure</span>
+          <strong>&#8377;{{ formatCurrency(paperFunds?.open_exposure) }}</strong>
+        </div>
+        <div class="fund-row pnl-row">
+          <span>Today's P&amp;L</span>
+          <strong [class.positive]="paperFunds?.net_pnl_today > 0" [class.negative]="paperFunds?.net_pnl_today < 0">
+            &#8377;{{ formatPnl(paperFunds?.net_pnl_today) }}
+          </strong>
+        </div>
+        <div class="limits-section">
+          <div class="limit-bar">
+            <span class="limit-label">Loss Used</span>
+            <div class="progress-bar"><div class="progress-fill warn" [style.width.%]="paperFunds?.loss_consumed_pct || 0"></div></div>
+            <span class="limit-pct">{{ paperFunds?.loss_consumed_pct || 0 }}%</span>
+          </div>
+          <div class="limit-bar">
+            <span class="limit-label">Profit Progress</span>
+            <div class="progress-bar"><div class="progress-fill accent" [style.width.%]="paperFunds?.profit_achieved_pct || 0"></div></div>
+            <span class="limit-pct">{{ paperFunds?.profit_achieved_pct || 0 }}%</span>
+          </div>
+        </div>
+        <div class="halt-banner" *ngIf="paperFunds && !paperFunds.trading_allowed">
+          {{ paperFunds?.stop_reason }}
+        </div>
+      </div>
+    </div>
+
+    <div class="glass-card funds-card live-card">
+      <div class="card-header">
+        <span class="card-icon">&#x26A1;</span>
+        <span class="card-title">Live Funds (Fyers)</span>
+        <span class="mode-badge live">REAL MONEY</span>
+      </div>
+      <div class="fund-rows">
+        <div class="fund-row main-row">
+          <span>Available Margin</span>
+          <strong>&#8377;{{ formatCurrency(liveFunds?.available_margin) }}</strong>
+        </div>
+        <div class="fund-row">
+          <span>Total Balance</span>
+          <strong>&#8377;{{ formatCurrency(liveFunds?.total_balance) }}</strong>
+        </div>
+        <div class="fund-row">
+          <span>Margin Used</span>
+          <strong>&#8377;{{ formatCurrency(liveFunds?.utilized_margin) }}</strong>
+        </div>
+        <div class="fund-row pnl-row">
+          <span>Today's P&amp;L (Live)</span>
+          <strong [class.positive]="liveFunds?.net_pnl_today > 0" [class.negative]="liveFunds?.net_pnl_today < 0">
+            &#8377;{{ formatPnl(liveFunds?.net_pnl_today) }}
+          </strong>
+        </div>
+        <div class="connection-status">
+          <span class="dot" [class.connected]="fyersConnected"></span>
+          {{ fyersConnected ? 'Fyers Connected' : 'Fyers Disconnected' }}
+        </div>
+        <div class="market-status-row">
+          <span class="dot" [class.connected]="marketOpen"></span>
+          {{ marketOpen ? 'Market Open' : 'Market Closed' }}
+          <span class="sse-badge" [class.connected]="sseConnected">{{ sseConnected ? 'LIVE SSE' : 'POLLING' }}</span>
+        </div>
+        <div class="limits-section">
+          <div class="limit-bar">
+            <span class="limit-label">Loss Used</span>
+            <div class="progress-bar"><div class="progress-fill warn" [style.width.%]="liveFunds?.loss_consumed_pct || 0"></div></div>
+            <span class="limit-pct">{{ liveFunds?.loss_consumed_pct || 0 }}%</span>
+          </div>
+          <div class="limit-bar">
+            <span class="limit-label">Profit Progress</span>
+            <div class="progress-bar"><div class="progress-fill accent" [style.width.%]="liveFunds?.profit_achieved_pct || 0"></div></div>
+            <span class="limit-pct">{{ liveFunds?.profit_achieved_pct || 0 }}%</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AUTO-TRADE CONTROL -->
+  <div class="glass-card auto-trade-panel">
+    <div class="card-header">
+      <span class="card-icon">&#x1F916;</span>
+      <span class="card-title">Auto-Trade Engine</span>
+      <button class="btn-auto-trade" [class.enabled]="autoTradeStatus?.engine_running" (click)="toggleAutoTrade()">
+        {{ autoTradeStatus?.engine_running ? 'DISABLE Auto-Trade' : 'ENABLE Auto-Trade' }}
+      </button>
+    </div>
+    <div class="auto-trade-info">
+      <span class="at-status" [class.active]="autoTradeStatus?.engine_running">
+        Engine: {{ autoTradeStatus?.engine_running ? 'RUNNING' : 'STOPPED' }}
+      </span>
+      <span class="at-status" [class.active]="autoTradeStatus?.market_open">
+        Market: {{ autoTradeStatus?.market_open ? 'OPEN' : 'CLOSED' }}
+      </span>
+      <span class="at-status" [class.active]="!autoTradeStatus?.daily_target_met" [class.target-met]="autoTradeStatus?.daily_target_met">
+        {{ autoTradeStatus?.daily_target_met ? 'TARGET MET - Paused' : 'Trading Active' }}
+      </span>
+      <span class="at-status">
+        Signals: {{ autoTradeStatus?.signals_count || 0 }} | Max Trades: {{ autoTradeStatus?.max_active_trades || 5 }}
+      </span>
+      <span class="at-last-scan" *ngIf="autoTradeStatus?.last_scan_time">
+        Last Scan: {{ autoTradeStatus?.last_scan_time }}
+      </span>
+    </div>
+  </div>
+
+  <!-- HEATMAP PANEL -->
+  <div class="glass-card heatmap-panel">
+    <div class="card-header">
+      <span class="card-icon">&#x1F525;</span>
+      <span class="card-title">NSE Live Heatmap</span>
+      <span class="last-update" *ngIf="lastHeatmapUpdate">Updated: {{ lastHeatmapUpdate }}</span>
+      <button class="btn-refresh" (click)="refreshHeatmap()">Refresh</button>
+    </div>
+    <div class="sector-row" *ngIf="sectors.length > 0">
+      <div *ngFor="let sector of sectors" class="sector-chip"
+           [class.bullish]="sector.avg_change > 0" [class.bearish]="sector.avg_change < 0">
+        <div class="sector-name">{{ sector.name }}</div>
+        <div class="sector-change" [class.pos]="sector.avg_change > 0" [class.neg]="sector.avg_change < 0">
+          {{ sector.avg_change > 0 ? '&#9650;' : '&#9660;' }} {{ sector.avg_change }}%
+        </div>
+      </div>
+    </div>
+    <div class="no-data" *ngIf="sectors.length === 0">Click "Refresh" to fetch live NSE heatmap data</div>
+    <div class="movers-section" *ngIf="topGainers.length > 0 || topLosers.length > 0">
+      <div class="movers-col">
+        <h4 class="green">Top Gainers</h4>
+        <div *ngFor="let s of topGainers" class="mover-chip gainer" [routerLink]="['/chart']" [queryParams]="{symbol: s.symbol}">
+          <span class="sym">{{ s.display_symbol }}</span>
+          <span class="chg">+{{ s.change_pct }}%</span>
+          <span class="price">&#8377;{{ s.ltp }}</span>
+        </div>
+      </div>
+      <div class="movers-col">
+        <h4 class="red">Top Losers</h4>
+        <div *ngFor="let s of topLosers" class="mover-chip loser" [routerLink]="['/chart']" [queryParams]="{symbol: s.symbol}">
+          <span class="sym">{{ s.display_symbol }}</span>
+          <span class="chg">{{ s.change_pct }}%</span>
+          <span class="price">&#8377;{{ s.ltp }}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- OPEN TRADES -->
+  <div class="glass-card trades-panel">
+    <div class="card-header">
+      <span class="card-icon">&#x1F4C4;</span>
+      <span class="card-title">Open Trades</span>
+      <span class="trade-counts">
+        <span class="paper-count">{{ openPaperTrades.length }} Paper</span>
+        <span class="live-count">{{ openLiveTrades.length }} Live</span>
+      </span>
+    </div>
+    <div class="trades-table" *ngIf="openPaperTrades.length > 0 || openLiveTrades.length > 0">
+      <table>
+        <thead>
+          <tr><th>Mode</th><th>Source</th><th>Symbol</th><th>Side</th><th>Entry</th><th>LTP</th><th>Qty</th><th>Unrealized P&amp;L</th><th>Action</th></tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let t of openPaperTrades" class="paper-row">
+            <td><span class="badge paper">PAPER</span></td>
+            <td><span class="badge" [class.auto]="t.is_auto_trade" [class.manual]="!t.is_auto_trade">{{ t.is_auto_trade ? 'AUTO' : 'MANUAL' }}</span></td>
+            <td>{{ t.symbol }}</td><td>{{ t.side }}</td>
+            <td>&#8377;{{ t.entry_price }}</td>
+            <td>
+              <span *ngIf="getLTP(t) > 0">&#8377;{{ getLTP(t) | number:'1.2-2' }}</span>
+              <span *ngIf="getLTP(t) === 0" class="no-ltp">--</span>
+            </td>
+            <td>{{ t.quantity }}</td>
+            <td>
+              <span *ngIf="getLTP(t) > 0" [class.positive]="getUnrealizedPnl(t) > 0" [class.negative]="getUnrealizedPnl(t) < 0">
+                &#8377;{{ formatPnl(getUnrealizedPnl(t)) }}
+                <small>({{ getUnrealizedPnlPct(t) | number:'1.2-2' }}%)</small>
+              </span>
+              <span *ngIf="getLTP(t) === 0" class="no-ltp">--</span>
+            </td>
+            <td><button class="btn-close-trade" (click)="closePaperTrade(t)">Close</button></td>
+          </tr>
+          <tr *ngFor="let t of openLiveTrades" class="live-row">
+            <td><span class="badge live">LIVE</span></td>
+            <td><span class="badge manual">MANUAL</span></td>
+            <td>{{ t.display_symbol || t.symbol }}</td><td>{{ t.direction }}</td>
+            <td>&#8377;{{ t.entry_price }}</td>
+            <td>
+              <span *ngIf="getLTP(t) > 0">&#8377;{{ getLTP(t) | number:'1.2-2' }}</span>
+              <span *ngIf="getLTP(t) === 0" class="no-ltp">--</span>
+            </td>
+            <td>{{ t.quantity }}</td>
+            <td>
+              <span *ngIf="getLTP(t) > 0" [class.positive]="getUnrealizedPnl(t) > 0" [class.negative]="getUnrealizedPnl(t) < 0">
+                &#8377;{{ formatPnl(getUnrealizedPnl(t)) }}
+                <small>({{ getUnrealizedPnlPct(t) | number:'1.2-2' }}%)</small>
+              </span>
+              <span *ngIf="getLTP(t) === 0" class="no-ltp">--</span>
+            </td>
+            <td><button class="btn-close-trade live" (click)="closeLiveTrade(t)">Close</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="no-data" *ngIf="openPaperTrades.length === 0 && openLiveTrades.length === 0">No open trades</div>
+  </div>
+</div>

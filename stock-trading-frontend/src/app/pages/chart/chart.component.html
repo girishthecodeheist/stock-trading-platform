@@ -1,0 +1,337 @@
+<div class="page-container fade-in">
+  <div class="chart-header glass-card">
+    <div class="search-section">
+      <div class="search-wrapper">
+        <input type="text" placeholder="Search symbol..."
+               [(ngModel)]="searchTerm" (input)="onSearch()" class="symbol-search">
+        <div class="search-dropdown glass-card" *ngIf="showSearch && searchResults.length > 0">
+          <div class="search-item" *ngFor="let r of searchResults" (click)="onSymbolSelect(r)">
+            <span class="search-symbol">{{formatSymbol(r.symbol)}}</span>
+            <span class="search-name">{{r.name}}</span>
+            <span class="badge" [ngClass]="{'badge-buy': r.segment === 'EQUITY', 'badge-open': r.segment === 'INDEX', 'badge-sell': r.segment === 'OPTION', 'badge-neutral': r.segment === 'FUTURE'}">{{r.segment}}</span>
+          </div>
+        </div>
+      </div>
+      <div class="active-symbol">
+        <span class="current-symbol">{{formatSymbol(symbol)}}</span>
+        <span class="current-segment badge" [ngClass]="{'badge-buy': instrumentType === 'EQUITY', 'badge-open': instrumentType === 'INDEX'}">{{instrumentType}}</span>
+        <span class="data-source-badge" [ngClass]="{'live': dataSource === 'fyers_live'}">
+          {{dataSource === 'fyers_live' ? 'FYERS LIVE' : 'CACHED'}}
+        </span>
+        <span class="market-status-badge" [class.open]="marketOpen">
+          {{marketOpen ? 'MARKET OPEN' : 'MARKET CLOSED'}}
+        </span>
+      </div>
+    </div>
+    <div class="timeframe-selector">
+      <button *ngFor="let tf of timeframes" class="tf-btn" [class.active]="timeframe === tf"
+              (click)="timeframe = tf; onTimeframeChange()">{{tf}}</button>
+    </div>
+  </div>
+
+  <div class="loading-overlay" *ngIf="loading">
+    <div class="spinner"></div>
+    <span>Analyzing {{formatSymbol(symbol)}}...</span>
+  </div>
+
+  <div class="analysis-layout">
+    <div class="main-area">
+      <!-- Price Summary -->
+      <div class="glass-card price-summary-card" *ngIf="signal">
+        <div class="price-main">
+          <div class="price-left">
+            <div class="symbol-large">{{formatSymbol(symbol)}}</div>
+            <div class="entry-price">&#x20B9;{{signal.entry_price | number:'1.2-2'}}</div>
+          </div>
+          <div class="price-right">
+            <span class="badge signal-badge-lg" [ngClass]="getSignalClass(signal.signal)">{{signal.signal}}</span>
+            <div class="confidence-ring">
+              <svg viewBox="0 0 36 36" class="circular-chart">
+                <path class="circle-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
+                <path class="circle-fill" [ngClass]="{'green-stroke': signal.score > 0, 'red-stroke': signal.score < 0}"
+                      [attr.stroke-dasharray]="signal.confidence + ', 100'"
+                      d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
+                <text x="18" y="20.35" class="conf-text">{{signal.confidence}}%</text>
+              </svg>
+            </div>
+          </div>
+        </div>
+        <div class="price-targets-row">
+          <div class="target-item sl-item">
+            <span class="target-label">Stop Loss</span>
+            <span class="target-val negative">&#x20B9;{{signal.stop_loss | number:'1.2-2'}}</span>
+          </div>
+          <div class="target-item">
+            <span class="target-label">Target 1</span>
+            <span class="target-val positive">&#x20B9;{{signal.target_1 | number:'1.2-2'}}</span>
+          </div>
+          <div class="target-item" *ngIf="signal.target_2">
+            <span class="target-label">Target 2</span>
+            <span class="target-val positive">&#x20B9;{{signal.target_2 | number:'1.2-2'}}</span>
+          </div>
+          <div class="target-item" *ngIf="signal.target_3">
+            <span class="target-label">Target 3</span>
+            <span class="target-val positive">&#x20B9;{{signal.target_3 | number:'1.2-2'}}</span>
+          </div>
+        </div>
+        <div class="trade-buttons-row" *ngIf="signal.signal.includes('BUY') || signal.signal.includes('SELL')">
+          <button class="btn-trade paper-trade-btn" (click)="initiateTrade('PAPER')">
+            Paper {{signal.signal.includes('BUY') ? 'BUY' : 'SELL'}}
+          </button>
+          <button class="btn-trade live-trade-btn" (click)="initiateTrade('LIVE')"
+                  [class.disabled]="!fyersConnected" [disabled]="!fyersConnected">
+            Live {{signal.signal.includes('BUY') ? 'BUY' : 'SELL'}}
+            <span class="live-warn" *ngIf="!fyersConnected">(Connect Fyers)</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- F&O -->
+      <div class="glass-card fno-card" *ngIf="signal?.fno_recommendation">
+        <h3 class="panel-title">F&amp;O Recommendation</h3>
+        <div class="fno-badge-wrap">
+          <span class="fno-action-badge" [ngClass]="getFnoClass(signal.fno_recommendation.action)">{{signal.fno_recommendation.action}}</span>
+          <span class="fno-strength">{{signal.fno_recommendation.strength}}</span>
+        </div>
+        <p class="fno-reasoning">{{signal.fno_recommendation.reasoning}}</p>
+      </div>
+
+      <!-- OHLC Table -->
+      <div class="glass-card ohlc-card" *ngIf="candles.length > 0">
+        <h3 class="panel-title">Recent OHLC Data - {{formatSymbol(symbol)}} ({{timeframe}})</h3>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th>Time</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th><th>Change</th></tr></thead>
+            <tbody>
+              <tr *ngFor="let c of candles.slice(-15)">
+                <td class="time-cell">{{c.time | slice:0:16}}</td>
+                <td>{{c.open | number:'1.2-2'}}</td>
+                <td class="positive">{{c.high | number:'1.2-2'}}</td>
+                <td class="negative">{{c.low | number:'1.2-2'}}</td>
+                <td [ngClass]="c.close >= c.open ? 'positive' : 'negative'">{{c.close | number:'1.2-2'}}</td>
+                <td>{{c.volume | number}}</td>
+                <td [ngClass]="c.close >= c.open ? 'positive' : 'negative'">{{((c.close - c.open) / c.open * 100) | number:'1.2-2'}}%</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Candlestick Patterns -->
+      <div class="glass-card patterns-card" *ngIf="indicators?.candlestick_patterns?.length > 0">
+        <h3 class="panel-title">Detected Candlestick Patterns</h3>
+        <div class="patterns-grid">
+          <div *ngFor="let p of indicators.candlestick_patterns" class="pattern-chip" [ngClass]="getPatternClass(p.type)">
+            <span class="pattern-name">{{p.name}}</span>
+            <span class="pattern-type">{{p.type}}</span>
+            <span class="pattern-strength">{{p.strength}}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Swing Points -->
+      <div class="glass-card swing-card" *ngIf="indicators?.swing_high || indicators?.swing_low">
+        <h3 class="panel-title">Price Action Context</h3>
+        <div class="swing-grid">
+          <div class="swing-item" *ngIf="indicators.swing_high">
+            <span class="swing-label">Swing High</span>
+            <span class="swing-val positive">&#x20B9;{{indicators.swing_high | number:'1.2-2'}}</span>
+            <span class="swing-ago" *ngIf="indicators.swing_high_bars_ago">({{indicators.swing_high_bars_ago}} bars ago)</span>
+          </div>
+          <div class="swing-item" *ngIf="indicators.swing_low">
+            <span class="swing-label">Swing Low</span>
+            <span class="swing-val negative">&#x20B9;{{indicators.swing_low | number:'1.2-2'}}</span>
+            <span class="swing-ago" *ngIf="indicators.swing_low_bars_ago">({{indicators.swing_low_bars_ago}} bars ago)</span>
+          </div>
+          <div class="swing-item" *ngIf="indicators.trend_strength">
+            <span class="swing-label">Trend</span>
+            <span class="swing-val" [ngClass]="getTrendClass()">{{getTrendIcon()}} {{indicators.trend_strength}}</span>
+          </div>
+          <div class="swing-item" *ngIf="indicators.consecutive_green !== undefined">
+            <span class="swing-label">Consecutive Green</span>
+            <span class="swing-val positive">{{indicators.consecutive_green}}</span>
+          </div>
+          <div class="swing-item" *ngIf="indicators.consecutive_red !== undefined">
+            <span class="swing-label">Consecutive Red</span>
+            <span class="swing-val negative">{{indicators.consecutive_red}}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Signal Reasons -->
+      <div class="glass-card reasons-card" *ngIf="signal?.reasons?.length > 0">
+        <h3 class="panel-title">Why This Signal</h3>
+        <div class="reasons-list">
+          <div class="reason-item" *ngFor="let r of signal.reasons">
+            <span class="reason-bullet" [ngClass]="{'green': signal.score > 0, 'red': signal.score < 0}"></span>
+            <span class="reason-text">{{r}}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="side-panel">
+      <!-- Analysis Breakdown -->
+      <div class="glass-card breakdown-card" *ngIf="signal">
+        <h3 class="panel-title">Analysis Breakdown</h3>
+        <div class="breakdown-weights" *ngIf="analysisWeights"><span class="weight-label">{{analysisWeights}}</span></div>
+        <div class="score-bars">
+          <div class="score-row">
+            <span class="score-label">Technical</span>
+            <div class="score-bar-bg"><div class="score-bar-fill" [ngClass]="signal.technical_score > 0 ? 'green' : 'red'" [style.width.%]="(Math.abs(signal.technical_score) / 100) * 100"></div></div>
+            <span class="score-val" [ngClass]="{'positive': signal.technical_score > 0, 'negative': signal.technical_score < 0}">{{signal.technical_score}}</span>
+          </div>
+          <div class="score-row" *ngIf="signal.fundamental_score !== 0 || fundamental">
+            <span class="score-label">Fundamental</span>
+            <div class="score-bar-bg"><div class="score-bar-fill" [ngClass]="signal.fundamental_score > 0 ? 'green' : 'red'" [style.width.%]="(Math.abs(signal.fundamental_score) / 100) * 100"></div></div>
+            <span class="score-val" [ngClass]="{'positive': signal.fundamental_score > 0, 'negative': signal.fundamental_score < 0}">{{signal.fundamental_score}}</span>
+          </div>
+          <div class="score-row" *ngIf="signal.sentiment_score !== 0 || sentiment">
+            <span class="score-label">Sentiment</span>
+            <div class="score-bar-bg"><div class="score-bar-fill" [ngClass]="signal.sentiment_score > 0 ? 'green' : 'red'" [style.width.%]="(Math.abs(signal.sentiment_score) / 100) * 100"></div></div>
+            <span class="score-val" [ngClass]="{'positive': signal.sentiment_score > 0, 'negative': signal.sentiment_score < 0}">{{signal.sentiment_score}}</span>
+          </div>
+          <div class="score-row total">
+            <span class="score-label">Combined</span>
+            <div class="score-bar-bg"><div class="score-bar-fill" [ngClass]="signal.score > 0 ? 'green' : 'red'" [style.width.%]="(Math.abs(signal.score) / 100) * 100"></div></div>
+            <span class="score-val" [ngClass]="{'positive': signal.score > 0, 'negative': signal.score < 0}">{{signal.score}}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Fundamental -->
+      <div class="glass-card fundamental-card" *ngIf="fundamental">
+        <h3 class="panel-title">Fundamental Analysis</h3>
+        <div class="fund-signal-row" *ngIf="fundamental.fundamental_signal">
+          <span class="fund-signal-label">Signal:</span>
+          <span class="badge" [ngClass]="{'badge-buy': fundamental.fundamental_signal?.includes('BULLISH'), 'badge-sell': fundamental.fundamental_signal?.includes('BEARISH'), 'badge-neutral': fundamental.fundamental_signal === 'NEUTRAL'}">{{fundamental.fundamental_signal}}</span>
+          <span class="fund-score">(Score: {{fundamental.fundamental_score}})</span>
+        </div>
+        <div class="fund-company" *ngIf="fundamental.company_name">
+          <span class="fund-company-name">{{fundamental.company_name}}</span>
+          <span class="fund-sector" *ngIf="fundamental.sector">{{fundamental.sector}}</span>
+        </div>
+        <div class="indicator-grid fund-grid">
+          <div class="ind-item" *ngIf="fundamental.pe_ratio != null"><span class="ind-name">P/E Ratio</span><span class="ind-val">{{fundamental.pe_ratio | number:'1.1-1'}}</span></div>
+          <div class="ind-item" *ngIf="fundamental.pb_ratio != null"><span class="ind-name">P/B Ratio</span><span class="ind-val">{{fundamental.pb_ratio | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="fundamental.eps != null"><span class="ind-name">EPS</span><span class="ind-val">{{fundamental.eps | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="fundamental.roe != null"><span class="ind-name">ROE</span><span class="ind-val" [ngClass]="{'positive': fundamental.roe > 0.15}">{{formatPercent(fundamental.roe)}}</span></div>
+          <div class="ind-item" *ngIf="fundamental.roa != null"><span class="ind-name">ROA</span><span class="ind-val">{{formatPercent(fundamental.roa)}}</span></div>
+          <div class="ind-item" *ngIf="fundamental.debt_to_equity != null"><span class="ind-name">D/E Ratio</span><span class="ind-val" [ngClass]="{'negative': fundamental.debt_to_equity > 150}">{{fundamental.debt_to_equity | number:'1.0-0'}}</span></div>
+          <div class="ind-item" *ngIf="fundamental.dividend_yield != null"><span class="ind-name">Div Yield</span><span class="ind-val">{{formatPercent(fundamental.dividend_yield)}}</span></div>
+          <div class="ind-item" *ngIf="fundamental.market_cap != null"><span class="ind-name">Market Cap</span><span class="ind-val">{{formatNumber(fundamental.market_cap)}}</span></div>
+          <div class="ind-item" *ngIf="fundamental.profit_margin != null"><span class="ind-name">Profit Margin</span><span class="ind-val" [ngClass]="{'positive': fundamental.profit_margin > 0.15}">{{formatPercent(fundamental.profit_margin)}}</span></div>
+          <div class="ind-item" *ngIf="fundamental.revenue_growth != null"><span class="ind-name">Rev Growth</span><span class="ind-val" [ngClass]="{'positive': fundamental.revenue_growth > 0, 'negative': fundamental.revenue_growth < 0}">{{formatPercent(fundamental.revenue_growth)}}</span></div>
+          <div class="ind-item" *ngIf="fundamental.current_ratio != null"><span class="ind-name">Current Ratio</span><span class="ind-val">{{fundamental.current_ratio | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="fundamental.beta != null"><span class="ind-name">Beta</span><span class="ind-val">{{fundamental.beta | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="fundamental.recommendation"><span class="ind-name">Analyst</span><span class="ind-val">{{fundamental.recommendation}}</span></div>
+          <div class="ind-item" *ngIf="fundamental.target_mean_price != null"><span class="ind-name">Target Price</span><span class="ind-val">{{fundamental.target_mean_price | number:'1.2-2'}}</span></div>
+        </div>
+      </div>
+
+      <!-- Sentiment -->
+      <div class="glass-card sentiment-card" *ngIf="sentiment">
+        <h3 class="panel-title">News Sentiment</h3>
+        <div class="sentiment-header">
+          <span class="sentiment-classification badge" [ngClass]="{'badge-buy': sentiment.sentiment_classification?.includes('BULLISH'), 'badge-sell': sentiment.sentiment_classification?.includes('BEARISH'), 'badge-neutral': sentiment.sentiment_classification === 'NEUTRAL'}">{{sentiment.sentiment_classification}}</span>
+          <span class="sentiment-score-val" [ngClass]="getSentimentClass(sentiment.sentiment_classification)">Score: {{sentiment.sentiment_score}}</span>
+        </div>
+        <div class="sentiment-stats" *ngIf="sentiment.headline_count > 0">
+          <span class="stat-item positive-bg">{{sentiment.bullish_count}} Bullish</span>
+          <span class="stat-item neutral-bg">{{sentiment.neutral_count}} Neutral</span>
+          <span class="stat-item negative-bg">{{sentiment.bearish_count}} Bearish</span>
+        </div>
+        <div class="sentiment-headlines" *ngIf="sentiment.headlines?.length > 0">
+          <div class="headline-item" *ngFor="let h of sentiment.headlines.slice(0, 5)">
+            <span class="headline-sentiment-dot" [ngClass]="{'green': h.sentiment > 0.1, 'red': h.sentiment < -0.1, 'gray': h.sentiment >= -0.1 && h.sentiment <= 0.1}"></span>
+            <span class="headline-text">{{h.title}}</span>
+          </div>
+        </div>
+        <div class="no-news" *ngIf="!sentiment.headlines || sentiment.headlines.length === 0"><span>No recent news headlines available</span></div>
+      </div>
+
+      <!-- Technical Indicators -->
+      <div class="glass-card indicators-card" *ngIf="indicators">
+        <h3 class="panel-title">Technical Indicators ({{getIndicatorCount()}})</h3>
+        <div class="indicator-grid">
+          <div class="ind-item" *ngIf="indicators.rsi !== undefined"><span class="ind-name">RSI (14)</span><span class="ind-val" [ngClass]="{'positive': indicators.rsi < 40, 'negative': indicators.rsi > 60}">{{indicators.rsi | number:'1.1-1'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.macd_line !== undefined"><span class="ind-name">MACD</span><span class="ind-val" [ngClass]="{'positive': indicators.macd_hist > 0, 'negative': indicators.macd_hist < 0}">{{indicators.macd_hist | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.sma_20"><span class="ind-name">SMA 20</span><span class="ind-val">{{indicators.sma_20 | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.sma_50"><span class="ind-name">SMA 50</span><span class="ind-val">{{indicators.sma_50 | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.sma_200"><span class="ind-name">SMA 200</span><span class="ind-val">{{indicators.sma_200 | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.ema_9"><span class="ind-name">EMA 9</span><span class="ind-val">{{indicators.ema_9 | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.ema_20"><span class="ind-name">EMA 20</span><span class="ind-val">{{indicators.ema_20 | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.bb_upper"><span class="ind-name">BB Upper</span><span class="ind-val">{{indicators.bb_upper | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.bb_lower"><span class="ind-name">BB Lower</span><span class="ind-val">{{indicators.bb_lower | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.atr"><span class="ind-name">ATR (14)</span><span class="ind-val">{{indicators.atr | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.stoch_k !== undefined"><span class="ind-name">Stoch %K</span><span class="ind-val" [ngClass]="{'positive': indicators.stoch_k < 25, 'negative': indicators.stoch_k > 75}">{{indicators.stoch_k | number:'1.1-1'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.stoch_d !== undefined"><span class="ind-name">Stoch %D</span><span class="ind-val" [ngClass]="{'positive': indicators.stoch_d < 25, 'negative': indicators.stoch_d > 75}">{{indicators.stoch_d | number:'1.1-1'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.williams_r !== undefined"><span class="ind-name">Williams %R</span><span class="ind-val">{{indicators.williams_r | number:'1.1-1'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.cci !== undefined"><span class="ind-name">CCI</span><span class="ind-val" [ngClass]="{'positive': indicators.cci > 100, 'negative': indicators.cci < -100}">{{indicators.cci | number:'1.0-0'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.adx !== undefined"><span class="ind-name">ADX</span><span class="ind-val" [ngClass]="{'positive': indicators.adx > 25}">{{indicators.adx | number:'1.1-1'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.mfi !== undefined"><span class="ind-name">MFI</span><span class="ind-val" [ngClass]="{'positive': indicators.mfi < 30, 'negative': indicators.mfi > 70}">{{indicators.mfi | number:'1.1-1'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.roc !== undefined"><span class="ind-name">ROC</span><span class="ind-val" [ngClass]="{'positive': indicators.roc > 0, 'negative': indicators.roc < 0}">{{indicators.roc | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.vwap"><span class="ind-name">VWAP</span><span class="ind-val">{{indicators.vwap | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.supertrend_direction"><span class="ind-name">Supertrend</span><span class="ind-val" [ngClass]="{'positive': indicators.supertrend_direction === 'UP', 'negative': indicators.supertrend_direction === 'DOWN'}">{{indicators.supertrend_direction}}</span></div>
+          <div class="ind-item" *ngIf="indicators.obv_trend"><span class="ind-name">OBV Trend</span><span class="ind-val" [ngClass]="{'positive': indicators.obv_trend === 'RISING', 'negative': indicators.obv_trend === 'FALLING'}">{{indicators.obv_trend}}</span></div>
+          <div class="ind-item" *ngIf="indicators.volume_ratio !== undefined"><span class="ind-name">Vol Ratio</span><span class="ind-val" [ngClass]="{'positive': indicators.volume_ratio > 1.5}">{{indicators.volume_ratio | number:'1.2-2'}}x</span></div>
+          <div class="ind-item" *ngIf="indicators.support_1"><span class="ind-name">Support 1</span><span class="ind-val positive">&#x20B9;{{indicators.support_1 | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.resistance_1"><span class="ind-name">Resistance 1</span><span class="ind-val negative">&#x20B9;{{indicators.resistance_1 | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.support_2"><span class="ind-name">Support 2</span><span class="ind-val positive">&#x20B9;{{indicators.support_2 | number:'1.2-2'}}</span></div>
+          <div class="ind-item" *ngIf="indicators.resistance_2"><span class="ind-name">Resistance 2</span><span class="ind-val negative">&#x20B9;{{indicators.resistance_2 | number:'1.2-2'}}</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="glass-card no-data-card" *ngIf="!loading && !signal && !indicators">
+    <p>No analysis data available for <strong>{{formatSymbol(symbol)}}</strong> on {{timeframe}} timeframe.</p>
+    <p>Try a different symbol or timeframe.</p>
+  </div>
+</div>
+
+<!-- Quantity Modal -->
+<div class="modal-overlay" *ngIf="showQtyModal" (click)="cancelTrade()">
+  <div class="qty-modal glass-card" (click)="$event.stopPropagation()">
+    <div class="qty-modal-header">
+      <h3>Confirm {{pendingTradeMode}} Trade</h3>
+      <button class="modal-close-btn" (click)="cancelTrade()">&times;</button>
+    </div>
+    <div class="qty-modal-body">
+      <div class="qty-summary-row">
+        <span class="qty-symbol">{{formatSymbol(symbol)}}</span>
+        <span class="badge" [ngClass]="getSignalClass(signal?.signal)">{{signal?.signal}}</span>
+      </div>
+      <div class="qty-detail-grid">
+        <div class="qty-detail-item"><span class="qty-detail-label">Entry Price</span><span class="qty-detail-val">&#x20B9;{{signal?.entry_price | number:'1.2-2'}}</span></div>
+        <div class="qty-detail-item"><span class="qty-detail-label">Stop Loss</span><span class="qty-detail-val negative">&#x20B9;{{signal?.stop_loss | number:'1.2-2'}}</span></div>
+        <div class="qty-detail-item"><span class="qty-detail-label">Target</span><span class="qty-detail-val positive">&#x20B9;{{signal?.target_1 | number:'1.2-2'}}</span></div>
+        <div class="qty-detail-item highlight"><span class="qty-detail-label">Smart Quantity</span><span class="qty-detail-val qty-big">{{calculatedQty}}</span></div>
+      </div>
+      <div class="qty-breakdown" *ngIf="qtyBreakdown">
+        <h4>Quantity Breakdown</h4>
+        <div class="breakdown-row" *ngIf="qtyBreakdown.capital"><span>Available Capital</span><span>&#x20B9;{{qtyBreakdown.capital | number:'1.0-0'}}</span></div>
+        <div class="breakdown-row" *ngIf="qtyBreakdown.max_loss_limit"><span>Max Loss Limit</span><span class="negative">&#x20B9;{{qtyBreakdown.max_loss_limit | number:'1.0-0'}}</span></div>
+        <div class="breakdown-row" *ngIf="qtyBreakdown.profit_target"><span>Profit Target</span><span class="positive">&#x20B9;{{qtyBreakdown.profit_target | number:'1.0-0'}}</span></div>
+        <div class="breakdown-row" *ngIf="qtyBreakdown.sl_per_share"><span>SL / Share</span><span class="negative">&#x20B9;{{qtyBreakdown.sl_per_share | number:'1.2-2'}}</span></div>
+        <div class="breakdown-row" *ngIf="qtyBreakdown.target_per_share"><span>Target / Share</span><span class="positive">&#x20B9;{{qtyBreakdown.target_per_share | number:'1.2-2'}}</span></div>
+        <div class="breakdown-row" *ngIf="qtyBreakdown.potential_loss"><span>Potential Loss ({{calculatedQty}} qty)</span><span class="negative">&#x20B9;{{qtyBreakdown.potential_loss | number:'1.0-0'}}</span></div>
+        <div class="breakdown-row" *ngIf="qtyBreakdown.potential_profit"><span>Potential Profit ({{calculatedQty}} qty)</span><span class="positive">&#x20B9;{{qtyBreakdown.potential_profit | number:'1.0-0'}}</span></div>
+        <div class="breakdown-row" *ngIf="qtyBreakdown.total_investment"><span>Total Investment</span><span>&#x20B9;{{qtyBreakdown.total_investment | number:'1.0-0'}}</span></div>
+        <div class="breakdown-row risk-reward" *ngIf="qtyBreakdown.risk_reward_ratio">
+          <span>Risk:Reward</span>
+          <span [ngClass]="{'positive': qtyBreakdown.risk_reward_ratio >= 1.5, 'negative': qtyBreakdown.risk_reward_ratio < 1}">1:{{qtyBreakdown.risk_reward_ratio | number:'1.1-1'}}</span>
+        </div>
+        <div class="rr-warning" *ngIf="qtyBreakdown.risk_reward_ratio && qtyBreakdown.risk_reward_ratio < 1">
+          &#x26A0; Poor Risk:Reward - Potential loss exceeds potential profit!
+        </div>
+      </div>
+    </div>
+    <div class="qty-modal-footer">
+      <button class="btn-cancel-modal" (click)="cancelTrade()">Cancel</button>
+      <button class="btn-confirm-modal" [ngClass]="{'paper': pendingTradeMode === 'PAPER', 'live': pendingTradeMode === 'LIVE'}" (click)="confirmTrade()">
+        {{pendingTradeMode === 'PAPER' ? 'Create Paper Trade' : 'Place Live Order'}}
+      </button>
+    </div>
+  </div>
+</div>

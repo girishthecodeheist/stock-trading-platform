@@ -1,0 +1,106 @@
+.settings-page { padding: 20px; max-width: 900px; margin: 0 auto; }
+.page-title { font-size: 1.5rem; font-weight: 700; margin-bottom: 20px; color: #e0e0e0; }
+.settings-section {
+  padding: 20px; border-radius: 16px; margin-bottom: 20px;
+  .section-title {
+    font-size: 1rem; font-weight: 600; color: #e0e0e0; margin-bottom: 16px;
+    padding-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+}
+.settings-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+  .setting-row {
+    display: flex; flex-direction: column; gap: 4px;
+    label { font-size: 0.8rem; color: #999; }
+    input[type="number"], input[type="text"], select {
+      background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+      color: #e0e0e0; padding: 8px 12px; border-radius: 8px; font-size: 0.85rem;
+      &:focus { outline: none; border-color: #42a5f5; }
+    }
+  }
+  .toggle-row {
+    grid-column: 1 / -1;
+    .toggle-switch {
+      display: flex; align-items: center; gap: 8px; margin-top: 4px;
+      input[type="checkbox"] { width: 18px; height: 18px; accent-color: #42a5f5; cursor: pointer; }
+      .toggle-label { font-size: 0.85rem; color: #42a5f5; font-weight: 600; cursor: pointer; }
+    }
+    .toggle-hint { display: block; margin-top: 4px; font-size: 0.7rem; color: #777; }
+  }
+}
+// Calculator
+.calculator-section {
+  border: 1px solid rgba(66,165,245,0.2);
+  .calc-desc { font-size: 0.8rem; color: #999; margin-bottom: 12px; }
+}
+.calc-row {
+  display: flex; align-items: flex-end; gap: 12px;
+  .setting-row { flex: 1; }
+}
+.btn-calc {
+  padding: 8px 20px; background: linear-gradient(135deg, #42a5f5, #1e88e5);
+  color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 0.85rem;
+  height: 38px;
+  &:hover { background: linear-gradient(135deg, #1e88e5, #1565c0); }
+  &:disabled { opacity: 0.5; cursor: not-allowed; }
+}
+.calc-result {
+  margin-top: 16px; padding: 16px; background: rgba(255,255,255,0.03); border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.08);
+  .result-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+    .result-item {
+      text-align: center; padding: 10px; border-radius: 8px;
+      background: rgba(255,255,255,0.03);
+      &.highlight { background: rgba(66,165,245,0.1); border: 1px solid rgba(66,165,245,0.3); }
+      &.loss-item { background: rgba(239,83,80,0.06); }
+      &.profit-item { background: rgba(102,187,106,0.06); }
+      .result-label { display: block; font-size: 0.7rem; color: #888; margin-bottom: 4px; }
+      .result-value { display: block; font-size: 1rem; color: #e0e0e0; font-weight: 600;
+        &.big { font-size: 1.6rem; color: #42a5f5; }
+        &.positive { color: #66bb6a; }
+        &.negative { color: #ef5350; }
+      }
+    }
+  }
+  .breakdown {
+    margin-top: 12px; display: flex; gap: 16px; flex-wrap: wrap;
+    font-size: 0.75rem; color: #888;
+    .break-title { color: #aaa; font-weight: 600; }
+  }
+}
+.calc-error { margin-top: 10px; color: #ef5350; font-size: 0.8rem; }
+.scanner-status {
+  display: flex; align-items: center; gap: 12px; margin-top: 16px;
+  .scanner-badge {
+    padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 600;
+    background: rgba(239,83,80,0.15); color: #ef5350;
+    &.running { background: rgba(102,187,106,0.15); color: #66bb6a; }
+  }
+}
+.btn-toggle, .btn-connect {
+  padding: 6px 14px; background: rgba(66,165,245,0.15); color: #42a5f5;
+  border: 1px solid rgba(66,165,245,0.3); border-radius: 6px; cursor: pointer; font-size: 0.8rem;
+  &:hover { background: rgba(66,165,245,0.25); }
+}
+.fyers-info .connection-row {
+  display: flex; align-items: center; gap: 10px;
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%; background: #ef5350;
+    &.connected { background: #66bb6a; box-shadow: 0 0 6px rgba(102,187,106,0.5); }
+  }
+  span { color: #ccc; font-size: 0.85rem; }
+}
+.save-row {
+  display: flex; align-items: center; gap: 16px; margin-top: 20px;
+  .btn-save {
+    padding: 10px 24px; background: linear-gradient(135deg, #42a5f5, #1e88e5);
+    color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 0.9rem;
+    &:hover { background: linear-gradient(135deg, #1e88e5, #1565c0); }
+  }
+  .save-msg { color: #66bb6a; font-size: 0.85rem; }
+}
+@media (max-width: 600px) {
+  .settings-grid { grid-template-columns: 1fr; }
+  .calc-result .result-grid { grid-template-columns: 1fr 1fr; }
+}

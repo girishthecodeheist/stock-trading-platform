@@ -1,0 +1,66 @@
+<div class="trades-page">
+  <h2 class="page-title">All Trades</h2>
+
+  <!-- LOADING SPINNER -->
+  <div class="loading-overlay" *ngIf="loading">
+    <div class="spinner"></div>
+    <span class="loading-text">Loading trades...</span>
+  </div>
+  <div class="filters">
+    <div class="filter-group">
+      <label>Mode:</label>
+      <select [(ngModel)]="filterMode" (change)="mergeAndFilter()">
+        <option value="ALL">All</option>
+        <option value="PAPER">Paper</option>
+        <option value="LIVE">Live</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>Status:</label>
+      <select [(ngModel)]="filterStatus" (change)="mergeAndFilter()">
+        <option value="ALL">All</option>
+        <option value="OPEN">Open</option>
+        <option value="CLOSED">Closed</option>
+      </select>
+    </div>
+    <div class="trade-summary">Total: {{ allTrades.length }} trades</div>
+  </div>
+  <div class="glass-card">
+    <div class="trades-table">
+      <table>
+        <thead>
+          <tr>
+            <th>Mode</th><th>Source</th><th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th>
+            <th>SL</th><th>Target</th><th>Qty</th><th>P&amp;L</th><th>Timeframe</th><th>Analysis</th><th>Status</th><th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let t of allTrades" [class.paper-row]="t._mode==='PAPER'" [class.live-row]="t._mode==='LIVE'">
+            <td><span class="badge" [class.paper]="t._mode==='PAPER'" [class.live]="t._mode==='LIVE'">{{ t._mode }}</span></td>
+            <td>
+              <span class="badge auto" *ngIf="t.is_auto_trade">AUTO</span>
+              <span class="badge manual" *ngIf="!t.is_auto_trade">MANUAL</span>
+            </td>
+            <td class="sym-cell">{{ t.display_symbol || t.symbol }}</td>
+            <td>{{ t.direction || t.side }}</td>
+            <td>&#8377;{{ t.entry_price }}</td>
+            <td>{{ t.exit_price ? '&#8377;' + t.exit_price : '-' }}</td>
+            <td>&#8377;{{ t.stop_loss || 0 }}</td>
+            <td>&#8377;{{ t.target || t.target_price || 0 }}</td>
+            <td>{{ t.quantity }}</td>
+            <td [class]="getPnlClass(t.pnl_amount || t.net_pnl || 0)">
+              {{ (t.pnl_amount || t.net_pnl) ? '&#8377;' + (t.pnl_amount || t.net_pnl) : '-' }}
+            </td>
+            <td><span class="tf-badge">{{ getTimeframe(t) }}</span></td>
+            <td><span class="analysis-badge">{{ getAnalysisBasis(t) }}</span></td>
+            <td><span [class]="getStatusClass(t.status)">{{ t.status }}</span></td>
+            <td>
+              <button *ngIf="t.status === 'OPEN'" class="btn-close-trade" (click)="closeTrade(t)">Close</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="no-data" *ngIf="allTrades.length === 0">No trades found</div>
+  </div>
+</div>

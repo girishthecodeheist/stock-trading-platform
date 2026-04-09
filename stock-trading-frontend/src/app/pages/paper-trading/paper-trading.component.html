@@ -1,0 +1,136 @@
+<div class="page-container fade-in">
+  <div class="page-header">
+    <h1 class="page-title">Paper Trading</h1>
+  </div>
+
+  <!-- Summary Stats -->
+  <div class="grid-4 stats-row" *ngIf="analytics">
+    <div class="glass-card stat-card">
+      <div class="stat-label">Open Trades</div>
+      <div class="stat-value" style="color: var(--accent-blue)">{{analytics.open_trades}}</div>
+    </div>
+    <div class="glass-card stat-card">
+      <div class="stat-label">Total P&L</div>
+      <div class="stat-value" [ngClass]="getPnlClass(analytics.total_pnl)">
+        &#x20B9;{{analytics.total_pnl | number:'1.2-2'}}
+      </div>
+    </div>
+    <div class="glass-card stat-card">
+      <div class="stat-label">Win Rate</div>
+      <div class="stat-value" [ngClass]="analytics.win_rate >= 50 ? 'positive' : 'negative'">
+        {{analytics.win_rate}}%
+      </div>
+    </div>
+    <div class="glass-card stat-card">
+      <div class="stat-label">Total Trades</div>
+      <div class="stat-value">{{analytics.total_trades}}</div>
+      <div class="stat-sub">{{analytics.wins}}W / {{analytics.losses}}L</div>
+    </div>
+  </div>
+
+  <!-- Tab Switcher -->
+  <div class="tab-bar">
+    <button class="tab-btn" [class.active]="activeTab === 'open'" (click)="activeTab = 'open'">
+      Active Trades ({{openTrades.length}})
+    </button>
+    <button class="tab-btn" [class.active]="activeTab === 'closed'" (click)="activeTab = 'closed'">
+      Closed Trades ({{closedTrades.length}})
+    </button>
+  </div>
+
+  <div *ngIf="loading" class="loading-spinner">Loading trades...</div>
+
+  <!-- Open Trades Table -->
+  <div class="glass-card trades-table" *ngIf="!loading && activeTab === 'open'">
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Side</th>
+            <th>Entry Price</th>
+            <th>Stop Loss</th>
+            <th>Target</th>
+            <th>Confidence</th>
+            <th>Time</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let t of openTrades">
+            <td>
+              <span class="trade-symbol">{{formatSymbol(t.symbol)}}</span>
+              <span class="trade-tf">{{t.timeframe}}</span>
+            </td>
+            <td>
+              <span class="badge" [ngClass]="t.side === 'BUY' ? 'badge-buy' : 'badge-sell'">{{t.side}}</span>
+            </td>
+            <td>&#x20B9;{{t.entry_price | number:'1.2-2'}}</td>
+            <td class="negative">&#x20B9;{{t.stop_loss | number:'1.2-2'}}</td>
+            <td class="positive">&#x20B9;{{t.target | number:'1.2-2'}}</td>
+            <td>{{t.signal_confidence | number:'1.0-0'}}%</td>
+            <td>{{t.entry_time | slice:0:16}}</td>
+            <td>
+              <button class="btn btn-sm btn-danger" (click)="closeTrade(t)">Close</button>
+            </td>
+          </tr>
+          <tr *ngIf="openTrades.length === 0">
+            <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 40px;">
+              No active trades
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Closed Trades Table -->
+  <div class="glass-card trades-table" *ngIf="!loading && activeTab === 'closed'">
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Side</th>
+            <th>Entry</th>
+            <th>Exit</th>
+            <th>P&L %</th>
+            <th>P&L &#x20B9;</th>
+            <th>Result</th>
+            <th>Duration</th>
+            <th>Exit Reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let t of closedTrades">
+            <td>
+              <span class="trade-symbol">{{formatSymbol(t.symbol)}}</span>
+              <span class="trade-tf">{{t.timeframe}}</span>
+            </td>
+            <td>
+              <span class="badge" [ngClass]="t.side === 'BUY' ? 'badge-buy' : 'badge-sell'">{{t.side}}</span>
+            </td>
+            <td>&#x20B9;{{t.entry_price | number:'1.2-2'}}</td>
+            <td>&#x20B9;{{t.exit_price | number:'1.2-2'}}</td>
+            <td [ngClass]="getPnlClass(t.pnl_percent)">
+              {{t.pnl_percent > 0 ? '+' : ''}}{{t.pnl_percent | number:'1.2-2'}}%
+            </td>
+            <td [ngClass]="getPnlClass(t.pnl_amount)">
+              &#x20B9;{{t.pnl_amount | number:'1.2-2'}}
+            </td>
+            <td>
+              <span class="badge" [ngClass]="getResultClass(t.result)">{{t.result}}</span>
+            </td>
+            <td>{{formatDuration(t.duration_minutes)}}</td>
+            <td>{{t.exit_reason || '-'}}</td>
+          </tr>
+          <tr *ngIf="closedTrades.length === 0">
+            <td colspan="9" style="text-align: center; color: var(--text-muted); padding: 40px;">
+              No closed trades yet
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,87 @@
+.heatmap-page { padding: 20px; max-width: 1400px; margin: 0 auto; }
+.page-title { font-size: 1.5rem; font-weight: 700; color: #e0e0e0; }
+.header-row {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 16px; flex-wrap: wrap; gap: 12px;
+}
+.header-info {
+  display: flex; align-items: center; gap: 12px;
+  .stock-count { font-size: 0.8rem; color: #42a5f5; }
+  .last-poll { font-size: 0.75rem; color: #888; }
+}
+.btn-refresh {
+  padding: 6px 16px; background: rgba(66,165,245,0.15); color: #42a5f5;
+  border: 1px solid rgba(66,165,245,0.3); border-radius: 8px; cursor: pointer;
+  font-size: 0.8rem; font-weight: 600;
+  &:hover { background: rgba(66,165,245,0.25); }
+  &:disabled { opacity: 0.5; cursor: not-allowed; }
+  &.btn-live { background: rgba(102,187,106,0.15); color: #66bb6a; border-color: rgba(102,187,106,0.3); }
+}
+.backdate-panel {
+  padding: 14px 20px; border-radius: 12px; margin-bottom: 16px;
+  border: 1px solid rgba(255,167,38,0.15);
+  .backdate-row {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    .backdate-label { font-size: 0.85rem; color: #ccc; font-weight: 500; }
+    .date-input {
+      background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.15);
+      color: #e0e0e0; padding: 6px 12px; border-radius: 6px; font-size: 0.85rem;
+      &::-webkit-calendar-picker-indicator { filter: invert(0.7); }
+    }
+  }
+  .backdate-info {
+    display: flex; gap: 10px; margin-top: 10px; align-items: center;
+    .backdate-badge {
+      padding: 3px 10px; border-radius: 4px; font-size: 0.7rem; font-weight: 700;
+      background: rgba(255,167,38,0.2); color: #ffa726;
+    }
+    .source-badge {
+      padding: 3px 10px; border-radius: 4px; font-size: 0.7rem;
+      background: rgba(66,165,245,0.15); color: #42a5f5;
+    }
+  }
+  .backdate-error { margin-top: 8px; color: #ef5350; font-size: 0.8rem; }
+}
+.btn-backdate {
+  padding: 6px 16px; background: rgba(255,167,38,0.15); color: #ffa726;
+  border: 1px solid rgba(255,167,38,0.3); border-radius: 8px; cursor: pointer;
+  font-size: 0.8rem; font-weight: 600;
+  &:hover { background: rgba(255,167,38,0.25); }
+  &:disabled { opacity: 0.5; cursor: not-allowed; }
+}
+.sector-row {
+  display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px;
+  .sector-chip {
+    padding: 10px 16px; border-radius: 10px; cursor: pointer; text-align: center; min-width: 90px;
+    background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); transition: all 0.2s;
+    &.bullish { border-color: rgba(102,187,106,0.3); }
+    &.bearish { border-color: rgba(239,83,80,0.3); }
+    &.selected { background: rgba(66,165,245,0.15); border-color: #42a5f5; }
+    &:hover { background: rgba(255,255,255,0.08); }
+    .sector-name { font-size: 0.75rem; color: #ccc; font-weight: 600; }
+    .sector-change { font-size: 0.9rem; font-weight: 700; margin-top: 2px;
+      &.pos { color: #66bb6a; } &.neg { color: #ef5350; }
+    }
+    .sector-count { font-size: 0.65rem; color: #777; margin-top: 2px; }
+  }
+}
+.glass-card { padding: 16px; border-radius: 16px; }
+.heatmap-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px;
+  .heat-tile {
+    padding: 12px 10px; border-radius: 10px; cursor: pointer; text-align: center;
+    transition: transform 0.2s; border: 1px solid rgba(255,255,255,0.05);
+    &:hover { transform: scale(1.03); }
+    &.strong-gain { background: rgba(46,125,50,0.3); border-color: rgba(76,175,80,0.4); }
+    &.gain { background: rgba(102,187,106,0.12); border-color: rgba(102,187,106,0.2); }
+    &.strong-loss { background: rgba(183,28,28,0.3); border-color: rgba(239,83,80,0.4); }
+    &.loss { background: rgba(239,83,80,0.12); border-color: rgba(239,83,80,0.2); }
+    .tile-sym { font-weight: 700; font-size: 0.8rem; color: #e0e0e0; }
+    .tile-change { font-size: 0.85rem; font-weight: 700; margin-top: 4px; }
+    .tile-price { font-size: 0.7rem; color: #aaa; margin-top: 2px; }
+    .tile-sector { font-size: 0.6rem; color: #666; margin-top: 2px; }
+  }
+  .strong-gain .tile-change, .gain .tile-change { color: #66bb6a; }
+  .strong-loss .tile-change, .loss .tile-change { color: #ef5350; }
+}
+.no-data { text-align: center; padding: 40px; color: #666; font-size: 0.9rem; }
