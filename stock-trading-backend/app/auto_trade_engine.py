@@ -1,12 +1,12 @@
-"""Auto Trade Engine v3 - Capital-aware, re-analysis, trailing profit.
+"""Auto Trade Engine v4 - Smarter trading with brokerage awareness.
 
-Improvements over v2:
-1. Capital limit enforcement: trades don't exceed available margin
-2. Continuous re-analysis: open trades re-analyzed every cycle, SL/target modified if trend changes
-3. Trailing profit protection: target moves upward when trade is in profit
-4. Settings hot-reload: reads settings from DB every cycle (no restart needed)
-5. Timeframe + analysis basis tracking: records which timeframe and analysis type was used
-6. Guppy GMMA included in signal analysis
+Improvements over v3:
+1. Daily trade limit (max 10/day configurable) + cooldown between trades
+2. Brokerage-aware filtering: skip trades where brokerage > expected profit
+3. Multi-timeframe analysis: 15m for entry, 1D for trend confirmation
+4. Realistic targets: capped to recent price range, tighter ATR multipliers
+5. Minimum confidence/score threshold for auto-trades (score >= 25, confidence >= 40)
+6. All v3 features retained: capital limits, trailing profit, re-analysis, hot-reload
 """
 
 import json
@@ -24,11 +24,19 @@ from app import fyers_client
 from app.heatmap_poller import heatmap_poller
 from app.indicator_engine import compute_all_indicators
 from app.signal_engine import generate_signal
+from app.brokerage_calc import is_trade_profitable_after_brokerage
 
 logger = logging.getLogger(__name__)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 MAX_ACTIVE_TRADES = 5
+
+# v4: Trade frequency controls
+MAX_TRADES_PER_DAY = 10              # Max new trades per day (configurable via settings)
+TRADE_COOLDOWN_SECS = 300            # 5 min cooldown between trades on same symbol
+SCAN_INTERVAL_SECS = 120             # Scan every 2 minutes (was 60s)
+MIN_SCORE_FOR_TRADE = 25             # Minimum absolute score to place trade
+MIN_CONFIDENCE_FOR_TRADE = 40        # Minimum confidence to place trade
 
 # Trailing profit config
 TRAILING_PROFIT_TRIGGER_PCT = 1.0   # Start trailing after 1% profit
@@ -45,6 +53,8 @@ _last_monitor_time: Optional[datetime] = None
 _last_reanalysis_time: Optional[datetime] = None
 _auto_trade_log: list = []
 _daily_target_met = False
+_trades_placed_today: int = 0
+_last_trade_time_per_symbol: Dict[str, datetime] = {}
 
 # SSE subscribers: list of asyncio.Queue objects
 _sse_subscribers: list = []
@@ -168,6 +178,26 @@ async def _has_open_trade_for_symbol(symbol: str) -> bool:
         return (result.scalar() or 0) > 0
 
 
+async def _get_trades_placed_today() -> int:
+    """Count how many trades were auto-placed today."""
+    today = datetime.now(IST).date()
+    async with async_session_factory() as db:
+        result = await db.execute(text(
+            "SELECT COUNT(*) FROM paper_trades "
+            "WHERE is_auto_trade = true AND DATE(entry_time) = :today"
+        ), {"today": today})
+        return result.scalar() or 0
+
+
+def _is_on_cooldown(symbol: str) -> bool:
+    """Check if symbol is on cooldown (recently traded)."""
+    last_time = _last_trade_time_per_symbol.get(symbol)
+    if last_time is None:
+        return False
+    elapsed = (datetime.now(IST) - last_time).total_seconds()
+    return elapsed < TRADE_COOLDOWN_SECS
+
+
 async def _calculate_quantity(
     entry_price: float, sl_pct: float, tgt_pct: float,
     settings: dict, available_margin: float
@@ -200,11 +230,123 @@ async def _calculate_quantity(
     return optimal_qty
 
 
+# --- Recent Price Range (for realistic targets) --------------------------------
+
+async def _get_recent_price_range(symbol: str, days: int = 5) -> Optional[Dict[str, float]]:
+    """Get the high/low price range from recent candle data.
+
+    Used to cap targets to realistic levels.
+    """
+    try:
+        if fyers_client.is_authenticated():
+            candles = fyers_client.get_historical_data(symbol, timeframe="1D", days_back=days)
+            if candles and len(candles) >= 2:
+                highs = [float(c["high"]) for c in candles]
+                lows = [float(c["low"]) for c in candles]
+                closes = [float(c["close"]) for c in candles]
+                return {
+                    "recent_high": max(highs),
+                    "recent_low": min(lows),
+                    "avg_range": sum(h - l for h, l in zip(highs, lows)) / len(highs),
+                    "avg_close": sum(closes) / len(closes),
+                    "last_close": closes[-1],
+                }
+
+        async with async_session_factory() as db:
+            result = await db.execute(text(
+                "SELECT high, low, close FROM ohlcv_candles "
+                "WHERE symbol = :symbol AND timeframe = '1D' "
+                "ORDER BY timestamp DESC LIMIT :limit"
+            ), {"symbol": symbol, "limit": days})
+            rows = result.fetchall()
+            if rows and len(rows) >= 2:
+                highs = [float(r[0]) for r in rows]
+                lows = [float(r[1]) for r in rows]
+                closes = [float(r[2]) for r in rows]
+                return {
+                    "recent_high": max(highs),
+                    "recent_low": min(lows),
+                    "avg_range": sum(h - l for h, l in zip(highs, lows)) / len(highs),
+                    "avg_close": sum(closes) / len(closes),
+                    "last_close": closes[-1],
+                }
+    except Exception as e:
+        logger.debug(f"Failed to get recent price range for {symbol}: {e}")
+    return None
+
+
+def _cap_targets_to_range(
+    entry_price: float, stop_loss: float, target: float,
+    side: str, price_range: Optional[Dict[str, float]],
+    atr: Optional[float] = None,
+) -> tuple:
+    """Cap SL and target to realistic levels based on recent price action.
+
+    Returns (adjusted_sl, adjusted_target).
+    """
+    if price_range is None:
+        # No price data - use conservative defaults
+        if side == "BUY":
+            sl = round(entry_price * 0.99, 2)     # 1% SL
+            tgt = round(entry_price * 1.01, 2)    # 1% target
+        else:
+            sl = round(entry_price * 1.01, 2)
+            tgt = round(entry_price * 0.99, 2)
+        return sl, tgt
+
+    recent_high = price_range["recent_high"]
+    recent_low = price_range["recent_low"]
+    avg_range = price_range["avg_range"]
+
+    # Use average daily range as max target distance
+    # For intraday: target should be within 50-70% of average daily range
+    max_target_distance = avg_range * 0.6
+
+    # ATR-based adjustments (use smaller multiplier for intraday)
+    if atr and atr > 0:
+        max_target_distance = min(max_target_distance, atr * 0.8)
+
+    if side == "BUY":
+        # Cap target to recent high or max_target_distance
+        max_target = min(recent_high, entry_price + max_target_distance)
+        adjusted_target = min(target, max_target) if target else max_target
+        # Ensure target is above entry
+        if adjusted_target <= entry_price:
+            adjusted_target = round(entry_price * 1.005, 2)  # 0.5% minimum
+
+        # SL: tighter, within 1% or half of target distance
+        target_distance = adjusted_target - entry_price
+        sl_distance = min(abs(entry_price - stop_loss) if stop_loss else target_distance,
+                         target_distance * 0.75,
+                         entry_price * 0.01)  # max 1% SL
+        adjusted_sl = round(entry_price - sl_distance, 2)
+        adjusted_sl = max(adjusted_sl, recent_low)  # Don't set SL below recent low
+
+    else:  # SELL
+        # Cap target to recent low or max_target_distance
+        min_target = max(recent_low, entry_price - max_target_distance)
+        adjusted_target = max(target, min_target) if target else min_target
+        # Ensure target is below entry
+        if adjusted_target >= entry_price:
+            adjusted_target = round(entry_price * 0.995, 2)  # 0.5% minimum
+
+        # SL
+        target_distance = entry_price - adjusted_target
+        sl_distance = min(abs(stop_loss - entry_price) if stop_loss else target_distance,
+                         target_distance * 0.75,
+                         entry_price * 0.01)
+        adjusted_sl = round(entry_price + sl_distance, 2)
+        adjusted_sl = min(adjusted_sl, recent_high)
+
+    return round(adjusted_sl, 2), round(adjusted_target, 2)
+
+
 # --- Analysis -----------------------------------------------------------------
 
-async def _analyze_stock(stock: dict, timeframe: str = "1D") -> Optional[dict]:
+async def _analyze_stock(stock: dict, timeframe: str = "15m") -> Optional[dict]:
     """Run full indicator + signal engine on a single stock.
 
+    v4: Default timeframe changed from 1D to 15m for intraday.
     Returns signal dict with analysis_basis and analyzed_timeframe, or None.
     """
     symbol = stock["symbol"]
@@ -276,8 +418,9 @@ async def _analyze_stock(stock: dict, timeframe: str = "1D") -> Optional[dict]:
         if signal_type == "NEUTRAL":
             return None
 
-        sl_pct_val = 1.5
-        tgt_pct_val = 2.0
+        # v4: Tighter SL/target for heatmap fallback (was 1.5/2.0)
+        sl_pct_val = 0.8
+        tgt_pct_val = 1.0
         if "BUY" in signal_type:
             sl = round(ltp * (1 - sl_pct_val / 100), 2)
             tgt = round(ltp * (1 + tgt_pct_val / 100), 2)
@@ -308,16 +451,68 @@ async def _analyze_stock(stock: dict, timeframe: str = "1D") -> Optional[dict]:
     }
 
 
+# --- Multi-Timeframe Confirmation --------------------------------------------
+
+async def _confirm_with_daily_trend(symbol: str, intraday_signal: str) -> bool:
+    """v4: Confirm intraday signal with daily trend.
+
+    If 15m says BUY but 1D trend is bearish, skip the trade.
+    Returns True if daily trend confirms the intraday signal.
+    """
+    if not fyers_client.is_authenticated():
+        return True  # Can't confirm, allow the trade
+
+    try:
+        candles = fyers_client.get_historical_data(symbol, timeframe="1D", days_back=20)
+        if not candles or len(candles) < 10:
+            return True  # Not enough data, allow
+
+        df = pd.DataFrame(candles)
+        df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+        df["volume"] = df["volume"].astype(float)
+        indicators = compute_all_indicators(df)
+        daily_signal = generate_signal(indicators, instrument_type="EQUITY")
+
+        daily_direction = daily_signal.get("signal", "NEUTRAL")
+        daily_score = daily_signal.get("score", 0)
+
+        # Check for conflict
+        if "BUY" in intraday_signal.upper():
+            # Intraday wants to BUY - check daily isn't strongly bearish
+            if "SELL" in daily_direction.upper() and daily_score <= -30:
+                _add_log("TREND_CONFLICT", symbol,
+                         f"Intraday={intraday_signal} but Daily={daily_direction} (score={daily_score}). Skipping.")
+                return False
+        elif "SELL" in intraday_signal.upper():
+            # Intraday wants to SELL - check daily isn't strongly bullish
+            if "BUY" in daily_direction.upper() and daily_score >= 30:
+                _add_log("TREND_CONFLICT", symbol,
+                         f"Intraday={intraday_signal} but Daily={daily_direction} (score={daily_score}). Skipping.")
+                return False
+
+        return True
+    except Exception as e:
+        logger.debug(f"Daily trend confirmation failed for {symbol}: {e}")
+        return True  # On error, allow the trade
+
+
 # --- Trade Placement ----------------------------------------------------------
 
 async def _place_auto_trade(
     symbol: str, signal_data: dict, settings: dict,
-    analysis_basis: str = "technical", analyzed_timeframe: str = "1D"
+    analysis_basis: str = "technical", analyzed_timeframe: str = "15m"
 ) -> Optional[int]:
     """Auto-place a paper trade based on signal. Returns trade_id or None.
 
-    Enforces capital limit before placing.
+    v4 additions:
+    - Daily trade limit check
+    - Cooldown check per symbol
+    - Brokerage profitability filter
+    - Realistic target capping
+    - Multi-timeframe trend confirmation
+    - Minimum score/confidence threshold
     """
+    global _trades_placed_today
     try:
         signal_type = signal_data.get("signal", "NEUTRAL")
         entry_price = signal_data.get("entry_price", 0)
@@ -326,6 +521,7 @@ async def _place_auto_trade(
         confidence = signal_data.get("confidence", 0)
         score = signal_data.get("score", 0)
         reasons = signal_data.get("reasons", [])
+        atr = signal_data.get("atr")
 
         if not entry_price or entry_price <= 0:
             return None
@@ -337,8 +533,56 @@ async def _place_auto_trade(
         else:
             return None
 
-        sl_pct = settings.get("default_sl_percent", 1.5)
-        tgt_pct = settings.get("default_target_percent", 2.0)
+        # v4: MINIMUM SCORE/CONFIDENCE THRESHOLD
+        max_trades_day = settings.get("max_trades_per_day", MAX_TRADES_PER_DAY)
+        min_score = settings.get("min_score_for_trade", MIN_SCORE_FOR_TRADE)
+        min_confidence = settings.get("min_confidence_for_trade", MIN_CONFIDENCE_FOR_TRADE)
+
+        if abs(score) < min_score:
+            _add_log("WEAK_SIGNAL", symbol,
+                     f"Score {score:.1f} below threshold {min_score}. Skipping.")
+            return None
+
+        if confidence < min_confidence:
+            _add_log("LOW_CONFIDENCE", symbol,
+                     f"Confidence {confidence:.1f} below threshold {min_confidence}. Skipping.")
+            return None
+
+        # v4: DAILY TRADE LIMIT
+        _trades_placed_today = await _get_trades_placed_today()
+        if _trades_placed_today >= max_trades_day:
+            _add_log("DAILY_LIMIT", symbol,
+                     f"Daily trade limit ({max_trades_day}) reached. {_trades_placed_today} trades today.")
+            _push_event("DAILY_TRADE_LIMIT", {
+                "symbol": symbol,
+                "trades_today": _trades_placed_today,
+                "max_trades": max_trades_day,
+            })
+            return None
+
+        # v4: COOLDOWN CHECK
+        if _is_on_cooldown(symbol):
+            last_time = _last_trade_time_per_symbol.get(symbol)
+            elapsed = int((datetime.now(IST) - last_time).total_seconds()) if last_time else 0
+            _add_log("COOLDOWN", symbol,
+                     f"On cooldown ({elapsed}s / {TRADE_COOLDOWN_SECS}s). Skipping.")
+            return None
+
+        # v4: MULTI-TIMEFRAME CONFIRMATION
+        if analyzed_timeframe != "1D":
+            confirmed = await _confirm_with_daily_trend(symbol, signal_type)
+            if not confirmed:
+                return None
+
+        # v4: REALISTIC TARGET CAPPING
+        price_range = await _get_recent_price_range(symbol, days=5)
+        if stop_loss and target:
+            stop_loss, target = _cap_targets_to_range(
+                entry_price, stop_loss, target, side, price_range, atr
+            )
+
+        sl_pct = settings.get("default_sl_percent", 1.0)
+        tgt_pct = settings.get("default_target_percent", 1.0)
 
         if stop_loss and entry_price:
             sl_pct = abs((entry_price - stop_loss) / entry_price * 100)
@@ -368,6 +612,25 @@ async def _place_auto_trade(
                          f"Rejected after margin check: margin={available_margin:.0f}")
                 return None
             trade_cost = entry_price * quantity
+
+        # v4: BROKERAGE PROFITABILITY CHECK
+        if target:
+            brokerage_check = is_trade_profitable_after_brokerage(
+                entry_price, target, quantity, min_profit_ratio=2.0
+            )
+            if not brokerage_check["profitable"]:
+                _add_log("BROKERAGE_FILTER", symbol,
+                         f"Rejected: gross_profit={brokerage_check['gross_profit']}, "
+                         f"charges={brokerage_check['total_charges']}, "
+                         f"ratio={brokerage_check['profit_to_cost_ratio']}")
+                _push_event("BROKERAGE_FILTER", {
+                    "symbol": symbol,
+                    "gross_profit": brokerage_check["gross_profit"],
+                    "total_charges": brokerage_check["total_charges"],
+                    "net_profit": brokerage_check["net_profit"],
+                    "message": "Trade rejected: brokerage would exceed expected profit"
+                })
+                return None
 
         snapshot = {
             "auto_trade": True,
@@ -407,12 +670,18 @@ async def _place_auto_trade(
             await db.commit()
             trade_id = result.scalar()
 
+        # Update cooldown tracking
+        _last_trade_time_per_symbol[symbol] = datetime.now(IST)
+        _trades_placed_today += 1
+
         _add_log("AUTO_PLACE", symbol,
                  f"Trade #{trade_id}: {side} {quantity}x @ {entry_price}, SL={stop_loss}, "
                  f"Target={target}, Signal={signal_type}, Basis={analysis_basis}, TF={analyzed_timeframe}, "
-                 f"Cost={trade_cost:.0f}, Margin={available_margin:.0f}")
+                 f"Cost={trade_cost:.0f}, Margin={available_margin:.0f}, "
+                 f"Trades today: {_trades_placed_today}/{max_trades_day}")
         logger.info(f"Auto-placed trade #{trade_id}: {side} {symbol} {quantity}x @ {entry_price} "
-                     f"[{analyzed_timeframe}/{analysis_basis}]")
+                     f"[{analyzed_timeframe}/{analysis_basis}] "
+                     f"(SL={stop_loss}, Tgt={target}, Score={score}, Conf={confidence})")
 
         _push_event("TRADE_PLACED", {
             "trade_id": trade_id,
@@ -426,6 +695,7 @@ async def _place_auto_trade(
             "score": score,
             "analysis_basis": analysis_basis,
             "analyzed_timeframe": analyzed_timeframe,
+            "trades_today": _trades_placed_today,
         })
         return trade_id
 
@@ -499,7 +769,10 @@ async def _check_daily_limits(settings: dict) -> Dict[str, Any]:
 # --- Scan & Trade -------------------------------------------------------------
 
 async def _scan_and_trade() -> int:
-    """Main scan: get top 20 from heatmap, analyze, trade top picks."""
+    """Main scan: get top 20 from heatmap, analyze, trade top picks.
+
+    v4: Uses 15m timeframe, applies all filters before placing.
+    """
     global _last_scan_time, _last_signals
 
     settings = await _get_settings()
@@ -514,6 +787,14 @@ async def _scan_and_trade() -> int:
         logger.info(f"Auto-trade: {sr}, P&L={tp:.2f}")
         return 0
 
+    # v4: Check daily trade limit before even scanning
+    max_trades_day = settings.get("max_trades_per_day", MAX_TRADES_PER_DAY)
+    trades_today = await _get_trades_placed_today()
+    if trades_today >= max_trades_day:
+        _add_log("DAILY_LIMIT", "", f"Daily trade limit reached ({trades_today}/{max_trades_day})")
+        _last_scan_time = datetime.now(IST)
+        return 0
+
     top20 = await _get_top20_stocks()
     if not top20:
         logger.info("Auto-trade: No stocks in heatmap")
@@ -521,9 +802,10 @@ async def _scan_and_trade() -> int:
 
     _add_log("SCAN_START", "", f"Scanning top {len(top20)} stocks (10 gainers + 10 losers)")
 
+    # v4: Use 15m timeframe for intraday analysis
     analyzed: list = []
     for stock in top20:
-        result = await _analyze_stock(stock, timeframe="1D")
+        result = await _analyze_stock(stock, timeframe="15m")
         if result:
             analyzed.append(result)
         await asyncio.sleep(0.3)
@@ -543,7 +825,7 @@ async def _scan_and_trade() -> int:
             "target": sd.get("target_1") or sd.get("target"),
             "reasons": sd.get("reasons", []),
             "analysis_basis": item.get("analysis_basis", "unknown"),
-            "analyzed_timeframe": item.get("analyzed_timeframe", "1D"),
+            "analyzed_timeframe": item.get("analyzed_timeframe", "15m"),
         })
 
     signals_list.sort(key=lambda x: abs(x.get("score", 0)), reverse=True)
@@ -560,6 +842,8 @@ async def _scan_and_trade() -> int:
     tradeable = [
         a for a in analyzed
         if a["signal_data"].get("signal", "NEUTRAL") != "NEUTRAL"
+        and abs(a["signal_data"].get("score", 0)) >= MIN_SCORE_FOR_TRADE
+        and a["signal_data"].get("confidence", 0) >= MIN_CONFIDENCE_FOR_TRADE
     ]
     tradeable.sort(key=lambda x: abs(x["signal_data"].get("score", 0)), reverse=True)
 
@@ -568,10 +852,12 @@ async def _scan_and_trade() -> int:
         sym = pick["symbol"]
         if await _has_open_trade_for_symbol(sym):
             continue
+        if _is_on_cooldown(sym):
+            continue
         trade_id = await _place_auto_trade(
             sym, pick["signal_data"], settings,
             analysis_basis=pick.get("analysis_basis", "technical"),
-            analyzed_timeframe=pick.get("analyzed_timeframe", "1D")
+            analyzed_timeframe=pick.get("analyzed_timeframe", "15m")
         )
         if trade_id:
             placed += 1
@@ -580,7 +866,8 @@ async def _scan_and_trade() -> int:
 
     _last_scan_time = datetime.now(IST)
     _add_log("SCAN_COMPLETE", "",
-             f"Analyzed {len(analyzed)}/{len(top20)}, placed {placed} trades (slots: {slots})")
+             f"Analyzed {len(analyzed)}/{len(top20)}, placed {placed} trades "
+             f"(slots: {slots}, trades today: {_trades_placed_today}/{max_trades_day})")
     logger.info(f"Auto-trade scan: {len(top20)} stocks, {len(analyzed)} analyzed, {placed} placed")
     return placed
 
@@ -858,12 +1145,18 @@ async def _monitor_open_trades(settings: dict) -> int:
 # --- Engine Loop (HOT-RELOAD settings every cycle) ----------------------------
 
 async def _engine_loop():
-    """Unified engine loop with HOT-RELOAD settings every cycle."""
-    global _engine_running, _daily_target_met
+    """Unified engine loop with HOT-RELOAD settings every cycle.
+
+    v4: Scan interval increased to 120s (was 60s) to reduce trade frequency.
+    """
+    global _engine_running, _daily_target_met, _trades_placed_today
     _engine_running = True
     _daily_target_met = False
-    logger.info("Auto-trade engine v3 started (capital-aware, trailing profit, re-analysis)")
-    _add_log("ENGINE", "", "Auto-trade engine v3 started (hot-reload, trailing profit, re-analysis)")
+    _trades_placed_today = 0
+    logger.info("Auto-trade engine v4 started (smart trading, brokerage-aware)")
+    _add_log("ENGINE", "",
+             "Auto-trade engine v4 started (brokerage-aware, multi-TF, "
+             f"max {MAX_TRADES_PER_DAY}/day, {SCAN_INTERVAL_SECS}s scan interval)")
 
     while _engine_running:
         try:
@@ -882,7 +1175,9 @@ async def _engine_loop():
                 if limits["trading_allowed"]:
                     placed = await _scan_and_trade()
 
-                    for _ in range(30):  # 30 * 2s = 60s
+                    # v4: Monitor loop with longer scan interval (120s instead of 60s)
+                    monitor_iterations = SCAN_INTERVAL_SECS // 2  # 60 iterations * 2s = 120s
+                    for _ in range(monitor_iterations):
                         if not _engine_running:
                             break
                         # HOT-RELOAD inside monitor loop too
@@ -903,9 +1198,17 @@ async def _engine_loop():
                             if limits["trading_allowed"]:
                                 open_count = await _get_open_trade_count()
                                 if open_count < MAX_ACTIVE_TRADES:
-                                    _add_log("RESCAN", "",
-                                             f"Trade closed, {MAX_ACTIVE_TRADES - open_count} slots, re-scanning")
-                                    break
+                                    # v4: Still check daily trade limit before re-scanning
+                                    trades_today = await _get_trades_placed_today()
+                                    max_trades_day = settings.get("max_trades_per_day", MAX_TRADES_PER_DAY)
+                                    if trades_today < max_trades_day:
+                                        _add_log("RESCAN", "",
+                                                 f"Trade closed, {MAX_ACTIVE_TRADES - open_count} slots, "
+                                                 f"{trades_today}/{max_trades_day} trades today, re-scanning")
+                                        break
+                                    else:
+                                        _add_log("DAILY_LIMIT", "",
+                                                 f"Trade closed but daily limit reached ({trades_today}/{max_trades_day})")
                         await asyncio.sleep(2)
                 else:
                     sr = limits["stop_reason"]
@@ -933,7 +1236,7 @@ async def _engine_loop():
             await asyncio.sleep(10)
 
     _engine_running = False
-    logger.info("Auto-trade engine v3 stopped")
+    logger.info("Auto-trade engine v4 stopped")
 
 
 # --- Start / Stop / Status ----------------------------------------------------
@@ -943,7 +1246,7 @@ def start_engine():
     global _engine_task
     if _engine_task is None or _engine_task.done():
         _engine_task = asyncio.create_task(_engine_loop())
-    logger.info("Auto-trade engine v3 started")
+    logger.info("Auto-trade engine v4 started")
 
 
 def stop_engine():
@@ -952,7 +1255,7 @@ def stop_engine():
     _engine_running = False
     if _engine_task and not _engine_task.done():
         _engine_task.cancel()
-    logger.info("Auto-trade engine v3 stopped")
+    logger.info("Auto-trade engine v4 stopped")
 
 
 def get_engine_status() -> dict:
@@ -965,9 +1268,17 @@ def get_engine_status() -> dict:
         "last_reanalysis_time": _last_reanalysis_time.isoformat() if _last_reanalysis_time else None,
         "market_open": is_market_open(),
         "max_active_trades": MAX_ACTIVE_TRADES,
+        "max_trades_per_day": MAX_TRADES_PER_DAY,
+        "trades_placed_today": _trades_placed_today,
         "signals_count": len(_last_signals),
         "settings_hot_reload": True,
         "trailing_profit_enabled": True,
         "reanalysis_interval_secs": RE_ANALYSIS_INTERVAL_SECS,
+        "scan_interval_secs": SCAN_INTERVAL_SECS,
+        "min_score_for_trade": MIN_SCORE_FOR_TRADE,
+        "min_confidence_for_trade": MIN_CONFIDENCE_FOR_TRADE,
+        "trade_cooldown_secs": TRADE_COOLDOWN_SECS,
+        "brokerage_aware": True,
+        "multi_timeframe": True,
         "recent_log": _auto_trade_log[-30:],
     }
