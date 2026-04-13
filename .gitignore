@@ -52,3 +52,7 @@ Thumbs.db
 # Database
 *.db
 *.sqlite3
+stock-trading-backend/app/auto_trade_engine.py.bak
+stock-trading-backend/app/auto_trade_engine.py.bak2
+stock-trading-backend/app/auto_trade_engine.py.v3backup
+write_engine.py

@@ -65,20 +65,48 @@ def generate_signal(
     if instrument_type in ("OPTION", "FUTURE", "INDEX"):
         fno_recommendation = _get_fno_recommendation(combined_score, confidence)
 
-    # --- Stop Loss & Targets ---
+    # --- Stop Loss & Targets (v4: tighter, realistic for intraday) ---
     atr = indicators.get("atr")
     stop_loss, target_1, target_2, target_3 = None, None, None, None
     if atr and current_price:
+        # v4: Use tighter ATR multipliers for intraday trading
+        # SL = 0.75x ATR (was 1.5x), Target = 0.5x/1.0x/1.5x ATR (was 1.0x/2.0x/3.0x)
+        # Also cap SL to max 1% of price and targets to max 2% of price
+        sl_distance = min(0.75 * atr, current_price * 0.01)
+        t1_distance = min(0.5 * atr, current_price * 0.01)
+        t2_distance = min(1.0 * atr, current_price * 0.015)
+        t3_distance = min(1.5 * atr, current_price * 0.02)
+
+        # Cap targets using support/resistance if available
+        support = indicators.get("support_1")
+        resistance = indicators.get("resistance_1")
+
         if combined_score > 0:
-            stop_loss = round(current_price - 1.5 * atr, 2)
-            target_1 = round(current_price + 1.0 * atr, 2)
-            target_2 = round(current_price + 2.0 * atr, 2)
-            target_3 = round(current_price + 3.0 * atr, 2)
+            stop_loss = round(current_price - sl_distance, 2)
+            target_1 = round(current_price + t1_distance, 2)
+            target_2 = round(current_price + t2_distance, 2)
+            target_3 = round(current_price + t3_distance, 2)
+            # Cap target to resistance if available
+            if resistance and resistance > current_price:
+                target_1 = round(min(target_1, resistance), 2)
+                target_2 = round(min(target_2, resistance * 1.005), 2)
+                target_3 = round(min(target_3, resistance * 1.01), 2)
+            # Don't set SL below support
+            if support and support > 0:
+                stop_loss = round(max(stop_loss, support * 0.998), 2)
         elif combined_score < 0:
-            stop_loss = round(current_price + 1.5 * atr, 2)
-            target_1 = round(current_price - 1.0 * atr, 2)
-            target_2 = round(current_price - 2.0 * atr, 2)
-            target_3 = round(current_price - 3.0 * atr, 2)
+            stop_loss = round(current_price + sl_distance, 2)
+            target_1 = round(current_price - t1_distance, 2)
+            target_2 = round(current_price - t2_distance, 2)
+            target_3 = round(current_price - t3_distance, 2)
+            # Cap target to support if available
+            if support and support < current_price:
+                target_1 = round(max(target_1, support), 2)
+                target_2 = round(max(target_2, support * 0.995), 2)
+                target_3 = round(max(target_3, support * 0.99), 2)
+            # Don't set SL above resistance
+            if resistance and resistance > 0:
+                stop_loss = round(min(stop_loss, resistance * 1.002), 2)
 
     return {
         "signal": signal,
