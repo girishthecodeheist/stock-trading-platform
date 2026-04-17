@@ -210,8 +210,13 @@ async def _get_available_margin(settings: dict) -> float:
 async def _get_live_available_margin() -> float:
     """Return the broker-reported available margin for LIVE trading.
 
-    Queries Fyers ``funds`` and reads ``limitAmount`` from the equity bucket
-    (id=10), matching how :mod:`routers.funds` surfaces this in the UI.
+    Queries Fyers ``funds`` and reads ``equityAmount`` from row id=10
+    ("Available Balance"). The Fyers v3 payload exposes balances as
+    ``equityAmount`` / ``commodityAmount`` per row — the legacy
+    ``limitAmount`` field we previously read is absent in v3, which meant
+    every LIVE scan was rejecting with margin=0. We fall back to
+    ``limitAmount`` for forward-compat with any v2-style response.
+
     Returns 0 if we're not authenticated or the call fails — callers treat
     that as "no capacity" and skip the trade.
     """
@@ -223,11 +228,15 @@ async def _get_live_available_margin() -> float:
         logger.warning(f"Fyers funds lookup failed: {e}")
         return 0.0
     if not resp or resp.get("s") != "ok":
+        logger.warning(f"Fyers funds returned non-ok: {resp}")
         return 0.0
     for row in resp.get("fund_limit", []) or []:
         if row.get("id") == 10:
+            raw = row.get("equityAmount")
+            if raw is None:
+                raw = row.get("limitAmount", 0)
             try:
-                return float(row.get("limitAmount", 0) or 0)
+                return float(raw or 0)
             except (TypeError, ValueError):
                 return 0.0
     return 0.0
