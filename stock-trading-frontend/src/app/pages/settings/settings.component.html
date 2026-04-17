@@ -31,13 +31,13 @@
       </div>
       <div class="setting-row">
         <label>Min Net Profit / Trade (&#8377;)</label>
-        <input type="number" [(ngModel)]="settings.min_net_profit_per_trade" min="0" step="10" />
-        <small class="toggle-hint">Engine rejects setups (or auto-bumps qty) so that net P&amp;L after all Fyers charges is &ge; this value. Default &#8377;100.</small>
+        <input type="number" [(ngModel)]="settings.min_net_profit_per_trade" min="0" step="1" />
+        <small class="toggle-hint">Engine rejects setups (or auto-bumps qty) so that net P&amp;L after all Fyers charges is &ge; this value. Set to 1 to accept any positive profit. Default &#8377;1.</small>
       </div>
       <div class="setting-row">
         <label>Min Gross / Charges Ratio</label>
         <input type="number" [(ngModel)]="settings.min_profit_to_cost_ratio" min="1" step="0.1" />
-        <small class="toggle-hint">Gross profit must be at least this multiple of total charges (brokerage + STT + GST + stamp + exchange + SEBI + IPFT). Default 2.0.</small>
+        <small class="toggle-hint">Gross profit must be at least this multiple of total charges (brokerage + STT + GST + stamp + exchange + SEBI + IPFT). Set to 1.0 to require only that charges are covered. Default 1.0.</small>
       </div>
       <div class="setting-row toggle-row">
         <label>Auto-Calculate Quantity</label>
