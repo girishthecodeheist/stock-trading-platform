@@ -184,6 +184,7 @@ export class SignalsComponent implements OnInit, OnDestroy {
       TRADING_HALTED: 'Daily P&L limit hit',
       OPEN_TRADES_FULL: 'Max open trades reached',
       DUPLICATE_SYMBOL: 'Already open on this symbol',
+      FYERS_REJECTED: 'Broker rejected order',
     };
     return map[reason] || reason;
   }
@@ -191,7 +192,7 @@ export class SignalsComponent implements OnInit, OnDestroy {
   rejectionChipClass(reason: string): string {
     if (reason === 'BROKERAGE_FILTER') return 'reject-brokerage';
     if (reason === 'CAPITAL_LIMIT') return 'reject-capital';
-    if (reason === 'LIVE_NOT_CONNECTED') return 'reject-live';
+    if (reason === 'LIVE_NOT_CONNECTED' || reason === 'FYERS_REJECTED') return 'reject-live';
     if (reason === 'COOLDOWN' || reason === 'DAILY_LIMIT') return 'reject-cooldown';
     return 'reject-generic';
   }

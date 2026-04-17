@@ -102,12 +102,21 @@ async def calculate_quantity(
     settings = dict(row)
     sl_pct = sl_percent if sl_percent is not None else settings["default_sl_percent"]
     tgt_pct = target_percent if target_percent is not None else settings["default_target_percent"]
-    capital = settings["simulated_capital"]
 
-    if mode.upper() == "LIVE":
+    mode_up = (mode or "PAPER").upper()
+    if mode_up == "LIVE":
+        # Use actual Fyers available balance (equityAmount from funds API),
+        # NOT simulated_capital. Previously the LIVE quick-trade modal was
+        # sizing off \u20b9100k "paper capital" and showing qty=33 on a \u20b95k
+        # Fyers account.
+        live_margin = await auto_trade_engine._get_live_available_margin()
+        capital = float(live_margin or 0)
+        capital_source = "live_broker"
         max_loss = abs(settings["day_max_loss_live"])
         profit_target = settings["day_profit_target_live"]
     else:
+        capital = float(settings["simulated_capital"] or 0)
+        capital_source = "simulated"
         max_loss = abs(settings["day_max_loss_paper"])
         profit_target = settings["day_profit_target_paper"]
 

@@ -132,7 +132,18 @@ async def create_live_trade(body: LiveTradeCreate, db: AsyncSession = Depends(ge
     logger.info(f"Fyers entry order response ({trade_ref}): {entry_order_resp}")
     if not entry_order_resp or entry_order_resp.get("s") != "ok":
         err = entry_order_resp.get("message", "Unknown error") if entry_order_resp else "No response"
-        return {"success": False, "reason": f"Fyers entry order failed: {err}"}
+        code = entry_order_resp.get("code") if entry_order_resp else None
+        hint = ""
+        if code == -50 or "algo orders are not allowed" in (err or "").lower():
+            hint = (
+                " — Enable API/Algo trading for this app in Fyers "
+                "(myaccount.fyers.in → My APIs → request algo activation)."
+            )
+        return {
+            "success": False,
+            "reason": f"Fyers entry order failed: {err}{hint}",
+            "code": code,
+        }
 
     fyers_order_id = entry_order_resp.get("id", "")
 
