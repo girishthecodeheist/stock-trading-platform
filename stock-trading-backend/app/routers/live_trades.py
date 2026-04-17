@@ -369,7 +369,10 @@ async def close_live_trade(
     exit_fill = await fyers_client.reconcile_order_async(
         fyers_exit_order_id, timeout_seconds=10.0, poll_interval_seconds=0.5
     )
-    if exit_fill.get("status") == "FILLED" and exit_fill.get("avg_price"):
+    # Use the broker's actual fill price whenever shares actually executed
+    # — both FILLED and PARTIAL report a valid avg_price. Entry-side
+    # reconciliation treats the two the same way; keep exit P&L consistent.
+    if exit_fill.get("status") in ("FILLED", "PARTIAL") and exit_fill.get("avg_price"):
         price = float(exit_fill["avg_price"])
     if exit_fill.get("filled_qty"):
         exit_qty = int(exit_fill["filled_qty"])

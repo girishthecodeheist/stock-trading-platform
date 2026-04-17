@@ -1769,7 +1769,11 @@ async def _monitor_live_open_trades() -> int:
         exit_fill = await fyers_client.reconcile_order_async(
             fyers_exit_id, timeout_seconds=10.0, poll_interval_seconds=0.5
         )
-        if exit_fill.get("status") == "FILLED" and exit_fill.get("avg_price"):
+        # Use the actual broker fill price for any status that actually
+        # executed shares — FILLED *or* PARTIAL. get_order_by_id returns a
+        # valid avg_price for both, and the entry path already treats them
+        # the same way, so keep P&L math consistent.
+        if exit_fill.get("status") in ("FILLED", "PARTIAL") and exit_fill.get("avg_price"):
             exit_price = float(exit_fill["avg_price"])
         if exit_fill.get("filled_qty"):
             quantity = int(exit_fill["filled_qty"])
