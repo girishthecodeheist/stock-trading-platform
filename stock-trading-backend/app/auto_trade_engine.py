@@ -63,8 +63,14 @@ _sse_subscribers: list = []
 # Last analyzed signals (shared with signals dashboard)
 _last_signals: list = []
 
-# Cached settings (refreshed every cycle)
+# Cached settings (refreshed on demand, TTL-bounded)
 _cached_settings: Optional[dict] = None
+_settings_cache_time: float = 0.0
+SETTINGS_CACHE_TTL = 10  # seconds — engine tight loops call _get_settings every ~2s
+
+# Cooldown map pruning: anything older than this is removed at the start of
+# each scan cycle so the dict can't grow unbounded across a trading session.
+COOLDOWN_PRUNE_SECS = 3600  # 1 hour
 
 
 # --- SSE Event Bus -----------------------------------------------------------
@@ -125,19 +131,49 @@ def is_market_open() -> bool:
 
 # --- Settings (hot-reload) ---------------------------------------------------
 
-async def _get_settings() -> Optional[dict]:
-    """Get trading settings from DB. Called every cycle for hot-reload."""
-    global _cached_settings
+async def _get_settings(force: bool = False) -> Optional[dict]:
+    """Get trading settings, cached for SETTINGS_CACHE_TTL seconds.
+
+    The engine's monitor loop calls this every ~2s; without a cache we hit
+    the DB ~30 times/minute for data that almost never changes. Pass
+    ``force=True`` after a settings mutation to bypass the cache. Settings
+    routes also set ``_cached_settings = None`` directly to invalidate.
+    """
+    global _cached_settings, _settings_cache_time
+    now = time.time()
+    if (
+        not force
+        and _cached_settings is not None
+        and now - _settings_cache_time < SETTINGS_CACHE_TTL
+    ):
+        return _cached_settings
     try:
         async with async_session_factory() as db:
             result = await db.execute(text("SELECT * FROM trading_settings WHERE id=1"))
             row = result.mappings().first()
             if row:
                 _cached_settings = dict(row)
+                _settings_cache_time = now
                 return _cached_settings
     except Exception as e:
         logger.error(f"Failed to load settings: {e}")
     return _cached_settings  # Return cached if DB fails
+
+
+def _cleanup_cooldown_map() -> None:
+    """Prune cooldown entries older than COOLDOWN_PRUNE_SECS.
+
+    Called at the start of each scan cycle so the dict can't grow without
+    bound across a long trading session.
+    """
+    now = datetime.now(IST)
+    expired = [
+        sym
+        for sym, ts in _last_trade_time_per_symbol.items()
+        if (now - ts).total_seconds() > COOLDOWN_PRUNE_SECS
+    ]
+    for sym in expired:
+        _last_trade_time_per_symbol.pop(sym, None)
 
 
 # --- Capital & Margin ---------------------------------------------------------
