@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
@@ -149,6 +150,25 @@ async def get_auto_trade_signals():
     """Get the last computed signals from the auto-trade engine (top 20 stocks)."""
     signals = auto_trade_engine.get_last_signals()
     return {"count": len(signals), "signals": signals}
+
+
+@router.get("/rejected-signals")
+async def get_rejected_signals(
+    limit: int = Query(50, ge=1, le=200, description="Max rows to return"),
+    reason: Optional[str] = Query(None, description="Filter by reason, e.g. BROKERAGE_FILTER"),
+):
+    """Signals the engine looked at but *refused* to place, plus why.
+
+    Users were asking "I see 10 strong signals but zero trades — why?". This
+    powers a "Blocked" panel in the UI that shows each symbol that was
+    filtered out (capital, brokerage, cooldown, trend conflict, ...) so the
+    cause is visible instead of buried in logs.
+    """
+    rows = auto_trade_engine.get_recent_rejections(limit)
+    if reason:
+        r = reason.upper()
+        rows = [x for x in rows if (x.get("reason") or "").upper() == r]
+    return {"count": len(rows), "rejections": rows}
 
 
 @router.get("/open-trades/stream")

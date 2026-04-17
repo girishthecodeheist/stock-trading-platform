@@ -72,6 +72,13 @@ _sse_subscribers: list = []
 # Last analyzed signals (shared with signals dashboard)
 _last_signals: list = []
 
+# Recently-rejected signals (ring buffer). Each scan cycle a signal can be
+# dropped at one of several gates (weak score, low confidence, capital limit,
+# brokerage filter, cooldown, etc). The UI surfaces this so the user can see
+# *why* nothing was placed even though signals looked strong.
+_rejected_signals: list = []
+REJECTED_SIGNALS_BUFFER = 100
+
 # Cached settings (refreshed on demand, TTL-bounded)
 _cached_settings: Optional[dict] = None
 _settings_cache_time: float = 0.0
@@ -126,6 +133,76 @@ def _add_log(action: str, symbol: str, details: str):
     })
     if len(_auto_trade_log) > 200:
         _auto_trade_log = _auto_trade_log[-200:]
+
+
+# Reasons we expose to the UI as "blocked" — everything else is either a
+# success or an internal error and shouldn't show up on the rejected panel.
+_REJECTION_REASONS = {
+    "WEAK_SIGNAL",
+    "LOW_CONFIDENCE",
+    "DAILY_LIMIT",
+    "COOLDOWN",
+    "TREND_CONFLICT",
+    "LIVE_NOT_CONNECTED",
+    "CAPITAL_LIMIT",
+    "BROKERAGE_FILTER",
+    "TRADING_HALTED",
+    "OPEN_TRADES_FULL",
+    "DUPLICATE_SYMBOL",
+}
+
+
+def _record_rejection(
+    reason: str,
+    symbol: str,
+    signal_data: Optional[dict] = None,
+    trade_mode: Optional[str] = None,
+    details: str = "",
+    extra: Optional[dict] = None,
+) -> None:
+    """Record a rejected signal for the UI's "Blocked" panel.
+
+    Entries are dedup'd on (symbol, reason) within a 60s window so that a
+    stuck gate (e.g. CAPITAL_LIMIT every 15s) shows up as one row that keeps
+    refreshing rather than spamming the buffer.
+    """
+    if reason not in _REJECTION_REASONS:
+        return
+    global _rejected_signals
+    now = datetime.now(IST)
+    sig = signal_data or {}
+    payload = {
+        "time": now.isoformat(),
+        "reason": reason,
+        "symbol": symbol,
+        "trade_mode": trade_mode,
+        "details": details,
+        "signal": sig.get("signal"),
+        "score": sig.get("score"),
+        "confidence": sig.get("confidence"),
+        "entry_price": sig.get("entry_price"),
+        "stop_loss": sig.get("stop_loss"),
+        "target": sig.get("target_1") or sig.get("target"),
+        "extra": extra or {},
+    }
+    # Dedup: same symbol+reason within 60s → overwrite the existing row.
+    for idx, row in enumerate(_rejected_signals):
+        if row.get("symbol") == symbol and row.get("reason") == reason:
+            try:
+                prev_t = datetime.fromisoformat(row["time"])
+            except Exception:
+                prev_t = None
+            if prev_t and (now - prev_t).total_seconds() < 60:
+                _rejected_signals[idx] = payload
+                return
+    _rejected_signals.append(payload)
+    if len(_rejected_signals) > REJECTED_SIGNALS_BUFFER:
+        _rejected_signals = _rejected_signals[-REJECTED_SIGNALS_BUFFER:]
+
+
+def get_recent_rejections(limit: int = 50) -> list:
+    """Return the most recent rejections, newest first."""
+    return list(reversed(_rejected_signals[-limit:]))
 
 
 def is_market_open() -> bool:
@@ -302,14 +379,23 @@ def _is_on_cooldown(symbol: str) -> bool:
 
 async def _calculate_quantity(
     entry_price: float, sl_pct: float, tgt_pct: float,
-    settings: dict, available_margin: float
+    settings: dict, available_margin: float,
+    trade_mode: str = "PAPER",
 ) -> int:
     """Calculate optimal trade quantity based on settings AND available margin.
 
+    Loss/profit caps are mode-aware — previously we only read the PAPER caps
+    which meant a user who'd tuned ``day_max_loss_live`` / ``day_profit_target_live``
+    had no effect on LIVE auto-trades.
+
     Capital limit enforcement: quantity * entry_price must not exceed available_margin.
     """
-    max_loss = abs(settings.get("day_max_loss_paper", 1000))
-    profit_target = settings.get("day_profit_target_paper", 2000)
+    if str(trade_mode).upper() == "LIVE":
+        max_loss = abs(settings.get("day_max_loss_live", 2000) or 0)
+        profit_target = settings.get("day_profit_target_live", 4000) or 0
+    else:
+        max_loss = abs(settings.get("day_max_loss_paper", 1000) or 0)
+        profit_target = settings.get("day_profit_target_paper", 2000) or 0
 
     sl_per_share = entry_price * sl_pct / 100.0
     target_per_share = entry_price * tgt_pct / 100.0
@@ -319,14 +405,19 @@ async def _calculate_quantity(
             return 1
         return 0
 
-    qty_from_loss = max_loss / sl_per_share
-    qty_from_profit = profit_target / target_per_share
+    qty_from_loss = max_loss / sl_per_share if sl_per_share > 0 and max_loss > 0 else float("inf")
+    qty_from_profit = profit_target / target_per_share if target_per_share > 0 and profit_target > 0 else float("inf")
     qty_from_margin = available_margin / entry_price if entry_price > 0 else 0
 
     optimal_qty = int(math.floor(min(qty_from_loss, qty_from_profit, qty_from_margin)))
 
     if optimal_qty <= 0:
-        logger.info(f"Capital limit: qty=0 (margin={available_margin:.0f}, price={entry_price:.2f})")
+        logger.info(
+            f"Capital limit: qty=0 mode={trade_mode} "
+            f"margin={available_margin:.0f} price={entry_price:.2f} "
+            f"qty_from_loss={qty_from_loss:.2f} qty_from_profit={qty_from_profit:.2f} "
+            f"qty_from_margin={qty_from_margin:.2f}"
+        )
         return 0
 
     return optimal_qty
@@ -640,14 +731,24 @@ async def _place_auto_trade(
         min_score = settings.get("min_score_for_trade", MIN_SCORE_FOR_TRADE)
         min_confidence = settings.get("min_confidence_for_trade", MIN_CONFIDENCE_FOR_TRADE)
 
+        trade_mode_peek = str(settings.get("trade_mode") or "PAPER").upper()
+
         if abs(score) < min_score:
             _add_log("WEAK_SIGNAL", symbol,
                      f"Score {score:.1f} below threshold {min_score}. Skipping.")
+            _record_rejection(
+                "WEAK_SIGNAL", symbol, signal_data, trade_mode_peek,
+                f"Score {score:.1f} < min {min_score}",
+            )
             return None
 
         if confidence < min_confidence:
             _add_log("LOW_CONFIDENCE", symbol,
                      f"Confidence {confidence:.1f} below threshold {min_confidence}. Skipping.")
+            _record_rejection(
+                "LOW_CONFIDENCE", symbol, signal_data, trade_mode_peek,
+                f"Confidence {confidence:.1f} < min {min_confidence}",
+            )
             return None
 
         # v4: DAILY TRADE LIMIT
@@ -660,6 +761,10 @@ async def _place_auto_trade(
                 "trades_today": _trades_placed_today,
                 "max_trades": max_trades_day,
             })
+            _record_rejection(
+                "DAILY_LIMIT", symbol, signal_data, trade_mode_peek,
+                f"{_trades_placed_today}/{max_trades_day} trades placed today",
+            )
             return None
 
         # v4: COOLDOWN CHECK
@@ -668,12 +773,20 @@ async def _place_auto_trade(
             elapsed = int((datetime.now(IST) - last_time).total_seconds()) if last_time else 0
             _add_log("COOLDOWN", symbol,
                      f"On cooldown ({elapsed}s / {TRADE_COOLDOWN_SECS}s). Skipping.")
+            _record_rejection(
+                "COOLDOWN", symbol, signal_data, trade_mode_peek,
+                f"Re-entry cooldown: {elapsed}s / {TRADE_COOLDOWN_SECS}s",
+            )
             return None
 
         # v4: MULTI-TIMEFRAME CONFIRMATION
         if analyzed_timeframe != "1D":
             confirmed = await _confirm_with_daily_trend(symbol, signal_type)
             if not confirmed:
+                _record_rejection(
+                    "TREND_CONFLICT", symbol, signal_data, trade_mode_peek,
+                    f"{analyzed_timeframe} {signal_type} conflicts with 1D trend",
+                )
                 return None
 
         # v4: REALISTIC TARGET CAPPING
@@ -705,6 +818,10 @@ async def _place_auto_trade(
                 "symbol": symbol,
                 "message": "Fyers not connected; connect to place live trades.",
             })
+            _record_rejection(
+                "LIVE_NOT_CONNECTED", symbol, signal_data, trade_mode,
+                "Fyers not authenticated — connect in the UI to place live trades.",
+            )
             return None
 
         # CAPITAL LIMIT ENFORCEMENT
@@ -712,7 +829,9 @@ async def _place_auto_trade(
             available_margin = await _get_live_available_margin()
         else:
             available_margin = await _get_available_margin(settings)
-        quantity = await _calculate_quantity(entry_price, sl_pct, tgt_pct, settings, available_margin)
+        quantity = await _calculate_quantity(
+            entry_price, sl_pct, tgt_pct, settings, available_margin, trade_mode,
+        )
 
         if quantity <= 0:
             _add_log("CAPITAL_LIMIT", symbol,
@@ -725,6 +844,15 @@ async def _place_auto_trade(
                 "required": round(entry_price, 2),
                 "message": "Insufficient capital to place trade"
             })
+            _record_rejection(
+                "CAPITAL_LIMIT", symbol, signal_data, trade_mode,
+                f"Available {trade_mode} margin \u20b9{available_margin:.0f} insufficient "
+                f"for 1 share @ \u20b9{entry_price:.2f}",
+                extra={
+                    "available_margin": round(available_margin, 2),
+                    "required": round(entry_price, 2),
+                },
+            )
             return None
 
         trade_cost = entry_price * quantity
@@ -734,6 +862,11 @@ async def _place_auto_trade(
                 _add_log("CAPITAL_LIMIT", symbol,
                          f"Rejected after margin check: mode={trade_mode}, "
                          f"margin={available_margin:.0f}")
+                _record_rejection(
+                    "CAPITAL_LIMIT", symbol, signal_data, trade_mode,
+                    f"Trade cost exceeds {trade_mode} margin \u20b9{available_margin:.0f}",
+                    extra={"available_margin": round(available_margin, 2)},
+                )
                 return None
             trade_cost = entry_price * quantity
 
@@ -800,6 +933,25 @@ async def _place_auto_trade(
                     "min_required_ratio": min_ratio,
                     "message": "Trade rejected: would not be profitable after charges"
                 })
+                _record_rejection(
+                    "BROKERAGE_FILTER", symbol, signal_data, trade_mode,
+                    f"Net \u20b9{brokerage_check['net_profit']:.2f} at qty={quantity} "
+                    f"(gross \u20b9{brokerage_check['gross_profit']:.2f} \u2212 charges "
+                    f"\u20b9{brokerage_check['total_charges']:.2f}); "
+                    f"{', '.join(reason) or 'below floor'}",
+                    extra={
+                        "qty": quantity,
+                        "gross_profit": round(brokerage_check["gross_profit"], 2),
+                        "total_charges": round(brokerage_check["total_charges"], 2),
+                        "net_profit": round(brokerage_check["net_profit"], 2),
+                        "min_net_profit": min_net,
+                        "min_profit_to_cost_ratio": min_ratio,
+                        "profit_to_cost_ratio": round(
+                            brokerage_check.get("profit_to_cost_ratio") or 0, 3
+                        ),
+                        "charges_breakdown": brokerage_check.get("charges_breakdown"),
+                    },
+                )
                 return None
 
         snapshot = {
