@@ -29,6 +29,11 @@ export class SignalsComponent implements OnInit, OnDestroy {
   rejected: any[] = [];
   rejectedFilter: string = 'ALL';
   showRejected = true;
+  // TTL/dedup guard — loadSignals() fires on a 15s timer + SSE + toggles;
+  // we don't want to hammer /rejected-signals every single tick.
+  private rejectedLastFetch = 0;
+  private rejectedInFlight = false;
+  private static readonly REJECTED_TTL_MS = 10_000;
   private refreshInterval: any;
   private marketCheckInterval: any;
   private subs: Subscription[] = [];
@@ -133,12 +138,69 @@ export class SignalsComponent implements OnInit, OnDestroy {
       error: () => { this.loading = false; this.refreshing = false; },
     });
     this.state.refreshScannerStatus(isInitial);
+    this.loadRejected();
+  }
+
+  loadRejected(force: boolean = false) {
+    if (this.rejectedInFlight) return;
+    const now = Date.now();
+    if (!force && now - this.rejectedLastFetch < SignalsComponent.REJECTED_TTL_MS) return;
+    this.rejectedInFlight = true;
+    this.api.getRejectedSignals(50).subscribe({
+      next: (res) => {
+        this.rejected = res?.rejections || [];
+        this.rejectedLastFetch = Date.now();
+        this.rejectedInFlight = false;
+      },
+      error: () => {
+        this.rejectedInFlight = false;
+      },
+    });
+  }
+
+  get filteredRejected(): any[] {
+    if (this.rejectedFilter === 'ALL') return this.rejected;
+    return this.rejected.filter(r => (r.reason || '') === this.rejectedFilter);
+  }
+
+  get rejectedReasons(): string[] {
+    const set = new Set<string>();
+    for (const r of this.rejected) if (r.reason) set.add(r.reason);
+    return Array.from(set).sort();
+  }
+
+  setRejectedFilter(r: string) { this.rejectedFilter = r; }
+
+  rejectionLabel(reason: string): string {
+    const map: { [k: string]: string } = {
+      WEAK_SIGNAL: 'Score below threshold',
+      LOW_CONFIDENCE: 'Confidence too low',
+      DAILY_LIMIT: 'Daily trade cap reached',
+      COOLDOWN: 'Re-entry cooldown',
+      TREND_CONFLICT: '15m vs 1D trend conflict',
+      LIVE_NOT_CONNECTED: 'Fyers not connected',
+      CAPITAL_LIMIT: 'Insufficient capital',
+      BROKERAGE_FILTER: 'Not profitable after charges',
+      TRADING_HALTED: 'Daily P&L limit hit',
+      OPEN_TRADES_FULL: 'Max open trades reached',
+      DUPLICATE_SYMBOL: 'Already open on this symbol',
+    };
+    return map[reason] || reason;
+  }
+
+  rejectionChipClass(reason: string): string {
+    if (reason === 'BROKERAGE_FILTER') return 'reject-brokerage';
+    if (reason === 'CAPITAL_LIMIT') return 'reject-capital';
+    if (reason === 'LIVE_NOT_CONNECTED') return 'reject-live';
+    if (reason === 'COOLDOWN' || reason === 'DAILY_LIMIT') return 'reject-cooldown';
+    return 'reject-generic';
   }
 
   refreshNow() {
     this.refreshing = true;
     this.state.invalidateSignals();
     this.state.invalidateScanner();
+    this.loadRejected(true);
     this.loadSignals();
   }
 
