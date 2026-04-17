@@ -1,7 +1,11 @@
 import { Component, OnInit, OnDestroy, NgZone } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { RouterLink } from '@angular/router';
+import { Subscription } from 'rxjs';
+
 import { ApiService } from '../../services/api.service';
+import { StateService } from '../../services/state.service';
+import { SseService } from '../../services/sse.service';
 
 @Component({
   selector: 'app-dashboard',
@@ -25,20 +29,36 @@ export class DashboardComponent implements OnInit, OnDestroy {
   marketOpen = false;
   livePrices: { [symbol: string]: number } = {};
   autoTradeStatus: any = null;
-  private refreshInterval: any;
+  private fastInterval: any;
+  private slowInterval: any;
   private marketCheckInterval: any;
-  private eventSource: EventSource | null = null;
-  private autoTradeEventSource: EventSource | null = null;
+  private subs: Subscription[] = [];
   sseConnected = false;
   toastMessage = '';
   toastType = 'info';
   toastVisible = false;
   loading = true;
 
-  constructor(private api: ApiService, private zone: NgZone) {}
+  constructor(
+    private api: ApiService,
+    private zone: NgZone,
+    private state: StateService,
+    private sse: SseService,
+  ) {}
 
   ngOnInit() {
-    this.loadAll();
+    // Subscribe to shared state first so existing cached data renders
+    // immediately on navigation — no spinner flash when coming back to the
+    // page.
+    this.bindStateSubscriptions();
+
+    // If we already have cached funds from a previous visit, don't show the
+    // spinner at all; otherwise show it only for the initial fetch.
+    if (this.state.paperFunds !== null || this.state.liveFunds !== null) {
+      this.loading = false;
+    }
+
+    this.loadAll(true);
     this.checkMarketStatus();
     this.setupAutoRefresh();
     this.connectSSE();
@@ -50,45 +70,67 @@ export class DashboardComponent implements OnInit, OnDestroy {
   }
 
   ngOnDestroy() {
-    if (this.refreshInterval) clearInterval(this.refreshInterval);
+    if (this.fastInterval) clearInterval(this.fastInterval);
+    if (this.slowInterval) clearInterval(this.slowInterval);
     if (this.marketCheckInterval) clearInterval(this.marketCheckInterval);
-    this.disconnectSSE();
-    this.disconnectAutoTradeEvents();
+    this.subs.forEach(s => s.unsubscribe());
+    this.subs = [];
+    // Note: we don't disconnect the shared SSE streams here — they are
+    // singletons managed by SseService and other pages may still need them.
+  }
+
+  private bindStateSubscriptions() {
+    this.subs.push(
+      this.state.paperFunds$.subscribe(v => { this.paperFunds = v; }),
+      this.state.liveFunds$.subscribe(v => {
+        this.liveFunds = v;
+        if (v?.fyers_connected === true) this.fyersConnected = true;
+      }),
+      this.state.tradeMode$.subscribe(v => { this.tradeMode = v; }),
+      this.state.fyersConnected$.subscribe(v => { this.fyersConnected = v; }),
+      this.state.openPaperTrades$.subscribe(v => {
+        const prev = this.openPaperTrades.length;
+        this.openPaperTrades = v || [];
+        this.fetchLivePricesForTrades();
+        if (prev !== this.openPaperTrades.length) this.setupAutoRefresh();
+      }),
+      this.state.openLiveTrades$.subscribe(v => {
+        const prev = this.openLiveTrades.length;
+        this.openLiveTrades = v || [];
+        this.fetchLivePricesForTrades();
+        if (prev !== this.openLiveTrades.length) this.setupAutoRefresh();
+      }),
+      this.state.heatmap$.subscribe(res => {
+        if (!res) return;
+        this.heatmapData = res;
+        this.topGainers = res.top_gainers || [];
+        this.topLosers = res.top_losers || [];
+        this.sectors = res.sectors || [];
+        this.lastHeatmapUpdate = res.last_poll || '';
+      }),
+      this.state.autoTradeStatus$.subscribe(v => { this.autoTradeStatus = v; }),
+    );
   }
 
   connectSSE() {
-    this.disconnectSSE();
-    const url = this.api.getOpenTradesStreamUrl();
-    this.eventSource = new EventSource(url);
-    this.eventSource.onmessage = (event) => {
-      this.zone.run(() => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.prices) {
-            for (const [symbol, priceData] of Object.entries(data.prices)) {
-              const pd = priceData as any;
-              if (pd && pd.ltp) {
-                this.livePrices[symbol] = pd.ltp;
-              }
-            }
-            this.sseConnected = true;
-          }
-        } catch (e) {}
-      });
-    };
-    this.eventSource.onerror = () => {
-      this.sseConnected = false;
-      // Reconnect after 5s on error
-      setTimeout(() => this.connectSSE(), 5000);
-    };
+    // Shared singleton stream via SseService; connecting twice is a no-op.
+    this.subs.push(
+      this.sse.connectOpenTradesPrices().subscribe(data => {
+        if (!data?.prices) return;
+        for (const [symbol, priceData] of Object.entries(data.prices)) {
+          const pd = priceData as any;
+          if (pd && pd.ltp) this.livePrices[symbol] = pd.ltp;
+        }
+        this.sseConnected = true;
+      }),
+      this.sse.getOpenTradesConnectionState().subscribe(connected => {
+        this.sseConnected = connected;
+      }),
+    );
   }
 
   disconnectSSE() {
-    if (this.eventSource) {
-      this.eventSource.close();
-      this.eventSource = null;
-      this.sseConnected = false;
-    }
+    // Shared SSE — owned by the service, nothing to tear down here.
   }
 
   checkMarketStatus() {
@@ -103,77 +145,62 @@ export class DashboardComponent implements OnInit, OnDestroy {
   }
 
   setupAutoRefresh() {
-    if (this.refreshInterval) clearInterval(this.refreshInterval);
-    // Funds/trades refresh: 3s when trades are open (real-time P&L), 10s when market open, 30s otherwise
+    if (this.fastInterval) clearInterval(this.fastInterval);
+    if (this.slowInterval) clearInterval(this.slowInterval);
+
+    // Fast path: funds + open trades + auto-trade status.
+    //   - 5s when trades are open (near real-time P&L)
+    //   - 15s when market is open but no trades
+    //   - 60s when market is closed
     const hasOpenTrades = this.openPaperTrades.length > 0 || this.openLiveTrades.length > 0;
-    const interval = hasOpenTrades ? 3000 : (this.marketOpen ? 10000 : 30000);
-    this.refreshInterval = setInterval(() => this.loadAll(), interval);
+    const fastMs = hasOpenTrades ? 5000 : (this.marketOpen ? 15000 : 60000);
+    this.fastInterval = setInterval(() => this.loadFast(), fastMs);
+
+    // Slow path: heatmap / scanner status / trade mode every 30s — these
+    // are much cheaper now because the backend caches them at 5-30s TTL,
+    // but hitting them on the fast tick is still wasteful.
+    this.slowInterval = setInterval(() => this.loadSlow(), 30000);
   }
 
   toggleAutoTrade() {
     this.api.toggleAutoTrade().subscribe({
       next: (res) => {
         this.autoTradeStatus = { ...this.autoTradeStatus, auto_trade_enabled: res.auto_trade_enabled };
-        this.loadAll();
+        this.state.invalidateAutoTrade();
+        this.state.invalidateScanner();
+        this.loadAll(false);
       }
     });
   }
 
-  loadAll() {
-    this.loading = true;
-    let completed = 0;
-    const checkDone = () => { completed++; if (completed >= 4) this.loading = false; };
-    this.api.getCombinedFunds().subscribe({
-      next: (res) => {
-        this.paperFunds = res.paper;
-        this.liveFunds = res.live;
-        this.fyersConnected = res.live?.fyers_connected === true;
-      },
-      error: () => { checkDone(); }
-    });
-    this.api.getFyersStatus().subscribe({
-      next: (res) => {
-        if (res.authenticated === true) this.fyersConnected = true;
-      },
-      error: () => {}
-    });
-    this.api.getTradeMode().subscribe({
-      next: (res) => { this.tradeMode = res.mode || 'PAPER'; checkDone(); },
-      error: () => { checkDone(); }
-    });
-    this.api.getAutoTradeStatus().subscribe({
-      next: (res) => { this.autoTradeStatus = res; checkDone(); },
-      error: () => { checkDone(); }
-    });
-    this.api.getHeatmapLive().subscribe({
-      next: (res) => {
-        this.heatmapData = res;
-        this.topGainers = res.top_gainers || [];
-        this.topLosers = res.top_losers || [];
-        this.sectors = res.sectors || [];
-        this.lastHeatmapUpdate = res.last_poll || '';
-        checkDone();
-      },
-      error: () => { checkDone(); }
-    });
-    this.api.getPaperTrades('OPEN').subscribe({
-      next: (res) => {
-        const prev = this.openPaperTrades.length;
-        this.openPaperTrades = res || [];
-        this.fetchLivePricesForTrades();
-        if (prev !== this.openPaperTrades.length) this.setupAutoRefresh();
-      },
-      error: () => {}
-    });
-    this.api.getOpenLiveTrades().subscribe({
-      next: (res) => {
-        const prev = this.openLiveTrades.length;
-        this.openLiveTrades = res.trades || [];
-        this.fetchLivePricesForTrades();
-        if (prev !== this.openLiveTrades.length) this.setupAutoRefresh();
-      },
-      error: () => {}
-    });
+  loadAll(isInitial: boolean = false) {
+    if (isInitial) this.loading = true;
+
+    this.state.refreshFunds(isInitial);
+    this.state.refreshFyersStatus().subscribe();
+    this.state.refreshTradeMode(isInitial);
+    this.state.refreshAutoTradeStatus(isInitial);
+    this.state.refreshHeatmap(isInitial);
+    this.state.refreshOpenTrades(isInitial);
+
+    if (isInitial) {
+      // Drop the spinner once our first wave of fetches completes — exact
+      // ordering doesn't matter because the BehaviorSubjects are what the
+      // template reads from.
+      setTimeout(() => { this.loading = false; }, 400);
+    }
+  }
+
+  private loadFast() {
+    this.state.refreshFunds();
+    this.state.refreshOpenTrades();
+    this.state.refreshAutoTradeStatus();
+  }
+
+  private loadSlow() {
+    this.state.refreshHeatmap();
+    this.state.refreshScannerStatus();
+    this.state.refreshTradeMode();
   }
 
   fetchLivePricesForTrades() {
@@ -228,15 +255,8 @@ export class DashboardComponent implements OnInit, OnDestroy {
     this.api.forceRefreshHeatmap().subscribe({
       next: () => {
         setTimeout(() => {
-          this.api.getHeatmapLive().subscribe({
-            next: (res) => {
-              this.heatmapData = res;
-              this.topGainers = res.top_gainers || [];
-              this.topLosers = res.top_losers || [];
-              this.sectors = res.sectors || [];
-              this.lastHeatmapUpdate = res.last_poll || '';
-            }
-          });
+          this.state.invalidateHeatmap();
+          this.state.refreshHeatmap(true);
         }, 1000);
       }
     });
@@ -246,7 +266,11 @@ export class DashboardComponent implements OnInit, OnDestroy {
     const ltp = this.getLTP(trade);
     const exitPrice = ltp > 0 ? ltp : trade.entry_price;
     this.api.closePaperTrade(trade.id, exitPrice, 'MANUAL').subscribe({
-      next: () => this.loadAll()
+      next: () => {
+        this.state.invalidateOpenTrades();
+        this.state.invalidateFunds();
+        this.loadAll(false);
+      }
     });
   }
 
@@ -254,7 +278,11 @@ export class DashboardComponent implements OnInit, OnDestroy {
     const ltp = this.getLTP(trade);
     const exitPrice = ltp > 0 ? ltp : trade.entry_price;
     this.api.closeLiveTrade(trade.id, exitPrice, 'MANUAL').subscribe({
-      next: () => this.loadAll()
+      next: () => {
+        this.state.invalidateOpenTrades();
+        this.state.invalidateFunds();
+        this.loadAll(false);
+      }
     });
   }
 
@@ -271,42 +299,31 @@ export class DashboardComponent implements OnInit, OnDestroy {
 
   // --- Auto-Trade SSE Events ---
   connectAutoTradeEvents() {
-    this.disconnectAutoTradeEvents();
-    const url = this.api.getAutoTradeEventsStreamUrl();
-    this.autoTradeEventSource = new EventSource(url);
-    this.autoTradeEventSource.onmessage = (event) => {
-      this.zone.run(() => {
-        try {
-          const data = JSON.parse(event.data);
-          const eventType = data.type;
-          const payload = data.data || {};
-          if (eventType === 'TRADE_PLACED') {
-            this.showToast(`Auto-trade placed: ${payload.side} ${payload.symbol} @ ${payload.entry_price}`, 'success');
-            this.loadAll();
-          } else if (eventType === 'TRADE_CLOSED') {
-            const pnl = payload.pnl_amount >= 0 ? `+${payload.pnl_amount}` : `${payload.pnl_amount}`;
-            this.showToast(`Auto-trade closed: ${payload.symbol} ${payload.exit_reason} P&L: ${pnl}`, payload.pnl_amount >= 0 ? 'success' : 'error');
-            this.loadAll();
-          } else if (eventType === 'DAILY_TARGET_MET') {
-            this.showToast(`Daily profit target met! P&L: ${payload.total_pnl}`, 'success');
-            this.loadAll();
-          } else if (eventType === 'SIGNALS_UPDATED') {
-            // Signals updated, no toast needed
-          }
-        } catch (e) {}
-      });
-    };
-    this.autoTradeEventSource.onerror = () => {
-      // Reconnect after 5s on error
-      setTimeout(() => this.connectAutoTradeEvents(), 5000);
-    };
+    this.subs.push(
+      this.sse.connectAutoTradeEvents().subscribe(data => {
+        const eventType = data?.type;
+        const payload = data?.data || {};
+        if (eventType === 'TRADE_PLACED') {
+          this.showToast(`Auto-trade placed: ${payload.side} ${payload.symbol} @ ${payload.entry_price}`, 'success');
+          this.state.invalidateOpenTrades();
+          this.state.invalidateFunds();
+          this.loadAll(false);
+        } else if (eventType === 'TRADE_CLOSED') {
+          const pnl = payload.pnl_amount >= 0 ? `+${payload.pnl_amount}` : `${payload.pnl_amount}`;
+          this.showToast(`Auto-trade closed: ${payload.symbol} ${payload.exit_reason} P&L: ${pnl}`, payload.pnl_amount >= 0 ? 'success' : 'error');
+          this.state.invalidateOpenTrades();
+          this.state.invalidateFunds();
+          this.loadAll(false);
+        } else if (eventType === 'DAILY_TARGET_MET') {
+          this.showToast(`Daily profit target met! P&L: ${payload.total_pnl}`, 'success');
+          this.loadAll(false);
+        }
+      }),
+    );
   }
 
   disconnectAutoTradeEvents() {
-    if (this.autoTradeEventSource) {
-      this.autoTradeEventSource.close();
-      this.autoTradeEventSource = null;
-    }
+    // Shared SSE — owned by the service.
   }
 
   showToast(message: string, type: string = 'info') {

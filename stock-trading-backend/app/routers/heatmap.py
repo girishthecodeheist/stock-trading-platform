@@ -1,6 +1,7 @@
 """Heatmap API endpoints."""
 
 import logging
+import time
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
@@ -13,16 +14,27 @@ from app import fyers_client
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/heatmap", tags=["Heatmap"])
 
+# Heatmap payloads are large and change only when the NSE poller refreshes. A
+# 30s TTL is well within the poller's natural cadence and massively reduces
+# serialization cost under active dashboard polling.
+_live_heatmap_cache: dict = {"data": None, "timestamp": 0.0}
+LIVE_HEATMAP_CACHE_TTL = 30  # seconds
+
 
 @router.get("/live")
 async def get_live_heatmap(db: AsyncSession = Depends(get_db)):
     """Get current heatmap with all sectors + movers."""
+    now = time.time()
+    cached = _live_heatmap_cache["data"]
+    if cached is not None and now - _live_heatmap_cache["timestamp"] < LIVE_HEATMAP_CACHE_TTL:
+        return cached
+
     all_stocks = heatmap_poller.get_all_stocks()
     sectors = heatmap_poller.get_sectors()
     top_gainers = heatmap_poller.get_top_gainers(10)
     top_losers = heatmap_poller.get_top_losers(10)
 
-    return {
+    result = {
         "success": True,
         "total_stocks": len(all_stocks),
         "last_poll": heatmap_poller.last_poll_time.isoformat() if heatmap_poller.last_poll_time else None,
@@ -31,6 +43,9 @@ async def get_live_heatmap(db: AsyncSession = Depends(get_db)):
         "top_losers": top_losers,
         "all_stocks": all_stocks,
     }
+    _live_heatmap_cache["data"] = result
+    _live_heatmap_cache["timestamp"] = now
+    return result
 
 
 @router.get("/sectors")
@@ -90,6 +105,10 @@ async def force_refresh(db: AsyncSession = Depends(get_db)):
                 "fetched_at": datetime.utcnow(),
             })
         await db.commit()
+
+        # Invalidate the /live cache so the next call reflects fresh data.
+        _live_heatmap_cache["data"] = None
+        _live_heatmap_cache["timestamp"] = 0.0
 
         return {"success": True, "result": result}
     except Exception as e:

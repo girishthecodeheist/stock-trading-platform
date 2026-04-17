@@ -1,6 +1,7 @@
 """Signals API router - analyze symbols and generate explainable signals."""
 
 import json
+import time
 from datetime import datetime
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
@@ -13,6 +14,15 @@ from app.indicator_engine import compute_all_indicators
 from app.signal_engine import generate_signal
 
 router = APIRouter(prefix="/api/signals", tags=["signals"])
+
+# --- Dashboard scan cache ---------------------------------------------------
+# The /dashboard endpoint is hit by every open page on a short interval. Even
+# when the auto-trade engine has no cached signals, the expensive path does up
+# to 20 sequential Fyers historical-data calls + indicator computations per
+# request. Cache the response per-timeframe so bursty polling collapses to
+# one expensive scan every DASHBOARD_CACHE_TTL seconds.
+_dashboard_cache: dict = {"data": None, "timestamp": 0.0, "timeframe": None, "segment": None}
+DASHBOARD_CACHE_TTL = 30  # seconds
 
 
 @router.get("/analyze")
@@ -173,6 +183,16 @@ async def dashboard_scan(
     if engine_signals:
         return {"count": len(engine_signals), "instruments": engine_signals, "timeframe": timeframe}
 
+    # Serve from TTL cache when possible (same timeframe + segment).
+    now_ts = time.time()
+    if (
+        _dashboard_cache["data"] is not None
+        and _dashboard_cache["timeframe"] == timeframe
+        and _dashboard_cache["segment"] == segment
+        and now_ts - _dashboard_cache["timestamp"] < DASHBOARD_CACHE_TTL
+    ):
+        return _dashboard_cache["data"]
+
     # Otherwise, get top 20 stocks (10 gainers + 10 losers) from heatmap
     gainers = heatmap_poller.get_top_gainers(10)
     losers = heatmap_poller.get_top_losers(10)
@@ -200,7 +220,7 @@ async def dashboard_scan(
         instruments = result.fetchall()
         stocks = [{"symbol": r[0], "display_symbol": r[1], "ltp": r[3] or 0, "change_pct": 0, "volume": 0} for r in instruments]
 
-    # Fetch live Fyers prices for all stocks in batch
+    # Fetch live Fyers prices for all stocks in batch (async, off event loop)
     live_prices = {}
     fyers_connected = fyers_client.is_authenticated()
     if fyers_connected:
@@ -209,7 +229,7 @@ async def dashboard_scan(
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i:i + batch_size]
             try:
-                prices = fyers_client.get_live_prices_batch(batch)
+                prices = await fyers_client.get_live_prices_batch_async(batch)
                 live_prices.update(prices)
             except Exception:
                 pass
@@ -232,7 +252,7 @@ async def dashboard_scan(
         indicators = {}
         if fyers_connected:
             try:
-                candles = fyers_client.get_historical_data(symbol, timeframe=timeframe, days_back=100)
+                candles = await fyers_client.get_historical_data_async(symbol, timeframe=timeframe, days_back=100)
                 if candles and len(candles) >= 15:
                     df = pd.DataFrame(candles)
                     df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
@@ -313,4 +333,9 @@ async def dashboard_scan(
     # Sort by absolute score descending (strongest signals first)
     scan_results.sort(key=lambda x: abs(x.get("score", 0)), reverse=True)
 
-    return {"count": len(scan_results), "instruments": scan_results, "timeframe": timeframe}
+    result = {"count": len(scan_results), "instruments": scan_results, "timeframe": timeframe}
+    _dashboard_cache["data"] = result
+    _dashboard_cache["timestamp"] = now_ts
+    _dashboard_cache["timeframe"] = timeframe
+    _dashboard_cache["segment"] = segment
+    return result

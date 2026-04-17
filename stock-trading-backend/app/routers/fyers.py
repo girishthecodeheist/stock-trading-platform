@@ -29,7 +29,7 @@ async def fyers_status():
         "redirect_uri": fyers_client.FYERS_REDIRECT_URI,
     }
     if authenticated:
-        profile = fyers_client.get_profile()
+        profile = await fyers_client.get_profile_async()
         if profile.get("s") == "ok":
             result["profile"] = profile.get("data", {})
     return result
@@ -110,7 +110,7 @@ async def get_quotes(
         return {"status": "error", "message": "Fyers not authenticated. Call /api/fyers/auth-url first."}
 
     symbol_list = [s.strip() for s in symbols.split(",")]
-    return fyers_client.get_quotes(symbol_list)
+    return await fyers_client.get_quotes_async(symbol_list)
 
 
 @router.get("/history")
@@ -124,7 +124,7 @@ async def get_fyers_history(
     if not fyers_client.is_authenticated():
         return {"status": "error", "message": "Fyers not authenticated"}
 
-    candles = fyers_client.get_historical_data(symbol, timeframe, days)
+    candles = await fyers_client.get_historical_data_async(symbol, timeframe, days)
     
     if not candles:
         return {"status": "error", "message": "No data returned from Fyers", "symbol": symbol}
@@ -181,7 +181,7 @@ async def sync_all_instruments(
 
     results = []
     for symbol in symbols:
-        candles = fyers_client.get_historical_data(symbol, timeframe, days)
+        candles = await fyers_client.get_historical_data_async(symbol, timeframe, days)
         stored = 0
         for c in candles:
             try:
@@ -231,7 +231,7 @@ async def get_live_prices(
     batch_size = 50
     for i in range(0, len(symbol_list), batch_size):
         batch = symbol_list[i:i + batch_size]
-        prices = fyers_client.get_live_prices_batch(batch)
+        prices = await fyers_client.get_live_prices_batch_async(batch)
         all_prices.update(prices)
 
     # Also update approx_price in instruments table
@@ -269,7 +269,7 @@ async def stream_live_prices(
     async def event_generator():
         try:
             while True:
-                prices = fyers_client.get_live_prices_batch(symbol_list)
+                prices = await fyers_client.get_live_prices_batch_async(symbol_list)
                 if prices:
                     yield f"data: {json.dumps({'prices': prices, 'timestamp': datetime.now().isoformat()})}\n\n"
                 else:
