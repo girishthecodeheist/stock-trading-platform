@@ -13,6 +13,7 @@ import json
 import math
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 
@@ -239,7 +240,7 @@ async def _get_recent_price_range(symbol: str, days: int = 5) -> Optional[Dict[s
     """
     try:
         if fyers_client.is_authenticated():
-            candles = fyers_client.get_historical_data(symbol, timeframe="1D", days_back=days)
+            candles = await fyers_client.get_historical_data_async(symbol, timeframe="1D", days_back=days)
             if candles and len(candles) >= 2:
                 highs = [float(c["high"]) for c in candles]
                 lows = [float(c["low"]) for c in candles]
@@ -355,7 +356,7 @@ async def _analyze_stock(stock: dict, timeframe: str = "15m") -> Optional[dict]:
 
     if fyers_client.is_authenticated():
         try:
-            prices = fyers_client.get_live_prices_batch([symbol])
+            prices = await fyers_client.get_live_prices_batch_async([symbol])
             if prices and symbol in prices:
                 ltp = prices[symbol].get("ltp", ltp)
         except Exception:
@@ -369,7 +370,7 @@ async def _analyze_stock(stock: dict, timeframe: str = "15m") -> Optional[dict]:
 
     if fyers_client.is_authenticated():
         try:
-            candles = fyers_client.get_historical_data(symbol, timeframe=timeframe, days_back=days_back)
+            candles = await fyers_client.get_historical_data_async(symbol, timeframe=timeframe, days_back=days_back)
             if candles and len(candles) >= 15:
                 df = pd.DataFrame(candles)
                 df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
@@ -463,7 +464,7 @@ async def _confirm_with_daily_trend(symbol: str, intraday_signal: str) -> bool:
         return True  # Can't confirm, allow the trade
 
     try:
-        candles = fyers_client.get_historical_data(symbol, timeframe="1D", days_back=20)
+        candles = await fyers_client.get_historical_data_async(symbol, timeframe="1D", days_back=20)
         if not candles or len(candles) < 10:
             return True  # Not enough data, allow
 
@@ -775,6 +776,8 @@ async def _scan_and_trade() -> int:
     """
     global _last_scan_time, _last_signals
 
+    _cleanup_cooldown_map()
+
     settings = await _get_settings()
     if not settings:
         logger.warning("Auto-trade: Settings not initialized")
@@ -898,7 +901,7 @@ async def _monitor_open_trades(settings: dict) -> int:
     for i in range(0, len(symbols), batch_size):
         batch = symbols[i:i + batch_size]
         try:
-            prices = fyers_client.get_live_prices_batch(batch)
+            prices = await fyers_client.get_live_prices_batch_async(batch)
             all_prices.update(prices)
         except Exception as e:
             logger.error(f"Monitor: Failed to fetch prices: {e}")

@@ -57,6 +57,14 @@ async def update_settings(body: SettingsUpdate, db: AsyncSession = Depends(get_d
         f"UPDATE trading_settings SET {set_clauses}, updated_at = :now WHERE id=1"
     ), updates)
     await db.commit()
+    # Invalidate the auto-trade engine's settings TTL cache so the next scan
+    # cycle picks up the new values immediately instead of waiting for TTL.
+    from app import auto_trade_engine
+    auto_trade_engine._cached_settings = None
+    auto_trade_engine._settings_cache_time = 0.0
+    # Scanner status embeds settings values, so its cache must also clear.
+    from app.routers.scanner import _invalidate_status_cache
+    _invalidate_status_cache()
     logger.info(f"Settings updated: {list(updates.keys())}")
     return {"success": True, "updated": list(updates.keys())}
 

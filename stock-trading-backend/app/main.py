@@ -220,6 +220,12 @@ async def lifespan(app: FastAPI):
     logger.info("Startup complete - v3.0 NSE Auto Trading System")
     yield
     auto_trade_engine.stop_engine()
+    # Release the persistent NSE httpx client cleanly.
+    from app.heatmap_poller import heatmap_poller
+    try:
+        await heatmap_poller.close()
+    except Exception as e:
+        logger.warning(f"Heatmap poller close failed: {e}")
     logger.info("Shutting down...")
 
 

@@ -33,7 +33,7 @@ async def comprehensive_analysis(
     if fyers_client.is_authenticated():
         days_map = {"1m": 7, "5m": 30, "15m": 60, "1D": 365, "1W": 730, "1Y": 365}
         days = days_map.get(timeframe, 365)
-        fyers_candles = fyers_client.get_historical_data(symbol, timeframe, days)
+        fyers_candles = await fyers_client.get_historical_data_async(symbol, timeframe, days)
         if fyers_candles and len(fyers_candles) >= 10:
             data_source = "fyers_live"
             df = pd.DataFrame(fyers_candles)

@@ -175,7 +175,7 @@ async def close_live_trade(
         return {"success": False, "reason": "Fyers not connected. Please authenticate first."}
 
     exit_side = -1 if trade["direction"] == "LONG" else 1
-    exit_order_resp = fyers_client.place_order(
+    exit_order_resp = await fyers_client.place_order_async(
         symbol=trade["symbol"],
         side=exit_side,
         qty=trade["quantity"],

@@ -1,6 +1,7 @@
 """Funds API endpoints - Paper and Live fund management."""
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends
 from sqlalchemy import text
@@ -14,6 +15,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/funds", tags=["Funds"])
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+# Short-lived cache for /combined — the dashboard polls this every few seconds
+# from multiple components. 5s TTL collapses bursts into a single DB + Fyers
+# round trip while still feeling real-time to the UI.
+_combined_funds_cache: dict = {"data": None, "timestamp": 0.0}
+COMBINED_FUNDS_CACHE_TTL = 5  # seconds
 
 
 @router.get("/paper")
@@ -108,7 +115,7 @@ async def get_live_funds(db: AsyncSession = Depends(get_db)):
 
     if is_connected:
         try:
-            funds_resp = fyers_client.get_funds()
+            funds_resp = await fyers_client.get_funds_async()
             if funds_resp and funds_resp.get("s") == "ok":
                 fund_list = funds_resp.get("fund_limit", [])
                 for f in fund_list:
@@ -127,10 +134,18 @@ async def get_live_funds(db: AsyncSession = Depends(get_db)):
 @router.get("/combined")
 async def get_combined_funds(db: AsyncSession = Depends(get_db)):
     """Get both paper and live funds in one response."""
+    now = time.time()
+    cached = _combined_funds_cache["data"]
+    if cached is not None and now - _combined_funds_cache["timestamp"] < COMBINED_FUNDS_CACHE_TTL:
+        return cached
+
     paper = await get_paper_funds(db)
     live = await get_live_funds(db)
-    return {
+    result = {
         "success": True,
         "paper": paper,
         "live": live,
     }
+    _combined_funds_cache["data"] = result
+    _combined_funds_cache["timestamp"] = now
+    return result
