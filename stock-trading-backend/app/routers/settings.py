@@ -10,6 +10,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.brokerage_calc import (
+    calc_brokerage,
+    is_trade_profitable_after_brokerage,
+    min_qty_for_net_profit,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/settings", tags=["Settings"])
@@ -33,6 +38,8 @@ class SettingsUpdate(BaseModel):
     auto_trade_enabled: Optional[bool] = None
     auto_quantity_enabled: Optional[bool] = None
     max_trades_per_day: Optional[int] = None
+    min_net_profit_per_trade: Optional[float] = None
+    min_profit_to_cost_ratio: Optional[float] = None
 
 
 @router.get("")
@@ -121,17 +128,37 @@ async def calculate_quantity(
     optimal_qty = int(math.floor(min(qty_from_loss, qty_from_profit, qty_from_capital)))
     optimal_qty = max(optimal_qty, 1)  # At least 1
 
+    # Brokerage-aware quantity floor: respect the user's configured net-profit
+    # minimum (clamped by the loss/capital caps above).
+    min_net = float(settings.get("min_net_profit_per_trade") or 100.0)
+    min_ratio = float(settings.get("min_profit_to_cost_ratio") or 2.0)
+    cap_qty = int(math.floor(min(qty_from_loss, qty_from_capital))) or optimal_qty
+    target_price = entry_price * (1 + tgt_pct / 100.0)
+    min_qty_net = min_qty_for_net_profit(
+        entry_price, target_price,
+        min_net_profit=min_net,
+        min_profit_ratio=min_ratio,
+        max_qty=max(cap_qty, optimal_qty),
+    )
+    bumped_qty = optimal_qty
+    if min_qty_net and min_qty_net > optimal_qty and min_qty_net <= cap_qty:
+        bumped_qty = min_qty_net
+    profitability = is_trade_profitable_after_brokerage(
+        entry_price, target_price, bumped_qty,
+        min_profit_ratio=min_ratio, min_net_profit=min_net,
+    )
+
     return {
         "success": True,
-        "quantity": optimal_qty,
+        "quantity": bumped_qty,
         "entry_price": entry_price,
         "sl_percent": sl_pct,
         "target_percent": tgt_pct,
         "sl_per_share": round(sl_per_share, 2),
         "target_per_share": round(target_per_share, 2),
-        "potential_loss": round(optimal_qty * sl_per_share, 2),
-        "potential_profit": round(optimal_qty * target_per_share, 2),
-        "total_investment": round(optimal_qty * entry_price, 2),
+        "potential_loss": round(bumped_qty * sl_per_share, 2),
+        "potential_profit": round(bumped_qty * target_per_share, 2),
+        "total_investment": round(bumped_qty * entry_price, 2),
         "max_loss_limit": max_loss,
         "profit_target": profit_target,
         "capital": capital,
@@ -139,5 +166,56 @@ async def calculate_quantity(
             "qty_from_loss_limit": int(math.floor(qty_from_loss)),
             "qty_from_profit_target": int(math.floor(qty_from_profit)),
             "qty_from_capital": int(math.floor(qty_from_capital)),
-        }
+            "qty_from_net_profit_floor": min_qty_net,
+            "raw_optimal_qty": optimal_qty,
+        },
+        "brokerage": {
+            "min_net_profit": min_net,
+            "min_profit_to_cost_ratio": min_ratio,
+            "gross_profit": profitability["gross_profit"],
+            "total_charges": profitability["total_charges"],
+            "net_profit": profitability["net_profit"],
+            "profit_to_cost_ratio": profitability["profit_to_cost_ratio"],
+            "profitable": profitability["profitable"],
+            "charges_breakdown": profitability["charges_breakdown"],
+        },
+    }
+
+
+@router.get("/brokerage-preview")
+async def brokerage_preview(
+    entry_price: float = Query(..., description="Entry price"),
+    target_price: float = Query(..., description="Exit/target price"),
+    qty: int = Query(..., description="Quantity"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Preview the full Fyers equity-intraday charges for a hypothetical trade.
+
+    Useful for the UI to show a live "Net P&L after charges" figure as the
+    user types. Uses the current ``min_net_profit_per_trade`` /
+    ``min_profit_to_cost_ratio`` settings for the pass/fail verdict.
+    """
+    result = await db.execute(text(
+        "SELECT min_net_profit_per_trade, min_profit_to_cost_ratio "
+        "FROM trading_settings WHERE id=1"
+    ))
+    row = result.mappings().first()
+    min_net = float((row or {}).get("min_net_profit_per_trade") or 100.0)
+    min_ratio = float((row or {}).get("min_profit_to_cost_ratio") or 2.0)
+
+    verdict = is_trade_profitable_after_brokerage(
+        entry_price, target_price, qty,
+        min_profit_ratio=min_ratio, min_net_profit=min_net,
+    )
+    charges = calc_brokerage(
+        entry_price * qty,
+        target_price * qty if target_price >= entry_price else entry_price * qty,
+        qty,
+    )
+    return {
+        "success": True,
+        "min_net_profit": min_net,
+        "min_profit_to_cost_ratio": min_ratio,
+        "verdict": verdict,
+        "charges_breakdown": charges,
     }

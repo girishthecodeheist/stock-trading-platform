@@ -57,6 +57,8 @@ async def ensure_columns():
         ("paper_trades", "exit_reason", "ALTER TABLE paper_trades ADD COLUMN exit_reason VARCHAR(50)"),
         ("paper_trades", "is_auto_trade", "ALTER TABLE paper_trades ADD COLUMN is_auto_trade BOOLEAN DEFAULT false"),
         ("trading_settings", "max_trades_per_day", "ALTER TABLE trading_settings ADD COLUMN max_trades_per_day INTEGER DEFAULT 50"),
+        ("trading_settings", "min_net_profit_per_trade", "ALTER TABLE trading_settings ADD COLUMN min_net_profit_per_trade FLOAT DEFAULT 100"),
+        ("trading_settings", "min_profit_to_cost_ratio", "ALTER TABLE trading_settings ADD COLUMN min_profit_to_cost_ratio FLOAT DEFAULT 2.0"),
     ]
 
     async with async_session_factory() as db:

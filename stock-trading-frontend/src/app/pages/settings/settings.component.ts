@@ -49,6 +49,8 @@ export class SettingsComponent implements OnInit {
       default_quantity: this.settings.default_quantity,
       max_open_trades: this.settings.max_open_trades,
       max_trades_per_day: this.settings.max_trades_per_day,
+      min_net_profit_per_trade: this.settings.min_net_profit_per_trade,
+      min_profit_to_cost_ratio: this.settings.min_profit_to_cost_ratio,
       day_max_loss_paper: this.settings.day_max_loss_paper,
       day_profit_target_paper: this.settings.day_profit_target_paper,
       day_max_loss_live: this.settings.day_max_loss_live,
