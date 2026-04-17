@@ -305,8 +305,6 @@ def get_order_by_id(order_id: str) -> dict:
             if str(o.get("id")) == str(order_id):
                 match = o
                 break
-        if match is None and orders:
-            match = orders[0]
         if match is None:
             return {
                 "status": "UNKNOWN",

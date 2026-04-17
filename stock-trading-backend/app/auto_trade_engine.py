@@ -1139,6 +1139,10 @@ async def _place_auto_trade(
                         symbol,
                         f"Partial fill: {filled_qty}/{quantity} @ ₹{(avg_fill or entry_price):.2f}",
                     )
+            # Log/SSE downstream must reflect what actually filled, not what
+            # we requested. PAPER mode trivially uses the original values.
+            quantity = effective_qty
+            entry_price = effective_entry
         else:
             async with async_session_factory() as db:
                 result = await db.execute(text(
