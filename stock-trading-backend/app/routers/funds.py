@@ -118,13 +118,23 @@ async def get_live_funds(db: AsyncSession = Depends(get_db)):
             funds_resp = await fyers_client.get_funds_async()
             if funds_resp and funds_resp.get("s") == "ok":
                 fund_list = funds_resp.get("fund_limit", [])
+                # Fyers v3 exposes balances as ``equityAmount`` /
+                # ``commodityAmount`` per row. ``limitAmount`` was a v2
+                # shape that no longer comes back — using it would zero
+                # out the whole live funds panel.
                 for f in fund_list:
                     fid = f.get("id")
-                    if fid == 10:
-                        fund_data["total_balance"] = f.get("equityAmount", 0)
-                        fund_data["available_margin"] = f.get("limitAmount", 0)
-                    elif fid == 11:
-                        fund_data["utilized_margin"] = f.get("limitAmount", 0)
+                    amt = f.get("equityAmount")
+                    if amt is None:
+                        amt = f.get("limitAmount", 0)  # v2 fallback
+                    if fid == 1:
+                        fund_data["total_balance"] = amt or 0
+                    elif fid == 2:
+                        fund_data["utilized_margin"] = amt or 0
+                    elif fid == 10:
+                        fund_data["available_margin"] = amt or 0
+                        if not fund_data.get("total_balance"):
+                            fund_data["total_balance"] = amt or 0
         except Exception as e:
             logger.warning(f"Failed to fetch Fyers funds: {e}")
 
