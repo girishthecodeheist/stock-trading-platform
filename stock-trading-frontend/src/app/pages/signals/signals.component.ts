@@ -133,6 +133,52 @@ export class SignalsComponent implements OnInit, OnDestroy {
       error: () => { this.loading = false; this.refreshing = false; },
     });
     this.state.refreshScannerStatus(isInitial);
+    this.loadRejected();
+  }
+
+  loadRejected() {
+    this.api.getRejectedSignals(50).subscribe({
+      next: (res) => { this.rejected = res?.rejections || []; },
+      error: () => { /* non-fatal */ },
+    });
+  }
+
+  get filteredRejected(): any[] {
+    if (this.rejectedFilter === 'ALL') return this.rejected;
+    return this.rejected.filter(r => (r.reason || '') === this.rejectedFilter);
+  }
+
+  get rejectedReasons(): string[] {
+    const set = new Set<string>();
+    for (const r of this.rejected) if (r.reason) set.add(r.reason);
+    return Array.from(set).sort();
+  }
+
+  setRejectedFilter(r: string) { this.rejectedFilter = r; }
+
+  rejectionLabel(reason: string): string {
+    const map: { [k: string]: string } = {
+      WEAK_SIGNAL: 'Score below threshold',
+      LOW_CONFIDENCE: 'Confidence too low',
+      DAILY_LIMIT: 'Daily trade cap reached',
+      COOLDOWN: 'Re-entry cooldown',
+      TREND_CONFLICT: '15m vs 1D trend conflict',
+      LIVE_NOT_CONNECTED: 'Fyers not connected',
+      CAPITAL_LIMIT: 'Insufficient capital',
+      BROKERAGE_FILTER: 'Not profitable after charges',
+      TRADING_HALTED: 'Daily P&L limit hit',
+      OPEN_TRADES_FULL: 'Max open trades reached',
+      DUPLICATE_SYMBOL: 'Already open on this symbol',
+    };
+    return map[reason] || reason;
+  }
+
+  rejectionChipClass(reason: string): string {
+    if (reason === 'BROKERAGE_FILTER') return 'reject-brokerage';
+    if (reason === 'CAPITAL_LIMIT') return 'reject-capital';
+    if (reason === 'LIVE_NOT_CONNECTED') return 'reject-live';
+    if (reason === 'COOLDOWN' || reason === 'DAILY_LIMIT') return 'reject-cooldown';
+    return 'reject-generic';
   }
 
   refreshNow() {
