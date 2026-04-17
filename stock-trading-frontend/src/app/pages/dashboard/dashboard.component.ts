@@ -17,15 +17,10 @@ import { SseService } from '../../services/sse.service';
 export class DashboardComponent implements OnInit, OnDestroy {
   paperFunds: any = null;
   liveFunds: any = null;
-  heatmapData: any = null;
   openPaperTrades: any[] = [];
   openLiveTrades: any[] = [];
-  topGainers: any[] = [];
-  topLosers: any[] = [];
-  sectors: any[] = [];
   tradeMode = 'PAPER';
   fyersConnected = false;
-  lastHeatmapUpdate: string = '';
   marketOpen = false;
   livePrices: { [symbol: string]: number } = {};
   autoTradeStatus: any = null;
@@ -100,14 +95,6 @@ export class DashboardComponent implements OnInit, OnDestroy {
         this.fetchLivePricesForTrades();
         if (prev !== this.openLiveTrades.length) this.setupAutoRefresh();
       }),
-      this.state.heatmap$.subscribe(res => {
-        if (!res) return;
-        this.heatmapData = res;
-        this.topGainers = res.top_gainers || [];
-        this.topLosers = res.top_losers || [];
-        this.sectors = res.sectors || [];
-        this.lastHeatmapUpdate = res.last_poll || '';
-      }),
       this.state.autoTradeStatus$.subscribe(v => { this.autoTradeStatus = v; }),
     );
   }
@@ -180,7 +167,6 @@ export class DashboardComponent implements OnInit, OnDestroy {
     this.state.refreshFyersStatus().subscribe();
     this.state.refreshTradeMode(isInitial);
     this.state.refreshAutoTradeStatus(isInitial);
-    this.state.refreshHeatmap(isInitial);
     this.state.refreshOpenTrades(isInitial);
 
     if (isInitial) {
@@ -198,7 +184,9 @@ export class DashboardComponent implements OnInit, OnDestroy {
   }
 
   private loadSlow() {
-    this.state.refreshHeatmap();
+    // Heatmap was dropped from the dashboard — the dedicated /heatmap page
+    // still refreshes its own data. Keep the scanner/trade-mode pulls so
+    // the auto-trade control panel stays accurate.
     this.state.refreshScannerStatus();
     this.state.refreshTradeMode();
   }
@@ -249,17 +237,6 @@ export class DashboardComponent implements OnInit, OnDestroy {
     } else {
       return ((trade.entry_price - ltp) / trade.entry_price) * 100;
     }
-  }
-
-  refreshHeatmap() {
-    this.api.forceRefreshHeatmap().subscribe({
-      next: () => {
-        setTimeout(() => {
-          this.state.invalidateHeatmap();
-          this.state.refreshHeatmap(true);
-        }, 1000);
-      }
-    });
   }
 
   closePaperTrade(trade: any) {

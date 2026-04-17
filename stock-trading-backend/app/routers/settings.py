@@ -41,6 +41,7 @@ class SettingsUpdate(BaseModel):
     max_trades_per_day: Optional[int] = None
     min_net_profit_per_trade: Optional[float] = None
     min_profit_to_cost_ratio: Optional[float] = None
+    product_type: Optional[str] = None  # INTRADAY | CNC
 
 
 @router.get("")
@@ -59,6 +60,15 @@ async def update_settings(body: SettingsUpdate, db: AsyncSession = Depends(get_d
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
         return {"success": False, "error": "No fields to update"}
+
+    if "product_type" in updates:
+        pt = str(updates["product_type"]).upper()
+        if pt not in ("INTRADAY", "CNC"):
+            return {
+                "success": False,
+                "error": "product_type must be 'INTRADAY' or 'CNC'",
+            }
+        updates["product_type"] = pt
 
     set_clauses = ", ".join(f"{k} = :{k}" for k in updates)
     updates["now"] = datetime.utcnow()

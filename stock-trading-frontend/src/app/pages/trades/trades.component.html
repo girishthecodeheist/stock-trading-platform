@@ -47,7 +47,23 @@
             <td>{{ t.exit_price ? '&#8377;' + t.exit_price : '-' }}</td>
             <td>&#8377;{{ t.stop_loss || 0 }}</td>
             <td>&#8377;{{ t.target || t.target_price || 0 }}</td>
-            <td>{{ t.quantity }}</td>
+            <td>
+              <ng-container *ngIf="t._mode === 'LIVE' && t.filled_quantity !== null && t.filled_quantity !== undefined; else qtyPlain">
+                <span [title]="'Filled ' + t.filled_quantity + ' / requested ' + t.quantity"
+                      [class.partial]="t.filled_quantity < t.quantity">
+                  {{ t.filled_quantity }}<span class="qty-slash" *ngIf="t.filled_quantity !== t.quantity">/{{ t.quantity }}</span>
+                </span>
+                <span class="broker-chip"
+                      *ngIf="t.broker_status"
+                      [class.partial]="t.broker_status === 'PARTIAL'"
+                      [class.pending]="t.broker_status === 'PENDING'"
+                      [class.rejected]="t.broker_status === 'REJECTED' || t.broker_status === 'CANCELLED'"
+                      [attr.aria-label]="'Broker status: ' + t.broker_status">
+                  {{ t.broker_status }}
+                </span>
+              </ng-container>
+              <ng-template #qtyPlain>{{ t.quantity }}</ng-template>
+            </td>
             <td [class]="getPnlClass(t.pnl_amount || t.net_pnl || 0)">
               {{ (t.pnl_amount || t.net_pnl) ? '&#8377;' + (t.pnl_amount || t.net_pnl) : '-' }}
             </td>

@@ -135,12 +135,25 @@
     <h3 class="section-title">Day Limits - Live</h3>
     <div class="settings-grid">
       <div class="setting-row">
-        <label>Max Loss per Day (&#8377;)</label>
-        <input type="number" [(ngModel)]="settings.day_max_loss_live" step="100" />
+        <label for="dayMaxLossLive">Max Loss per Day (&#8377;)</label>
+        <input id="dayMaxLossLive" type="number" [(ngModel)]="settings.day_max_loss_live" step="100" />
       </div>
       <div class="setting-row">
-        <label>Profit Target / Day (&#8377;)</label>
-        <input type="number" [(ngModel)]="settings.day_profit_target_live" step="100" />
+        <label for="dayProfitTargetLive">Profit Target / Day (&#8377;)</label>
+        <input id="dayProfitTargetLive" type="number" [(ngModel)]="settings.day_profit_target_live" step="100" />
+      </div>
+      <div class="setting-row">
+        <label for="productType">Order Product Type</label>
+        <select id="productType" [(ngModel)]="settings.product_type" aria-label="Live order product type">
+          <option value="INTRADAY">INTRADAY (MIS &mdash; 5&times; leverage)</option>
+          <option value="CNC">CNC (Delivery &mdash; full cash)</option>
+        </select>
+        <small class="toggle-hint">
+          INTRADAY uses MIS leverage but Fyers auto-squares-off at 15:15 IST and
+          rejects new MIS orders after that cutoff. CNC can be placed any time
+          during market hours (9:15&ndash;15:30 IST), but requires full cash and
+          holds positions overnight. Applies to live orders only.
+        </small>
       </div>
     </div>
   </div>
