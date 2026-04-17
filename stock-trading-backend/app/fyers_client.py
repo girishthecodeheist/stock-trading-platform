@@ -2,12 +2,39 @@
 
 import os
 import json
+import socket
 import hashlib
 import logging
 import asyncio
 from datetime import datetime, timedelta
 from typing import Optional
 from pathlib import Path
+
+# --- Force IPv4 for all outbound HTTP traffic from this process ---
+# Fyers' SEBI-compliant algo apps enforce IP whitelisting per request. If the
+# OS happens to resolve their endpoints over IPv6, the outbound address does
+# NOT match the whitelisted IPv4 the user registered on the Fyers dashboard,
+# and the broker rejects every order with:
+#   "Orders are only allowed from whitelisted IP addresses. This request was
+#    received from IP: <v6-addr>."
+# urllib3 (used transitively by fyers-apiv3 \u2192 requests) picks the address
+# family via ``urllib3.util.connection.allowed_gai_family``. Overriding it to
+# AF_INET guarantees every socket opened from this Python process uses IPv4.
+# We also patch ``socket.getaddrinfo`` directly so anything talking raw
+# sockets (e.g. websockets, httpx) behaves the same way.
+if os.environ.get("FYERS_FORCE_IPV4", "1") not in ("0", "false", "False"):
+    try:
+        import urllib3.util.connection as _u3c
+        _u3c.allowed_gai_family = lambda: socket.AF_INET
+    except Exception:
+        pass
+
+    _original_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        return _original_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 from fyers_apiv3 import fyersModel
 
