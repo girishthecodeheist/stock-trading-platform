@@ -25,7 +25,7 @@ from app import fyers_client
 from app.heatmap_poller import heatmap_poller
 from app.indicator_engine import compute_all_indicators
 from app.signal_engine import generate_signal
-from app.brokerage_calc import is_trade_profitable_after_brokerage
+from app.brokerage_calc import calc_brokerage, is_trade_profitable_after_brokerage
 
 logger = logging.getLogger(__name__)
 
@@ -198,32 +198,79 @@ async def _get_available_margin(settings: dict) -> float:
     return max(available, 0)
 
 
+async def _get_live_available_margin() -> float:
+    """Return the broker-reported available margin for LIVE trading.
+
+    Queries Fyers ``funds`` and reads ``limitAmount`` from the equity bucket
+    (id=10), matching how :mod:`routers.funds` surfaces this in the UI.
+    Returns 0 if we're not authenticated or the call fails — callers treat
+    that as "no capacity" and skip the trade.
+    """
+    if not fyers_client.is_authenticated():
+        return 0.0
+    try:
+        resp = await fyers_client.get_funds_async()
+    except Exception as e:
+        logger.warning(f"Fyers funds lookup failed: {e}")
+        return 0.0
+    if not resp or resp.get("s") != "ok":
+        return 0.0
+    for row in resp.get("fund_limit", []) or []:
+        if row.get("id") == 10:
+            try:
+                return float(row.get("limitAmount", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
 async def _get_open_trade_count() -> int:
-    """Get count of open paper trades."""
+    """Count open trades across both paper_trades and live_trades.
+
+    The engine enforces a single MAX_ACTIVE_TRADES budget regardless of mode
+    so that a user who flips from PAPER to LIVE mid-session can't accidentally
+    blow past the slot limit.
+    """
     async with async_session_factory() as db:
-        result = await db.execute(text("SELECT COUNT(*) FROM paper_trades WHERE status = 'OPEN'"))
-        return result.scalar() or 0
+        paper = await db.execute(text("SELECT COUNT(*) FROM paper_trades WHERE status = 'OPEN'"))
+        live = await db.execute(text("SELECT COUNT(*) FROM live_trades WHERE status = 'OPEN'"))
+        return int(paper.scalar() or 0) + int(live.scalar() or 0)
 
 
 async def _has_open_trade_for_symbol(symbol: str) -> bool:
-    """Check if there is already an open trade for this symbol."""
+    """Check if there is an open trade for ``symbol`` in either mode."""
     async with async_session_factory() as db:
-        result = await db.execute(
+        paper = await db.execute(
             text("SELECT COUNT(*) FROM paper_trades WHERE symbol = :symbol AND status = 'OPEN'"),
-            {"symbol": symbol}
+            {"symbol": symbol},
         )
-        return (result.scalar() or 0) > 0
+        if (paper.scalar() or 0) > 0:
+            return True
+        live = await db.execute(
+            text("SELECT COUNT(*) FROM live_trades WHERE symbol = :symbol AND status = 'OPEN'"),
+            {"symbol": symbol},
+        )
+        return (live.scalar() or 0) > 0
 
 
 async def _get_trades_placed_today() -> int:
-    """Count how many trades were auto-placed today."""
+    """Count auto-placed trades today across paper_trades + live_trades.
+
+    Paper trades are flagged via ``is_auto_trade``. Live trades don't have
+    that column, so we identify auto-placed ones by ``strategy = 'AUTO'``
+    which :func:`_place_auto_trade` writes when in LIVE mode.
+    """
     today = datetime.now(IST).date()
     async with async_session_factory() as db:
-        result = await db.execute(text(
+        paper = await db.execute(text(
             "SELECT COUNT(*) FROM paper_trades "
             "WHERE is_auto_trade = true AND DATE(entry_time) = :today"
         ), {"today": today})
-        return result.scalar() or 0
+        live = await db.execute(text(
+            "SELECT COUNT(*) FROM live_trades "
+            "WHERE strategy = 'AUTO' AND DATE(entry_time) = :today"
+        ), {"today": today})
+        return int(paper.scalar() or 0) + int(live.scalar() or 0)
 
 
 def _is_on_cooldown(symbol: str) -> bool:
@@ -626,15 +673,36 @@ async def _place_auto_trade(
         if target and entry_price:
             tgt_pct = abs((target - entry_price) / entry_price * 100)
 
+        # MODE ROUTING: PAPER writes to paper_trades; LIVE places a real Fyers
+        # order and writes to live_trades. Mode is read per-call from settings
+        # so a mid-session flip is picked up on the next scan.
+        trade_mode = str(settings.get("trade_mode") or "PAPER").upper()
+        if trade_mode not in ("PAPER", "LIVE"):
+            trade_mode = "PAPER"
+
+        if trade_mode == "LIVE" and not fyers_client.is_authenticated():
+            _add_log("LIVE_NOT_CONNECTED", symbol,
+                     "LIVE mode selected but Fyers is not authenticated. Skipping.")
+            _push_event("LIVE_NOT_CONNECTED", {
+                "symbol": symbol,
+                "message": "Fyers not connected; connect to place live trades.",
+            })
+            return None
+
         # CAPITAL LIMIT ENFORCEMENT
-        available_margin = await _get_available_margin(settings)
+        if trade_mode == "LIVE":
+            available_margin = await _get_live_available_margin()
+        else:
+            available_margin = await _get_available_margin(settings)
         quantity = await _calculate_quantity(entry_price, sl_pct, tgt_pct, settings, available_margin)
 
         if quantity <= 0:
             _add_log("CAPITAL_LIMIT", symbol,
-                     f"Rejected: margin={available_margin:.0f}, price={entry_price:.2f}")
+                     f"Rejected: mode={trade_mode}, margin={available_margin:.0f}, "
+                     f"price={entry_price:.2f}")
             _push_event("CAPITAL_LIMIT", {
                 "symbol": symbol,
+                "mode": trade_mode,
                 "available_margin": round(available_margin, 2),
                 "required": round(entry_price, 2),
                 "message": "Insufficient capital to place trade"
@@ -646,7 +714,8 @@ async def _place_auto_trade(
             quantity = int(math.floor(available_margin / entry_price))
             if quantity <= 0:
                 _add_log("CAPITAL_LIMIT", symbol,
-                         f"Rejected after margin check: margin={available_margin:.0f}")
+                         f"Rejected after margin check: mode={trade_mode}, "
+                         f"margin={available_margin:.0f}")
                 return None
             trade_cost = entry_price * quantity
 
@@ -671,6 +740,7 @@ async def _place_auto_trade(
 
         snapshot = {
             "auto_trade": True,
+            "mode": trade_mode,
             "signal_type": signal_type,
             "score": score,
             "analysis_basis": analysis_basis,
@@ -682,47 +752,118 @@ async def _place_auto_trade(
         full_reasons = list(reasons) if isinstance(reasons, list) else [str(reasons)]
         full_reasons.insert(0, f"[{analyzed_timeframe}] {analysis_basis}")
 
-        async with async_session_factory() as db:
-            result = await db.execute(text(
-                "INSERT INTO paper_trades (symbol, instrument_type, timeframe, side, entry_price, "
-                "entry_time, quantity, stop_loss, target, status, signal_confidence, "
-                "signal_reasons, indicators_snapshot, is_auto_trade) "
-                "VALUES (:symbol, 'EQUITY', :timeframe, :side, :entry_price, "
-                ":entry_time, :quantity, :stop_loss, :target, 'OPEN', :signal_confidence, "
-                ":signal_reasons, :indicators_snapshot, true) "
-                "RETURNING id"
-            ), {
-                "symbol": symbol,
-                "side": side,
-                "entry_price": entry_price,
-                "entry_time": datetime.now(IST).replace(tzinfo=None),
-                "quantity": quantity,
-                "stop_loss": stop_loss,
-                "target": target,
-                "timeframe": analyzed_timeframe,
-                "signal_confidence": confidence,
-                "signal_reasons": json.dumps(full_reasons),
-                "indicators_snapshot": json.dumps(snapshot),
-            })
-            await db.commit()
-            trade_id = result.scalar()
+        if trade_mode == "LIVE":
+            # Place the real entry order on Fyers FIRST — only persist the
+            # trade if the broker accepts it, otherwise we'd have a phantom
+            # OPEN row that monitor loops would try to close via a non-existent
+            # position.
+            fyers_side = 1 if side == "BUY" else -1
+            entry_resp = await fyers_client.place_order_async(
+                symbol=symbol,
+                side=fyers_side,
+                qty=quantity,
+                order_type=2,  # MARKET
+                product_type="INTRADAY",
+            )
+            logger.info(f"Fyers auto entry response for {symbol}: {entry_resp}")
+            if not entry_resp or entry_resp.get("s") != "ok":
+                err = entry_resp.get("message", "Unknown") if entry_resp else "No response"
+                _add_log("LIVE_ORDER_FAILED", symbol, f"Fyers rejected: {err}")
+                _push_event("LIVE_ORDER_FAILED", {
+                    "symbol": symbol, "side": side, "qty": quantity,
+                    "error": err,
+                })
+                return None
+            fyers_order_id = entry_resp.get("id", "") or ""
+
+            direction = "LONG" if side == "BUY" else "SHORT"
+            display_sym = symbol.replace("NSE:", "").replace("-EQ", "")
+            risk = abs(entry_price - stop_loss) if stop_loss else 0
+            reward = abs(target - entry_price) if target else 0
+            rr = round(reward / risk, 2) if risk > 0 else 0
+
+            now_ist = datetime.now(IST)
+            async with async_session_factory() as db:
+                count_result = await db.execute(text(
+                    "SELECT COUNT(*) FROM live_trades WHERE DATE(created_at) = :today"
+                ), {"today": now_ist.date()})
+                count = int(count_result.scalar() or 0)
+                trade_ref = f"LT-{now_ist.strftime('%Y%m%d')}-{count + 1:04d}"
+
+                result = await db.execute(text(
+                    "INSERT INTO live_trades "
+                    "(trade_ref, symbol, display_symbol, direction, entry_price, "
+                    " entry_time, quantity, stop_loss, sl_percent, target_price, "
+                    " target_percent, strategy, risk_reward, signal_score, "
+                    " signal_strength, status, fyers_order_id) "
+                    "VALUES (:trade_ref, :symbol, :display_sym, :direction, :entry_price, "
+                    " :entry_time, :quantity, :stop_loss, :sl_pct, :target_price, "
+                    " :tgt_pct, 'AUTO', :rr, :signal_score, :signal_strength, "
+                    " 'OPEN', :order_id) "
+                    "RETURNING id"
+                ), {
+                    "trade_ref": trade_ref,
+                    "symbol": symbol,
+                    "display_sym": display_sym,
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "entry_time": now_ist.replace(tzinfo=None),
+                    "quantity": quantity,
+                    "stop_loss": stop_loss,
+                    "sl_pct": round(sl_pct, 2),
+                    "target_price": target,
+                    "tgt_pct": round(tgt_pct, 2),
+                    "rr": rr,
+                    "signal_score": score,
+                    "signal_strength": signal_type,
+                    "order_id": fyers_order_id,
+                })
+                await db.commit()
+                trade_id = result.scalar()
+        else:
+            async with async_session_factory() as db:
+                result = await db.execute(text(
+                    "INSERT INTO paper_trades (symbol, instrument_type, timeframe, side, entry_price, "
+                    "entry_time, quantity, stop_loss, target, status, signal_confidence, "
+                    "signal_reasons, indicators_snapshot, is_auto_trade) "
+                    "VALUES (:symbol, 'EQUITY', :timeframe, :side, :entry_price, "
+                    ":entry_time, :quantity, :stop_loss, :target, 'OPEN', :signal_confidence, "
+                    ":signal_reasons, :indicators_snapshot, true) "
+                    "RETURNING id"
+                ), {
+                    "symbol": symbol,
+                    "side": side,
+                    "entry_price": entry_price,
+                    "entry_time": datetime.now(IST).replace(tzinfo=None),
+                    "quantity": quantity,
+                    "stop_loss": stop_loss,
+                    "target": target,
+                    "timeframe": analyzed_timeframe,
+                    "signal_confidence": confidence,
+                    "signal_reasons": json.dumps(full_reasons),
+                    "indicators_snapshot": json.dumps(snapshot),
+                })
+                await db.commit()
+                trade_id = result.scalar()
 
         # Update cooldown tracking
         _last_trade_time_per_symbol[symbol] = datetime.now(IST)
         _trades_placed_today += 1
 
         _add_log("AUTO_PLACE", symbol,
-                 f"Trade #{trade_id}: {side} {quantity}x @ {entry_price}, SL={stop_loss}, "
-                 f"Target={target}, Signal={signal_type}, Basis={analysis_basis}, TF={analyzed_timeframe}, "
+                 f"[{trade_mode}] Trade #{trade_id}: {side} {quantity}x @ {entry_price}, "
+                 f"SL={stop_loss}, Target={target}, Signal={signal_type}, "
+                 f"Basis={analysis_basis}, TF={analyzed_timeframe}, "
                  f"Cost={trade_cost:.0f}, Margin={available_margin:.0f}, "
                  f"Trades today: {_trades_placed_today}/{max_trades_day}")
-        logger.info(f"Auto-placed trade #{trade_id}: {side} {symbol} {quantity}x @ {entry_price} "
-                     f"[{analyzed_timeframe}/{analysis_basis}] "
+        logger.info(f"Auto-placed [{trade_mode}] trade #{trade_id}: {side} {symbol} "
+                     f"{quantity}x @ {entry_price} [{analyzed_timeframe}/{analysis_basis}] "
                      f"(SL={stop_loss}, Tgt={target}, Score={score}, Conf={confidence})")
 
         _push_event("TRADE_PLACED", {
             "trade_id": trade_id,
             "symbol": symbol,
+            "mode": trade_mode,
             "side": side,
             "quantity": quantity,
             "entry_price": entry_price,
@@ -1177,8 +1318,172 @@ async def _monitor_open_trades(settings: dict) -> int:
 
     _last_monitor_time = datetime.now(IST)
     if closed_count > 0:
-        _add_log("MONITOR", "", f"Auto-closed {closed_count} trades")
-    return closed_count
+        _add_log("MONITOR", "", f"Auto-closed {closed_count} paper trades")
+
+    # Live trades live in a separate table and must be closed via a real Fyers
+    # exit order; delegate to a dedicated monitor so PAPER and LIVE bookkeeping
+    # stay cleanly separated.
+    try:
+        live_closed = await _monitor_live_open_trades()
+    except Exception as e:
+        logger.error(f"Live-trade monitor error: {e}")
+        live_closed = 0
+
+    return closed_count + live_closed
+
+
+async def _monitor_live_open_trades() -> int:
+    """Close live trades whose SL/target has been hit.
+
+    Mirrors the paper-trade monitor but operates on ``live_trades`` rows and
+    routes the exit through ``fyers_client.place_order_async``. We intentionally
+    keep this conservative — no trailing/re-analysis for live — until that
+    behaviour has been validated end-to-end on a real account.
+    """
+    if not fyers_client.is_authenticated():
+        return 0
+
+    async with async_session_factory() as db:
+        result = await db.execute(text(
+            "SELECT id, trade_ref, symbol, direction, entry_price, quantity, "
+            "       stop_loss, target_price, entry_time "
+            "FROM live_trades WHERE status = 'OPEN'"
+        ))
+        open_trades = result.fetchall()
+
+    if not open_trades:
+        return 0
+
+    symbols = list({t[2] for t in open_trades})
+    prices: dict = {}
+    for i in range(0, len(symbols), 50):
+        batch = symbols[i:i + 50]
+        try:
+            prices.update(await fyers_client.get_live_prices_batch_async(batch))
+        except Exception as e:
+            logger.error(f"Live monitor: price fetch failed: {e}")
+
+    if not prices:
+        return 0
+
+    closed = 0
+    for row in open_trades:
+        trade_id = row[0]
+        trade_ref = row[1]
+        symbol = row[2]
+        direction = row[3]  # LONG / SHORT
+        entry_price = float(row[4])
+        quantity = int(row[5] or 0)
+        stop_loss = float(row[6]) if row[6] is not None else None
+        target_price = float(row[7]) if row[7] is not None else None
+        entry_time = row[8]
+
+        price_data = prices.get(symbol) or {}
+        ltp = float(price_data.get("ltp", 0) or 0)
+        if ltp <= 0 or quantity <= 0:
+            continue
+
+        exit_reason = None
+        exit_price = ltp
+        if direction == "LONG":
+            if stop_loss is not None and ltp <= stop_loss:
+                exit_reason, exit_price = "AUTO_SL_HIT", stop_loss
+            elif target_price is not None and ltp >= target_price:
+                exit_reason, exit_price = "AUTO_TARGET_HIT", target_price
+        else:  # SHORT
+            if stop_loss is not None and ltp >= stop_loss:
+                exit_reason, exit_price = "AUTO_SL_HIT", stop_loss
+            elif target_price is not None and ltp <= target_price:
+                exit_reason, exit_price = "AUTO_TARGET_HIT", target_price
+
+        if not exit_reason:
+            continue
+
+        exit_side = -1 if direction == "LONG" else 1
+        exit_resp = await fyers_client.place_order_async(
+            symbol=symbol,
+            side=exit_side,
+            qty=quantity,
+            order_type=2,  # MARKET
+            product_type="INTRADAY",
+        )
+        logger.info(f"Fyers auto exit response for {trade_ref or trade_id}: {exit_resp}")
+        if not exit_resp or exit_resp.get("s") != "ok":
+            err = exit_resp.get("message", "Unknown") if exit_resp else "No response"
+            _add_log("LIVE_EXIT_FAILED", symbol,
+                     f"Trade #{trade_id}: Fyers rejected exit: {err}")
+            continue
+
+        fyers_exit_id = exit_resp.get("id", "") or ""
+
+        if direction == "LONG":
+            gross_pnl = (exit_price - entry_price) * quantity
+        else:
+            gross_pnl = (entry_price - exit_price) * quantity
+
+        trade_value = exit_price * quantity
+        charges = calc_brokerage(trade_value, quantity)
+        net_pnl = gross_pnl - charges["total_charges"]
+        now = datetime.now(IST)
+        duration = int((now - entry_time).total_seconds() / 60) if entry_time else 0
+
+        async with async_session_factory() as db:
+            await db.execute(text("""
+                UPDATE live_trades SET
+                    status = 'CLOSED',
+                    exit_price = :exit_price,
+                    exit_time = :exit_time,
+                    exit_reason = :exit_reason,
+                    gross_pnl = :gross_pnl,
+                    brokerage = :brokerage,
+                    stt = :stt,
+                    exchange_charges = :exchange_charges,
+                    gst = :gst,
+                    sebi_charges = :sebi_charges,
+                    stamp_duty = :stamp_duty,
+                    net_pnl = :net_pnl,
+                    trade_duration_minutes = :duration,
+                    fyers_target_order_id = COALESCE(fyers_target_order_id, :exit_id)
+                WHERE id = :id AND status = 'OPEN'
+            """), {
+                "exit_price": round(exit_price, 2),
+                "exit_time": now.replace(tzinfo=None),
+                "exit_reason": exit_reason,
+                "gross_pnl": round(gross_pnl, 2),
+                "brokerage": charges["brokerage"],
+                "stt": charges["stt"],
+                "exchange_charges": charges["exchange_charges"],
+                "gst": charges["gst"],
+                "sebi_charges": charges["sebi_charges"],
+                "stamp_duty": charges["stamp_duty"],
+                "net_pnl": round(net_pnl, 2),
+                "duration": duration,
+                "exit_id": fyers_exit_id,
+                "id": trade_id,
+            })
+            await db.commit()
+
+        closed += 1
+        _add_log("AUTO_CLOSE", symbol,
+                 f"[LIVE] Trade #{trade_id}: {exit_reason}, Exit={exit_price}, "
+                 f"Net P&L={net_pnl:+.2f}")
+        logger.info(f"Auto-closed [LIVE] trade #{trade_id}: {exit_reason} @ {exit_price}, "
+                     f"gross={gross_pnl:+.2f}, net={net_pnl:+.2f}")
+
+        _push_event("TRADE_CLOSED", {
+            "trade_id": trade_id,
+            "mode": "LIVE",
+            "symbol": symbol,
+            "side": "BUY" if direction == "LONG" else "SELL",
+            "exit_price": round(exit_price, 2),
+            "exit_reason": exit_reason,
+            "gross_pnl": round(gross_pnl, 2),
+            "net_pnl": round(net_pnl, 2),
+        })
+
+    if closed:
+        _add_log("MONITOR", "", f"Auto-closed {closed} live trades")
+    return closed
 
 
 # --- Engine Loop (HOT-RELOAD settings every cycle) ----------------------------
