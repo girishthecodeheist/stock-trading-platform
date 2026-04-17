@@ -204,4 +204,5 @@ class TradingSettings(Base):
     auto_trade_enabled = Column(Boolean, default=False)
     auto_quantity_enabled = Column(Boolean, default=True)
     scanner_running = Column(Boolean, default=False)
+    max_trades_per_day = Column(Integer, default=50)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

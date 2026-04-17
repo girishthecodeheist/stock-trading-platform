@@ -24,6 +24,11 @@
         <label>Max Open Trades</label>
         <input type="number" [(ngModel)]="settings.max_open_trades" />
       </div>
+      <div class="setting-row">
+        <label>Max Trades / Day</label>
+        <input type="number" [(ngModel)]="settings.max_trades_per_day" min="1" max="500" />
+        <small class="toggle-hint">Upper bound on new auto-placed trades per day (paper + live combined). Default 50.</small>
+      </div>
       <div class="setting-row toggle-row">
         <label>Auto-Calculate Quantity</label>
         <div class="toggle-switch">
