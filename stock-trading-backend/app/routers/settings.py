@@ -15,6 +15,7 @@ from app.brokerage_calc import (
     is_trade_profitable_after_brokerage,
     min_qty_for_net_profit,
 )
+from app import auto_trade_engine
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/settings", tags=["Settings"])
@@ -162,6 +163,8 @@ async def calculate_quantity(
         "max_loss_limit": max_loss,
         "profit_target": profit_target,
         "capital": capital,
+        "capital_source": capital_source,
+        "mode": mode_up,
         "breakdown": {
             "qty_from_loss_limit": int(math.floor(qty_from_loss)),
             "qty_from_profit_target": int(math.floor(qty_from_profit)),

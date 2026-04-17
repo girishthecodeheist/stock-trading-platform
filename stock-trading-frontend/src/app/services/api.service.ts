@@ -260,6 +260,14 @@ export class ApiService {
     return this.http.get(`${this.baseUrl}/api/v1/scanner/auto-trade/signals`);
   }
 
+  // Rejected signals — symbols the engine looked at but refused to place
+  // (brokerage filter, capital limit, cooldown, trend conflict, ...).
+  getRejectedSignals(limit: number = 50, reason?: string): Observable<any> {
+    let params = new HttpParams().set('limit', String(limit));
+    if (reason) params = params.set('reason', reason);
+    return this.http.get(`${this.baseUrl}/api/v1/scanner/rejected-signals`, { params });
+  }
+
   // Smart Quantity Calculator
   calculateQuantity(entryPrice: number, slPercent?: number, targetPercent?: number, mode?: string): Observable<any> {
     let params = new HttpParams().set('entry_price', entryPrice.toString());

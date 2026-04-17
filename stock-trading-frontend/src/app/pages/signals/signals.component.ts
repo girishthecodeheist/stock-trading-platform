@@ -25,6 +25,10 @@ export class SignalsComponent implements OnInit, OnDestroy {
   loading = true;
   refreshing = false;
   lastUpdate = '';
+  // Blocked signals — answers "I see strong signals, why zero trades?"
+  rejected: any[] = [];
+  rejectedFilter: string = 'ALL';
+  showRejected = true;
   private refreshInterval: any;
   private marketCheckInterval: any;
   private subs: Subscription[] = [];
