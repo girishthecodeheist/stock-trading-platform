@@ -29,6 +29,11 @@ export class SignalsComponent implements OnInit, OnDestroy {
   rejected: any[] = [];
   rejectedFilter: string = 'ALL';
   showRejected = true;
+  // TTL/dedup guard — loadSignals() fires on a 15s timer + SSE + toggles;
+  // we don't want to hammer /rejected-signals every single tick.
+  private rejectedLastFetch = 0;
+  private rejectedInFlight = false;
+  private static readonly REJECTED_TTL_MS = 10_000;
   private refreshInterval: any;
   private marketCheckInterval: any;
   private subs: Subscription[] = [];
@@ -136,10 +141,20 @@ export class SignalsComponent implements OnInit, OnDestroy {
     this.loadRejected();
   }
 
-  loadRejected() {
+  loadRejected(force: boolean = false) {
+    if (this.rejectedInFlight) return;
+    const now = Date.now();
+    if (!force && now - this.rejectedLastFetch < SignalsComponent.REJECTED_TTL_MS) return;
+    this.rejectedInFlight = true;
     this.api.getRejectedSignals(50).subscribe({
-      next: (res) => { this.rejected = res?.rejections || []; },
-      error: () => { /* non-fatal */ },
+      next: (res) => {
+        this.rejected = res?.rejections || [];
+        this.rejectedLastFetch = Date.now();
+        this.rejectedInFlight = false;
+      },
+      error: () => {
+        this.rejectedInFlight = false;
+      },
     });
   }
 
@@ -185,6 +200,7 @@ export class SignalsComponent implements OnInit, OnDestroy {
     this.refreshing = true;
     this.state.invalidateSignals();
     this.state.invalidateScanner();
+    this.loadRejected(true);
     this.loadSignals();
   }
 
