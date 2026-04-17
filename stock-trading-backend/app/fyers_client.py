@@ -343,3 +343,71 @@ def get_live_prices_batch(symbols: list[str]) -> dict:
     except Exception as e:
         logger.error(f"Fyers batch quotes error: {e}")
         return {}
+
+
+# --- Async wrappers ---------------------------------------------------------
+# The fyers_apiv3 SDK is synchronous. Every call (history/quotes/funds/...) does
+# blocking network I/O. If we call these directly from inside an async FastAPI
+# handler we block the entire event loop for the duration of the request,
+# making every concurrent request wait. These wrappers offload the blocking
+# SDK call to a worker thread via ``asyncio.to_thread`` so the event loop can
+# keep serving other requests in parallel.
+
+
+async def get_historical_data_async(
+    symbol: str,
+    timeframe: str = "1D",
+    days_back: int = 365,
+) -> list[dict]:
+    """Async wrapper around ``get_historical_data``."""
+    return await asyncio.to_thread(get_historical_data, symbol, timeframe, days_back)
+
+
+async def get_live_prices_batch_async(symbols: list[str]) -> dict:
+    """Async wrapper around ``get_live_prices_batch``."""
+    return await asyncio.to_thread(get_live_prices_batch, symbols)
+
+
+async def get_quotes_async(symbols: list[str]) -> dict:
+    """Async wrapper around ``get_quotes``."""
+    return await asyncio.to_thread(get_quotes, symbols)
+
+
+async def get_funds_async() -> dict:
+    """Async wrapper around ``get_funds``."""
+    return await asyncio.to_thread(get_funds)
+
+
+async def get_profile_async() -> dict:
+    """Async wrapper around ``get_profile``."""
+    return await asyncio.to_thread(get_profile)
+
+
+async def get_positions_async() -> dict:
+    """Async wrapper around ``get_positions``."""
+    return await asyncio.to_thread(get_positions)
+
+
+async def get_orders_async() -> dict:
+    """Async wrapper around ``get_orders``."""
+    return await asyncio.to_thread(get_orders)
+
+
+async def get_market_depth_async(symbol: str) -> dict:
+    """Async wrapper around ``get_market_depth``."""
+    return await asyncio.to_thread(get_market_depth, symbol)
+
+
+async def place_order_async(
+    symbol: str,
+    side: int,
+    qty: int,
+    order_type: int = 2,
+    product_type: str = "INTRADAY",
+    price: float = 0,
+    stop_price: float = 0,
+) -> dict:
+    """Async wrapper around ``place_order``."""
+    return await asyncio.to_thread(
+        place_order, symbol, side, qty, order_type, product_type, price, stop_price
+    )

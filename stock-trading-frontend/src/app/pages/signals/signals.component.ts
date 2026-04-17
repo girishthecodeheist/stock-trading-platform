@@ -1,8 +1,11 @@
 import { Component, OnInit, OnDestroy, NgZone } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { RouterLink } from '@angular/router';
+import { Subscription } from 'rxjs';
 import { ApiService } from '../../services/api.service';
 import { ToastService } from '../../services/toast.service';
+import { StateService } from '../../services/state.service';
+import { SseService } from '../../services/sse.service';
 
 @Component({
   selector: 'app-signals',
@@ -24,12 +27,38 @@ export class SignalsComponent implements OnInit, OnDestroy {
   lastUpdate = '';
   private refreshInterval: any;
   private marketCheckInterval: any;
-  private autoTradeEventSource: EventSource | null = null;
+  private subs: Subscription[] = [];
 
-  constructor(private api: ApiService, private toast: ToastService, private zone: NgZone) {}
+  constructor(
+    private api: ApiService,
+    private toast: ToastService,
+    private zone: NgZone,
+    private state: StateService,
+    private sse: SseService,
+  ) {}
 
   ngOnInit() {
-    this.loadSignals();
+    // Hydrate immediately from cached state if available (no spinner flash
+    // on navigation back to this page).
+    const cached = this.state.signals;
+    if (cached && cached.length > 0) {
+      this.signals = cached;
+      this.loading = false;
+    }
+    this.subs.push(
+      this.state.signals$.subscribe(v => {
+        this.signals = v || [];
+        if (this.signals.length > 0) this.loading = false;
+      }),
+      this.state.scannerStatus$.subscribe(v => {
+        this.scannerStatus = v;
+        this.autoTradeStatus = v?.engine ?? this.autoTradeStatus;
+      }),
+      this.state.autoTradeStatus$.subscribe(v => {
+        if (v) this.autoTradeStatus = v;
+      }),
+    );
+    this.loadSignals(true);
     this.checkMarketStatus();
     this.setupAutoRefresh();
     this.connectAutoTradeEvents();
@@ -42,39 +71,32 @@ export class SignalsComponent implements OnInit, OnDestroy {
   ngOnDestroy() {
     if (this.refreshInterval) clearInterval(this.refreshInterval);
     if (this.marketCheckInterval) clearInterval(this.marketCheckInterval);
-    if (this.autoTradeEventSource) {
-      this.autoTradeEventSource.close();
-      this.autoTradeEventSource = null;
-    }
+    this.subs.forEach(s => s.unsubscribe());
+    this.subs = [];
+    // Shared SSE streams belong to SseService — leave them running.
   }
 
   connectAutoTradeEvents() {
-    if (this.autoTradeEventSource) {
-      this.autoTradeEventSource.close();
-    }
-    const url = this.api.getAutoTradeEventsStreamUrl();
-    this.autoTradeEventSource = new EventSource(url);
-    this.autoTradeEventSource.onmessage = (event) => {
-      this.zone.run(() => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'SIGNALS_UPDATED') {
-            this.loadSignals();
-          } else if (data.type === 'TRADE_PLACED') {
-            const p = data.data || {};
-            this.toast.success('Auto-Trade', `${p.side} ${p.symbol} @ ${p.entry_price}`);
-            this.loadSignals();
-          } else if (data.type === 'TRADE_CLOSED') {
-            const p = data.data || {};
-            this.toast.info('Trade Closed', `${p.symbol} ${p.exit_reason} P&L: ${p.pnl_amount}`);
-            this.loadSignals();
-          }
-        } catch (e) {}
-      });
-    };
-    this.autoTradeEventSource.onerror = () => {
-      setTimeout(() => this.connectAutoTradeEvents(), 5000);
-    };
+    this.subs.push(
+      this.sse.connectAutoTradeEvents().subscribe(data => {
+        if (!data?.type) return;
+        if (data.type === 'SIGNALS_UPDATED') {
+          // Cheap refresh — invalidate TTL so the next scan reads fresh.
+          this.state.invalidateSignals();
+          this.loadSignals();
+        } else if (data.type === 'TRADE_PLACED') {
+          const p = data.data || {};
+          this.toast.success('Auto-Trade', `${p.side} ${p.symbol} @ ${p.entry_price}`);
+          this.state.invalidateSignals();
+          this.loadSignals();
+        } else if (data.type === 'TRADE_CLOSED') {
+          const p = data.data || {};
+          this.toast.info('Trade Closed', `${p.symbol} ${p.exit_reason} P&L: ${p.pnl_amount}`);
+          this.state.invalidateSignals();
+          this.loadSignals();
+        }
+      }),
+    );
   }
 
   checkMarketStatus() {
@@ -88,45 +110,46 @@ export class SignalsComponent implements OnInit, OnDestroy {
 
   setupAutoRefresh() {
     if (this.refreshInterval) clearInterval(this.refreshInterval);
-    // Continuous live refresh every 3 seconds
-    const interval = this.marketOpen ? 3000 : 15000;
+    // The auto-trade engine already scans every ~120s and pushes
+    // SIGNALS_UPDATED via SSE, which drives the real refresh. This interval
+    // is only a safety net — slow it down to 15s during market hours and
+    // 60s otherwise.
+    const interval = this.marketOpen ? 15000 : 60000;
     this.refreshInterval = setInterval(() => this.loadSignals(), interval);
   }
 
-  loadSignals() {
-    this.api.getDashboardScan(undefined, this.timeframe).subscribe({
-      next: (res) => {
-        this.signals = res.instruments || res.signals || [];
+  loadSignals(isInitial: boolean = false) {
+    if (isInitial && this.signals.length === 0) this.loading = true;
+    this.state.refreshSignals(this.timeframe, isInitial).subscribe({
+      next: () => {
         this.lastUpdate = new Date().toLocaleTimeString();
         this.loading = false;
         this.refreshing = false;
       },
-      error: () => { this.loading = false; this.refreshing = false; }
+      error: () => { this.loading = false; this.refreshing = false; },
     });
-    this.api.getScannerStatus().subscribe({
-      next: (res) => {
-        this.scannerStatus = res;
-        this.autoTradeStatus = res?.engine;
-      },
-      error: () => {}
-    });
+    this.state.refreshScannerStatus(isInitial);
   }
 
   refreshNow() {
     this.refreshing = true;
+    this.state.invalidateSignals();
+    this.state.invalidateScanner();
     this.loadSignals();
   }
 
   setTimeframe(tf: string) {
     this.timeframe = tf;
     this.loading = true;
-    this.loadSignals();
+    this.state.invalidateSignals();
+    this.loadSignals(true);
   }
 
   toggleScanner() {
     this.api.toggleScanner().subscribe({
       next: () => {
         this.toast.info('Scanner', this.scannerStatus?.scanner_running ? 'Scanner paused' : 'Scanner started');
+        this.state.invalidateScanner();
         this.loadSignals();
       }
     });
@@ -136,6 +159,8 @@ export class SignalsComponent implements OnInit, OnDestroy {
     this.api.toggleAutoTrade().subscribe({
       next: (res) => {
         this.toast.info('Auto-Trade', res.auto_trade_enabled ? 'Auto-trade ENABLED' : 'Auto-trade DISABLED');
+        this.state.invalidateScanner();
+        this.state.invalidateAutoTrade();
         this.loadSignals();
       }
     });

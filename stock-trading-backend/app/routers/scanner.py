@@ -3,6 +3,7 @@
 import json
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
@@ -19,16 +20,27 @@ router = APIRouter(prefix="/api/v1/scanner", tags=["Scanner"])
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+# Scanner status is polled aggressively by multiple components. It is cheap,
+# but collapsing duplicate calls within a 5s window still saves a DB round
+# trip per refresh cycle.
+_status_cache: dict = {"data": None, "timestamp": 0.0}
+STATUS_CACHE_TTL = 5  # seconds
+
 
 @router.get("/status")
 async def get_scanner_status(db: AsyncSession = Depends(get_db)):
     """Get scanner running/paused status + auto-trade engine status."""
+    now = time.time()
+    cached = _status_cache["data"]
+    if cached is not None and now - _status_cache["timestamp"] < STATUS_CACHE_TTL:
+        return cached
+
     result = await db.execute(text(
         "SELECT scanner_running, auto_trade_enabled, scan_frequency_minutes FROM trading_settings WHERE id=1"
     ))
     row = result.mappings().first()
     engine_status = auto_trade_engine.get_engine_status()
-    return {
+    payload = {
         "success": True,
         "scanner_running": row["scanner_running"] if row else False,
         "auto_trade_enabled": row["auto_trade_enabled"] if row else False,
@@ -37,6 +49,14 @@ async def get_scanner_status(db: AsyncSession = Depends(get_db)):
         "universe_size": len(heatmap_poller.active_movers),
         "engine": engine_status,
     }
+    _status_cache["data"] = payload
+    _status_cache["timestamp"] = now
+    return payload
+
+
+def _invalidate_status_cache() -> None:
+    _status_cache["data"] = None
+    _status_cache["timestamp"] = 0.0
 
 
 @router.put("/toggle")
@@ -49,6 +69,7 @@ async def toggle_scanner(db: AsyncSession = Depends(get_db)):
         "UPDATE trading_settings SET scanner_running = :val WHERE id=1"
     ), {"val": new_val})
     await db.commit()
+    _invalidate_status_cache()
     return {"success": True, "scanner_running": new_val}
 
 
@@ -68,6 +89,7 @@ async def toggle_auto_trade(db: AsyncSession = Depends(get_db)):
     else:
         auto_trade_engine.stop_engine()
 
+    _invalidate_status_cache()
     return {"success": True, "auto_trade_enabled": new_val}
 
 
@@ -158,7 +180,7 @@ async def stream_open_trades_prices(
                 for i in range(0, len(symbols), batch_size):
                     batch = symbols[i:i + batch_size]
                     try:
-                        prices = fyers_client.get_live_prices_batch(batch)
+                        prices = await fyers_client.get_live_prices_batch_async(batch)
                         all_prices.update(prices)
                     except Exception as e:
                         logger.error(f"SSE price fetch error: {e}")

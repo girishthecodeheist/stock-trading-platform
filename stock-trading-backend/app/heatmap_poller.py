@@ -38,50 +38,68 @@ class HeatmapPollerService:
         self.last_poll_time: Optional[datetime] = None
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        # Reuse a single httpx client across polls. NSE's API is sensitive to
+        # creating many TCP connections and keep-alive dramatically reduces the
+        # connection/TLS handshake overhead per poll (10 sectors * N polls).
+        self._client: Optional[httpx.AsyncClient] = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Return a persistent httpx client, creating one if needed."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                headers=HEADERS, follow_redirects=True, timeout=15
+            )
+        return self._client
+
+    async def close(self) -> None:
+        """Close the underlying httpx client (use on shutdown)."""
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
 
     async def init_nse_session(self):
         """Get session cookies from NSE website."""
         try:
-            async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=15) as client:
-                resp = await client.get("https://www.nseindia.com")
-                self.session_cookies = dict(resp.cookies)
-                await client.get(
-                    "https://www.nseindia.com/market-data/live-equity-market",
-                    cookies=self.session_cookies, timeout=10
-                )
-                logger.info("NSE session initialized with cookies")
+            client = self._get_client()
+            resp = await client.get("https://www.nseindia.com")
+            self.session_cookies = dict(resp.cookies)
+            await client.get(
+                "https://www.nseindia.com/market-data/live-equity-market",
+                cookies=self.session_cookies, timeout=10
+            )
+            logger.info("NSE session initialized with cookies")
         except Exception as e:
             logger.warning(f"NSE session init failed: {e}")
 
     async def fetch_sector(self, sector_name: str, url: str) -> list:
         """Fetch one sector's stock list from NSE API."""
         try:
-            async with httpx.AsyncClient(headers=HEADERS, timeout=15) as client:
-                resp = await client.get(url, cookies=self.session_cookies)
-                if resp.status_code != 200:
-                    logger.warning(f"NSE API returned {resp.status_code} for {sector_name}")
-                    return []
-                data = resp.json()
-                stocks = data.get("data", [])
-                result = []
-                for s in stocks:
-                    if s.get("symbol", "").startswith("NIFTY"):
-                        continue  # Skip index rows
-                    symbol = f"NSE:{s['symbol']}-EQ"
-                    result.append({
-                        "symbol": symbol,
-                        "display_symbol": s["symbol"],
-                        "sector": sector_name,
-                        "ltp": float(s.get("lastPrice", "0").replace(",", "") if isinstance(s.get("lastPrice"), str) else s.get("lastPrice", 0)),
-                        "change_pct": float(s.get("pChange", 0)),
-                        "volume": int(s.get("totalTradedVolume", 0)),
-                        "open_price": float(s.get("open", "0").replace(",", "") if isinstance(s.get("open"), str) else s.get("open", 0)),
-                        "high_price": float(s.get("dayHigh", "0").replace(",", "") if isinstance(s.get("dayHigh"), str) else s.get("dayHigh", 0)),
-                        "low_price": float(s.get("dayLow", "0").replace(",", "") if isinstance(s.get("dayLow"), str) else s.get("dayLow", 0)),
-                        "prev_close": float(s.get("previousClose", "0").replace(",", "") if isinstance(s.get("previousClose"), str) else s.get("previousClose", 0)),
-                        "fetched_at": datetime.utcnow().isoformat(),
-                    })
-                return result
+            client = self._get_client()
+            resp = await client.get(url, cookies=self.session_cookies)
+            if resp.status_code != 200:
+                logger.warning(f"NSE API returned {resp.status_code} for {sector_name}")
+                return []
+            data = resp.json()
+            stocks = data.get("data", [])
+            result = []
+            for s in stocks:
+                if s.get("symbol", "").startswith("NIFTY"):
+                    continue  # Skip index rows
+                symbol = f"NSE:{s['symbol']}-EQ"
+                result.append({
+                    "symbol": symbol,
+                    "display_symbol": s["symbol"],
+                    "sector": sector_name,
+                    "ltp": float(s.get("lastPrice", "0").replace(",", "") if isinstance(s.get("lastPrice"), str) else s.get("lastPrice", 0)),
+                    "change_pct": float(s.get("pChange", 0)),
+                    "volume": int(s.get("totalTradedVolume", 0)),
+                    "open_price": float(s.get("open", "0").replace(",", "") if isinstance(s.get("open"), str) else s.get("open", 0)),
+                    "high_price": float(s.get("dayHigh", "0").replace(",", "") if isinstance(s.get("dayHigh"), str) else s.get("dayHigh", 0)),
+                    "low_price": float(s.get("dayLow", "0").replace(",", "") if isinstance(s.get("dayLow"), str) else s.get("dayLow", 0)),
+                    "prev_close": float(s.get("previousClose", "0").replace(",", "") if isinstance(s.get("previousClose"), str) else s.get("previousClose", 0)),
+                    "fetched_at": datetime.utcnow().isoformat(),
+                })
+            return result
         except Exception as e:
             logger.warning(f"Heatmap fetch failed for {sector_name}: {e}")
             return []
