@@ -149,6 +149,10 @@ _REJECTION_REASONS = {
     "TRADING_HALTED",
     "OPEN_TRADES_FULL",
     "DUPLICATE_SYMBOL",
+    # Broker rejected the order at the Fyers API (e.g. -50 "algo orders
+    # not allowed", insufficient funds on the real account, instrument
+    # banned for intraday, etc.). Surfaces the raw broker message.
+    "FYERS_REJECTED",
 }
 
 
@@ -984,11 +988,48 @@ async def _place_auto_trade(
             logger.info(f"Fyers auto entry response for {symbol}: {entry_resp}")
             if not entry_resp or entry_resp.get("s") != "ok":
                 err = entry_resp.get("message", "Unknown") if entry_resp else "No response"
-                _add_log("LIVE_ORDER_FAILED", symbol, f"Fyers rejected: {err}")
+                code = entry_resp.get("code") if entry_resp else None
+                # Fyers returns -50 "Algo orders are not allowed from this
+                # app <APP_ID>" when the app hasn't been whitelisted for
+                # API/algo trading. It's an app-level Fyers setting — the
+                # user has to request enablement from Fyers (myaccount →
+                # My APIs → Algo). Surface that as actionable text, not
+                # just the raw broker message.
+                hint = ""
+                if code == -50 or "algo orders are not allowed" in (err or "").lower():
+                    hint = (
+                        " — Enable API/Algo trading for this app in Fyers "
+                        "(myaccount.fyers.in → My APIs → request algo "
+                        "activation). Orders will keep failing until that's on."
+                    )
+                _add_log("LIVE_ORDER_FAILED", symbol, f"Fyers rejected: {err}{hint}")
                 _push_event("LIVE_ORDER_FAILED", {
                     "symbol": symbol, "side": side, "qty": quantity,
-                    "error": err,
+                    "error": err, "code": code,
+                    "hint": hint.strip(" —") or None,
                 })
+                # Surface broker rejection in the "Blocked signals" panel so
+                # the user sees *why* LIVE orders aren't going through.
+                _record_rejection(
+                    "FYERS_REJECTED",
+                    symbol,
+                    signal_data={
+                        "signal": signal_type,
+                        "score": score,
+                        "confidence": confidence,
+                        "entry_price": entry_price,
+                        "stop_loss": stop_loss,
+                        "target_1": target,
+                    },
+                    trade_mode=trade_mode,
+                    details=f"Fyers: {err}{hint}",
+                    extra={
+                        "code": code,
+                        "qty": quantity,
+                        "side": side,
+                        "hint": hint.strip(" —") or None,
+                    },
+                )
                 return None
             fyers_order_id = entry_resp.get("id", "") or ""
 
