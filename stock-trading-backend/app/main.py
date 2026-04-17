@@ -57,8 +57,8 @@ async def ensure_columns():
         ("paper_trades", "exit_reason", "ALTER TABLE paper_trades ADD COLUMN exit_reason VARCHAR(50)"),
         ("paper_trades", "is_auto_trade", "ALTER TABLE paper_trades ADD COLUMN is_auto_trade BOOLEAN DEFAULT false"),
         ("trading_settings", "max_trades_per_day", "ALTER TABLE trading_settings ADD COLUMN max_trades_per_day INTEGER DEFAULT 50"),
-        ("trading_settings", "min_net_profit_per_trade", "ALTER TABLE trading_settings ADD COLUMN min_net_profit_per_trade FLOAT DEFAULT 100"),
-        ("trading_settings", "min_profit_to_cost_ratio", "ALTER TABLE trading_settings ADD COLUMN min_profit_to_cost_ratio FLOAT DEFAULT 2.0"),
+        ("trading_settings", "min_net_profit_per_trade", "ALTER TABLE trading_settings ADD COLUMN min_net_profit_per_trade FLOAT DEFAULT 1"),
+        ("trading_settings", "min_profit_to_cost_ratio", "ALTER TABLE trading_settings ADD COLUMN min_profit_to_cost_ratio FLOAT DEFAULT 1.0"),
     ]
 
     async with async_session_factory() as db:
@@ -76,6 +76,30 @@ async def ensure_columns():
             except Exception as e:
                 await db.rollback()
                 logger.warning(f"Migration skip {table}.{column}: {e}")
+
+        # One-time: users who were seeded with the original conservative
+        # profit floor (net \u2265 \u20b9100, gross \u2265 2\u00d7 charges) were finding the
+        # gate blocked almost every signal. Relax to "any net profit works"
+        # for rows still carrying the old defaults. Users who have already
+        # tuned these values (anything other than 100 / 2.0) are left alone.
+        try:
+            relax_sql = text("""
+                UPDATE trading_settings
+                   SET min_net_profit_per_trade = 1,
+                       min_profit_to_cost_ratio = 1.0
+                 WHERE min_net_profit_per_trade = 100
+                   AND min_profit_to_cost_ratio = 2.0
+            """)
+            r = await db.execute(relax_sql)
+            await db.commit()
+            if r.rowcount:
+                logger.info(
+                    f"Relaxed brokerage profit floor on {r.rowcount} row(s) "
+                    "(net \u20b9100\u2192\u20b91, ratio 2.0\u21921.0)"
+                )
+        except Exception as e:
+            await db.rollback()
+            logger.warning(f"Migration skip (relax profit floor): {e}")
 
 
 async def seed_database():

@@ -131,8 +131,8 @@ async def calculate_quantity(
 
     # Brokerage-aware quantity floor: respect the user's configured net-profit
     # minimum (clamped by the loss/capital caps above).
-    min_net = float(settings.get("min_net_profit_per_trade") or 100.0)
-    min_ratio = float(settings.get("min_profit_to_cost_ratio") or 2.0)
+    min_net = float(settings.get("min_net_profit_per_trade") or 1.0)
+    min_ratio = float(settings.get("min_profit_to_cost_ratio") or 1.0)
     cap_qty = int(math.floor(min(qty_from_loss, qty_from_capital))) or optimal_qty
     target_price = entry_price * (1 + tgt_pct / 100.0)
     min_qty_net = min_qty_for_net_profit(
@@ -203,8 +203,8 @@ async def brokerage_preview(
         "FROM trading_settings WHERE id=1"
     ))
     row = result.mappings().first()
-    min_net = float((row or {}).get("min_net_profit_per_trade") or 100.0)
-    min_ratio = float((row or {}).get("min_profit_to_cost_ratio") or 2.0)
+    min_net = float((row or {}).get("min_net_profit_per_trade") or 1.0)
+    min_ratio = float((row or {}).get("min_profit_to_cost_ratio") or 1.0)
 
     verdict = is_trade_profitable_after_brokerage(
         entry_price, target_price, qty,

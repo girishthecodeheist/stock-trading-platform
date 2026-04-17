@@ -45,8 +45,8 @@ MIN_CONFIDENCE_FOR_TRADE = 40        # Minimum confidence to place trade
 
 # v5: Brokerage-aware sizing floor. Overridden by
 # ``trading_settings.min_net_profit_per_trade`` / ``min_profit_to_cost_ratio``.
-MIN_NET_PROFIT_PER_TRADE = 100.0     # Rs — skip setups that can't clear this after charges
-MIN_PROFIT_TO_COST_RATIO = 2.0       # gross profit must be >= N× total charges
+MIN_NET_PROFIT_PER_TRADE = 1.0       # Rs — skip setups that can't clear this after charges
+MIN_PROFIT_TO_COST_RATIO = 1.0       # gross profit must be >= N× total charges (>=1 = any net profit)
 
 # Trailing profit config
 TRAILING_PROFIT_TRIGGER_PCT = 1.0   # Start trailing after 1% profit

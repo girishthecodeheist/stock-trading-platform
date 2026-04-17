@@ -205,6 +205,6 @@ class TradingSettings(Base):
     auto_quantity_enabled = Column(Boolean, default=True)
     scanner_running = Column(Boolean, default=False)
     max_trades_per_day = Column(Integer, default=50)
-    min_net_profit_per_trade = Column(Float, default=100.0)
-    min_profit_to_cost_ratio = Column(Float, default=2.0)
+    min_net_profit_per_trade = Column(Float, default=1.0)
+    min_profit_to_cost_ratio = Column(Float, default=1.0)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
