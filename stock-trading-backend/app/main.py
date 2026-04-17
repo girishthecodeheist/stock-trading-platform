@@ -56,6 +56,7 @@ async def ensure_columns():
         ("trading_settings", "scanner_running", "ALTER TABLE trading_settings ADD COLUMN scanner_running BOOLEAN DEFAULT false"),
         ("paper_trades", "exit_reason", "ALTER TABLE paper_trades ADD COLUMN exit_reason VARCHAR(50)"),
         ("paper_trades", "is_auto_trade", "ALTER TABLE paper_trades ADD COLUMN is_auto_trade BOOLEAN DEFAULT false"),
+        ("trading_settings", "max_trades_per_day", "ALTER TABLE trading_settings ADD COLUMN max_trades_per_day INTEGER DEFAULT 50"),
     ]
 
     async with async_session_factory() as db:

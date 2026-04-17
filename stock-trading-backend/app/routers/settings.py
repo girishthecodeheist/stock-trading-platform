@@ -32,6 +32,7 @@ class SettingsUpdate(BaseModel):
     min_volume: Optional[int] = None
     auto_trade_enabled: Optional[bool] = None
     auto_quantity_enabled: Optional[bool] = None
+    max_trades_per_day: Optional[int] = None
 
 
 @router.get("")

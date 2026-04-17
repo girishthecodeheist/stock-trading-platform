@@ -33,7 +33,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 MAX_ACTIVE_TRADES = 5
 
 # v4: Trade frequency controls
-MAX_TRADES_PER_DAY = 10              # Max new trades per day (configurable via settings)
+MAX_TRADES_PER_DAY = 50              # Default cap when ``trading_settings.max_trades_per_day`` is NULL
 TRADE_COOLDOWN_SECS = 300            # 5 min cooldown between trades on same symbol
 SCAN_INTERVAL_SECS = 120             # Scan every 2 minutes (was 60s)
 MIN_SCORE_FOR_TRADE = 25             # Minimum absolute score to place trade
@@ -967,17 +967,20 @@ async def _scan_and_trade() -> int:
         logger.info(f"Auto-trade: {sr}, P&L={tp:.2f}")
         return 0
 
-    # v4: Check daily trade limit before even scanning
+    # v4: Check daily trade limit. If hit, we still scan & publish signals so
+    # the dashboard stays informative — we just skip the placement phase.
     max_trades_day = settings.get("max_trades_per_day", MAX_TRADES_PER_DAY)
     trades_today = await _get_trades_placed_today()
-    if trades_today >= max_trades_day:
-        _add_log("DAILY_LIMIT", "", f"Daily trade limit reached ({trades_today}/{max_trades_day})")
-        _last_scan_time = datetime.now(IST)
-        return 0
+    daily_cap_hit = trades_today >= max_trades_day
+    if daily_cap_hit:
+        _add_log("DAILY_LIMIT", "",
+                 f"Daily trade limit reached ({trades_today}/{max_trades_day}) "
+                 f"— computing signals for display only")
 
     top20 = await _get_top20_stocks()
     if not top20:
         logger.info("Auto-trade: No stocks in heatmap")
+        _last_scan_time = datetime.now(IST)
         return 0
 
     _add_log("SCAN_START", "", f"Scanning top {len(top20)} stocks (10 gainers + 10 losers)")
@@ -1612,7 +1615,9 @@ def get_engine_status() -> dict:
         "last_reanalysis_time": _last_reanalysis_time.isoformat() if _last_reanalysis_time else None,
         "market_open": is_market_open(),
         "max_active_trades": MAX_ACTIVE_TRADES,
-        "max_trades_per_day": MAX_TRADES_PER_DAY,
+        "max_trades_per_day": (
+            (_cached_settings or {}).get("max_trades_per_day") or MAX_TRADES_PER_DAY
+        ),
         "trades_placed_today": _trades_placed_today,
         "signals_count": len(_last_signals),
         "settings_hot_reload": True,
