@@ -29,6 +29,16 @@
         <input type="number" [(ngModel)]="settings.max_trades_per_day" min="1" max="500" />
         <small class="toggle-hint">Upper bound on new auto-placed trades per day (paper + live combined). Default 50.</small>
       </div>
+      <div class="setting-row">
+        <label>Min Net Profit / Trade (&#8377;)</label>
+        <input type="number" [(ngModel)]="settings.min_net_profit_per_trade" min="0" step="10" />
+        <small class="toggle-hint">Engine rejects setups (or auto-bumps qty) so that net P&amp;L after all Fyers charges is &ge; this value. Default &#8377;100.</small>
+      </div>
+      <div class="setting-row">
+        <label>Min Gross / Charges Ratio</label>
+        <input type="number" [(ngModel)]="settings.min_profit_to_cost_ratio" min="1" step="0.1" />
+        <small class="toggle-hint">Gross profit must be at least this multiple of total charges (brokerage + STT + GST + stamp + exchange + SEBI + IPFT). Default 2.0.</small>
+      </div>
       <div class="setting-row toggle-row">
         <label>Auto-Calculate Quantity</label>
         <div class="toggle-switch">
@@ -85,6 +95,23 @@
         <span>Loss limit: {{ calcResult.breakdown.qty_from_loss_limit }} qty</span>
         <span>Profit target: {{ calcResult.breakdown.qty_from_profit_target }} qty</span>
         <span>Capital limit: {{ calcResult.breakdown.qty_from_capital }} qty</span>
+        <span *ngIf="calcResult.breakdown.qty_from_net_profit_floor">
+          Net-profit floor: {{ calcResult.breakdown.qty_from_net_profit_floor }} qty
+        </span>
+      </div>
+      <div class="breakdown" *ngIf="calcResult.brokerage">
+        <span class="break-title">After Fyers Charges:</span>
+        <span>Gross: &#8377;{{ calcResult.brokerage.gross_profit }}</span>
+        <span>Charges: &#8377;{{ calcResult.brokerage.total_charges }}</span>
+        <span [class.positive]="calcResult.brokerage.profitable"
+              [class.negative]="!calcResult.brokerage.profitable">
+          Net: &#8377;{{ calcResult.brokerage.net_profit }}
+          ({{ calcResult.brokerage.profit_to_cost_ratio }}&times;)
+        </span>
+        <span *ngIf="!calcResult.brokerage.profitable" class="negative">
+          Below &#8377;{{ calcResult.brokerage.min_net_profit }} floor or
+          {{ calcResult.brokerage.min_profit_to_cost_ratio }}&times; ratio.
+        </span>
       </div>
     </div>
     <div class="calc-error" *ngIf="calcResult && !calcResult.success">{{ calcResult.error }}</div>

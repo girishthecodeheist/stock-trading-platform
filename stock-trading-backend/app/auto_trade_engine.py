@@ -25,7 +25,11 @@ from app import fyers_client
 from app.heatmap_poller import heatmap_poller
 from app.indicator_engine import compute_all_indicators
 from app.signal_engine import generate_signal
-from app.brokerage_calc import calc_brokerage, is_trade_profitable_after_brokerage
+from app.brokerage_calc import (
+    calc_brokerage,
+    is_trade_profitable_after_brokerage,
+    min_qty_for_net_profit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +42,11 @@ TRADE_COOLDOWN_SECS = 300            # 5 min cooldown between trades on same sym
 SCAN_INTERVAL_SECS = 120             # Scan every 2 minutes (was 60s)
 MIN_SCORE_FOR_TRADE = 25             # Minimum absolute score to place trade
 MIN_CONFIDENCE_FOR_TRADE = 40        # Minimum confidence to place trade
+
+# v5: Brokerage-aware sizing floor. Overridden by
+# ``trading_settings.min_net_profit_per_trade`` / ``min_profit_to_cost_ratio``.
+MIN_NET_PROFIT_PER_TRADE = 100.0     # Rs — skip setups that can't clear this after charges
+MIN_PROFIT_TO_COST_RATIO = 2.0       # gross profit must be >= N× total charges
 
 # Trailing profit config
 TRAILING_PROFIT_TRIGGER_PCT = 1.0   # Start trailing after 1% profit
@@ -719,22 +728,68 @@ async def _place_auto_trade(
                 return None
             trade_cost = entry_price * quantity
 
-        # v4: BROKERAGE PROFITABILITY CHECK
-        if target:
+        # v5: BROKERAGE-AWARE SIZING + PROFITABILITY GATE
+        # Picking 1 share of a low-priced stock can mean charges eat the whole
+        # move. If the user has ``auto_quantity_enabled`` on, bump qty up to
+        # the smallest value that clears the configured net-profit floor
+        # (capped by loss/margin budgets); otherwise apply the gate as a filter.
+        if target and entry_price and target != entry_price:
+            min_net = float(
+                settings.get("min_net_profit_per_trade", MIN_NET_PROFIT_PER_TRADE) or 0
+            )
+            min_ratio = float(
+                settings.get("min_profit_to_cost_ratio", MIN_PROFIT_TO_COST_RATIO) or 0
+            )
+
+            auto_qty = bool(settings.get("auto_quantity_enabled", True))
+            if auto_qty and min_net > 0:
+                # Upper bound: whichever is tighter of margin or loss cap.
+                max_loss = abs(settings.get("day_max_loss_paper", 1000) or 0) if trade_mode == "PAPER" \
+                    else abs(settings.get("day_max_loss_live", 2000) or 0)
+                sl_per_share = entry_price * sl_pct / 100.0 if sl_pct > 0 else entry_price
+                qty_from_loss = int(math.floor(max_loss / sl_per_share)) if sl_per_share > 0 else 0
+                qty_from_margin = int(math.floor(available_margin / entry_price)) if entry_price > 0 else 0
+                max_qty_cap = min(q for q in (qty_from_loss, qty_from_margin) if q > 0) \
+                    if (qty_from_loss > 0 and qty_from_margin > 0) \
+                    else max(qty_from_loss, qty_from_margin, 1)
+
+                bumped = min_qty_for_net_profit(
+                    entry_price, target,
+                    min_net_profit=min_net,
+                    min_profit_ratio=min_ratio,
+                    max_qty=max(quantity, max_qty_cap),
+                )
+                if bumped > quantity and bumped <= max_qty_cap:
+                    _add_log("QTY_BUMP", symbol,
+                             f"qty {quantity}→{bumped} to clear net profit "
+                             f"floor ₹{min_net:.0f} after charges")
+                    quantity = bumped
+                    trade_cost = entry_price * quantity
+
             brokerage_check = is_trade_profitable_after_brokerage(
-                entry_price, target, quantity, min_profit_ratio=2.0
+                entry_price, target, quantity,
+                min_profit_ratio=min_ratio,
+                min_net_profit=min_net,
             )
             if not brokerage_check["profitable"]:
+                reason = []
+                if not brokerage_check.get("ratio_ok", True):
+                    reason.append(f"ratio {brokerage_check['profit_to_cost_ratio']:.2f}<{min_ratio}")
+                if not brokerage_check.get("net_ok", True):
+                    reason.append(f"net ₹{brokerage_check['net_profit']:.2f}<₹{min_net:.0f}")
                 _add_log("BROKERAGE_FILTER", symbol,
-                         f"Rejected: gross_profit={brokerage_check['gross_profit']}, "
-                         f"charges={brokerage_check['total_charges']}, "
-                         f"ratio={brokerage_check['profit_to_cost_ratio']}")
+                         f"Rejected: gross=₹{brokerage_check['gross_profit']:.2f}, "
+                         f"charges=₹{brokerage_check['total_charges']:.2f}, "
+                         f"qty={quantity} ({', '.join(reason) or 'n/a'})")
                 _push_event("BROKERAGE_FILTER", {
                     "symbol": symbol,
+                    "qty": quantity,
                     "gross_profit": brokerage_check["gross_profit"],
                     "total_charges": brokerage_check["total_charges"],
                     "net_profit": brokerage_check["net_profit"],
-                    "message": "Trade rejected: brokerage would exceed expected profit"
+                    "min_net_profit": min_net,
+                    "min_required_ratio": min_ratio,
+                    "message": "Trade rejected: would not be profitable after charges"
                 })
                 return None
 
