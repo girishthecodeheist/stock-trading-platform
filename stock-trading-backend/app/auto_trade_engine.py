@@ -978,12 +978,13 @@ async def _place_auto_trade(
             # OPEN row that monitor loops would try to close via a non-existent
             # position.
             fyers_side = 1 if side == "BUY" else -1
+            product_type = str(settings.get("product_type") or "INTRADAY").upper()
             entry_resp = await fyers_client.place_order_async(
                 symbol=symbol,
                 side=fyers_side,
                 qty=quantity,
                 order_type=2,  # MARKET
-                product_type="INTRADAY",
+                product_type=product_type,
             )
             logger.info(f"Fyers auto entry response for {symbol}: {entry_resp}")
             if not entry_resp or entry_resp.get("s") != "ok":
@@ -1033,10 +1034,59 @@ async def _place_auto_trade(
                 return None
             fyers_order_id = entry_resp.get("id", "") or ""
 
+            # Post-placement reconciliation (F4). Ask Fyers how much
+            # actually filled before we create the live_trades row. This
+            # protects against partial fills (where we'd otherwise try to
+            # exit more shares than we own) and post-ack rejects.
+            fill_info = await fyers_client.reconcile_order_async(
+                fyers_order_id, timeout_seconds=15.0, poll_interval_seconds=0.5
+            )
+            logger.info(f"Fyers auto fill reconciliation for {symbol}: {fill_info}")
+            broker_status = str(fill_info.get("status") or "PENDING")
+            filled_qty = int(fill_info.get("filled_qty") or 0)
+            avg_fill = float(fill_info.get("avg_price") or 0.0) or None
+
+            if broker_status in ("REJECTED", "CANCELLED") or (
+                broker_status == "UNKNOWN" and filled_qty == 0
+            ):
+                err_msg = fill_info.get("message") or broker_status.lower()
+                _add_log(
+                    "LIVE_ORDER_NO_FILL",
+                    symbol,
+                    f"Fyers {broker_status.lower()}: {err_msg}",
+                )
+                _record_rejection(
+                    "FYERS_REJECTED",
+                    symbol,
+                    signal_data={
+                        "signal": signal_type,
+                        "score": score,
+                        "confidence": confidence,
+                        "entry_price": entry_price,
+                        "stop_loss": stop_loss,
+                        "target_1": target,
+                    },
+                    trade_mode=trade_mode,
+                    details=f"Broker {broker_status}: {err_msg}",
+                    extra={
+                        "qty": quantity,
+                        "side": side,
+                        "broker_status": broker_status,
+                        "order_id": fyers_order_id,
+                    },
+                )
+                return None
+
+            if filled_qty == 0:
+                broker_status = "PENDING"
+
+            effective_qty = filled_qty if filled_qty > 0 else quantity
+            effective_entry = avg_fill if avg_fill else entry_price
+
             direction = "LONG" if side == "BUY" else "SHORT"
             display_sym = symbol.replace("NSE:", "").replace("-EQ", "")
-            risk = abs(entry_price - stop_loss) if stop_loss else 0
-            reward = abs(target - entry_price) if target else 0
+            risk = abs(effective_entry - stop_loss) if stop_loss else 0
+            reward = abs(target - effective_entry) if target else 0
             rr = round(reward / risk, 2) if risk > 0 else 0
 
             now_ist = datetime.now(IST)
@@ -1050,22 +1100,28 @@ async def _place_auto_trade(
                 result = await db.execute(text(
                     "INSERT INTO live_trades "
                     "(trade_ref, symbol, display_symbol, direction, entry_price, "
-                    " entry_time, quantity, stop_loss, sl_percent, target_price, "
-                    " target_percent, strategy, risk_reward, signal_score, "
-                    " signal_strength, status, fyers_order_id) "
+                    " entry_time, quantity, filled_quantity, avg_fill_price, "
+                    " broker_status, product_type, stop_loss, sl_percent, "
+                    " target_price, target_percent, strategy, risk_reward, "
+                    " signal_score, signal_strength, status, fyers_order_id) "
                     "VALUES (:trade_ref, :symbol, :display_sym, :direction, :entry_price, "
-                    " :entry_time, :quantity, :stop_loss, :sl_pct, :target_price, "
-                    " :tgt_pct, 'AUTO', :rr, :signal_score, :signal_strength, "
-                    " 'OPEN', :order_id) "
+                    " :entry_time, :quantity, :filled_qty, :avg_fill, "
+                    " :broker_status, :product_type, :stop_loss, :sl_pct, "
+                    " :target_price, :tgt_pct, 'AUTO', :rr, "
+                    " :signal_score, :signal_strength, 'OPEN', :order_id) "
                     "RETURNING id"
                 ), {
                     "trade_ref": trade_ref,
                     "symbol": symbol,
                     "display_sym": display_sym,
                     "direction": direction,
-                    "entry_price": entry_price,
+                    "entry_price": effective_entry,
                     "entry_time": now_ist.replace(tzinfo=None),
-                    "quantity": quantity,
+                    "quantity": effective_qty,
+                    "filled_qty": filled_qty,
+                    "avg_fill": avg_fill,
+                    "broker_status": broker_status,
+                    "product_type": product_type,
                     "stop_loss": stop_loss,
                     "sl_pct": round(sl_pct, 2),
                     "target_price": target,
@@ -1077,6 +1133,12 @@ async def _place_auto_trade(
                 })
                 await db.commit()
                 trade_id = result.scalar()
+                if broker_status == "PARTIAL":
+                    _add_log(
+                        "LIVE_PARTIAL_FILL",
+                        symbol,
+                        f"Partial fill: {filled_qty}/{quantity} @ ₹{(avg_fill or entry_price):.2f}",
+                    )
         else:
             async with async_session_factory() as db:
                 result = await db.execute(text(
@@ -1606,7 +1668,8 @@ async def _monitor_live_open_trades() -> int:
     async with async_session_factory() as db:
         result = await db.execute(text(
             "SELECT id, trade_ref, symbol, direction, entry_price, quantity, "
-            "       stop_loss, target_price, entry_time "
+            "       stop_loss, target_price, entry_time, filled_quantity, "
+            "       avg_fill_price, product_type "
             "FROM live_trades WHERE status = 'OPEN'"
         ))
         open_trades = result.fetchall()
@@ -1632,11 +1695,18 @@ async def _monitor_live_open_trades() -> int:
         trade_ref = row[1]
         symbol = row[2]
         direction = row[3]  # LONG / SHORT
-        entry_price = float(row[4])
-        quantity = int(row[5] or 0)
+        # Exit P&L / order qty must use the actual filled entry state,
+        # not the row's original request. ``entry_price`` and ``quantity``
+        # columns are rewritten to reflect the fill at create time, so
+        # they're safe; but we prefer the explicit columns when present
+        # (older rows won't have them).
+        entry_price = float(row[10]) if row[10] is not None else float(row[4])
+        filled_qty = int(row[9]) if row[9] is not None else int(row[5] or 0)
+        quantity = filled_qty if filled_qty > 0 else int(row[5] or 0)
         stop_loss = float(row[6]) if row[6] is not None else None
         target_price = float(row[7]) if row[7] is not None else None
         entry_time = row[8]
+        product_type = str(row[11] or "INTRADAY").upper()
 
         price_data = prices.get(symbol) or {}
         ltp = float(price_data.get("ltp", 0) or 0)
@@ -1659,15 +1729,29 @@ async def _monitor_live_open_trades() -> int:
         if not exit_reason:
             continue
 
+        if quantity <= 0:
+            # Defensive: nothing actually filled on entry. Just flip to
+            # CLOSED locally; no exit order to place.
+            async with async_session_factory() as db:
+                await db.execute(text(
+                    "UPDATE live_trades SET status='CLOSED', "
+                    "exit_time=:t, exit_reason='NO_FILL' WHERE id=:id"
+                ), {"id": trade_id, "t": datetime.now(IST).replace(tzinfo=None)})
+                await db.commit()
+            continue
+
         exit_side = -1 if direction == "LONG" else 1
         exit_resp = await fyers_client.place_order_async(
             symbol=symbol,
             side=exit_side,
             qty=quantity,
             order_type=2,  # MARKET
-            product_type="INTRADAY",
+            product_type=product_type,
         )
-        logger.info(f"Fyers auto exit response for {trade_ref or trade_id}: {exit_resp}")
+        logger.info(
+            f"Fyers auto exit response for {trade_ref or trade_id} "
+            f"(qty={quantity}, product={product_type}): {exit_resp}"
+        )
         if not exit_resp or exit_resp.get("s") != "ok":
             err = exit_resp.get("message", "Unknown") if exit_resp else "No response"
             _add_log("LIVE_EXIT_FAILED", symbol,
@@ -1675,6 +1759,16 @@ async def _monitor_live_open_trades() -> int:
             continue
 
         fyers_exit_id = exit_resp.get("id", "") or ""
+
+        # Reconcile the exit order so P&L uses the real fill price /
+        # quantity (may be partial if liquidity was thin).
+        exit_fill = await fyers_client.reconcile_order_async(
+            fyers_exit_id, timeout_seconds=10.0, poll_interval_seconds=0.5
+        )
+        if exit_fill.get("status") == "FILLED" and exit_fill.get("avg_price"):
+            exit_price = float(exit_fill["avg_price"])
+        if exit_fill.get("filled_qty"):
+            quantity = int(exit_fill["filled_qty"])
 
         if direction == "LONG":
             gross_pnl = (exit_price - entry_price) * quantity

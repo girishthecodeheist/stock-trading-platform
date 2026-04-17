@@ -60,6 +60,14 @@ async def ensure_columns():
         ("trading_settings", "min_net_profit_per_trade", "ALTER TABLE trading_settings ADD COLUMN min_net_profit_per_trade FLOAT DEFAULT 1"),
         ("trading_settings", "min_profit_to_cost_ratio", "ALTER TABLE trading_settings ADD COLUMN min_profit_to_cost_ratio FLOAT DEFAULT 1.0"),
         ("trading_settings", "profit_floor_relaxed", "ALTER TABLE trading_settings ADD COLUMN profit_floor_relaxed BOOLEAN DEFAULT false"),
+        ("trading_settings", "product_type", "ALTER TABLE trading_settings ADD COLUMN product_type VARCHAR(10) DEFAULT 'INTRADAY'"),
+        # live_trades — execution reconciliation columns (F4). Added so we
+        # can tell FILLED from PARTIAL from REJECTED after place_order and
+        # use actual filled qty on exit instead of blindly selling the
+        # requested qty.
+        ("live_trades", "filled_quantity", "ALTER TABLE live_trades ADD COLUMN filled_quantity INTEGER"),
+        ("live_trades", "avg_fill_price", "ALTER TABLE live_trades ADD COLUMN avg_fill_price FLOAT"),
+        ("live_trades", "broker_status", "ALTER TABLE live_trades ADD COLUMN broker_status VARCHAR(20)"),
     ]
 
     async with async_session_factory() as db:

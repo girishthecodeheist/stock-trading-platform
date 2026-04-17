@@ -130,6 +130,15 @@ class LiveTrade(Base):
     entry_price = Column(Float, nullable=False)
     entry_time = Column(DateTime, nullable=False, default=datetime.utcnow)
     quantity = Column(Integer, nullable=False, default=1)
+    # Broker-reported execution state. `filled_quantity` is the actual qty
+    # the exchange filled (may be < quantity on partial fills or 0 on a
+    # reject). `avg_fill_price` is what we *actually* paid — the exit P&L
+    # uses this (not the requested entry_price) when available. `broker_status`
+    # is the terminal Fyers order status: FILLED, PARTIAL, REJECTED,
+    # CANCELLED, PENDING (if we couldn't confirm within the ack window).
+    filled_quantity = Column(Integer, nullable=True)
+    avg_fill_price = Column(Float, nullable=True)
+    broker_status = Column(String(20), nullable=True)
     product_type = Column(String(20), default="INTRADAY")
     stop_loss = Column(Float, nullable=True)
     sl_percent = Column(Float, nullable=True)
@@ -207,6 +216,12 @@ class TradingSettings(Base):
     max_trades_per_day = Column(Integer, default=50)
     min_net_profit_per_trade = Column(Float, default=1.0)
     min_profit_to_cost_ratio = Column(Float, default=1.0)
+    # Fyers product type for live orders.
+    #   INTRADAY (MIS) — 5x leverage, auto-squared-off by Fyers around 15:15
+    #     IST. New MIS orders are *rejected* after that cutoff with
+    #     "RED:'MIS' Orders are disallowed after system square off".
+    #   CNC — delivery / full cash, no auto-square-off, valid 9:15-15:30 IST.
+    product_type = Column(String(10), default="INTRADAY")
     # Internal marker: set to true after the one-time migration relaxes the
     # old 100 / 2.0 defaults. Prevents the migration from re-overwriting a
     # user who later explicitly chooses 100 / 2.0 via the settings UI.

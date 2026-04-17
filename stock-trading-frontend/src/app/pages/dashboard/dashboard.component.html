@@ -139,44 +139,6 @@
     </div>
   </div>
 
-  <!-- HEATMAP PANEL -->
-  <div class="glass-card heatmap-panel">
-    <div class="card-header">
-      <span class="card-icon">&#x1F525;</span>
-      <span class="card-title">NSE Live Heatmap</span>
-      <span class="last-update" *ngIf="lastHeatmapUpdate">Updated: {{ lastHeatmapUpdate }}</span>
-      <button class="btn-refresh" (click)="refreshHeatmap()">Refresh</button>
-    </div>
-    <div class="sector-row" *ngIf="sectors.length > 0">
-      <div *ngFor="let sector of sectors" class="sector-chip"
-           [class.bullish]="sector.avg_change > 0" [class.bearish]="sector.avg_change < 0">
-        <div class="sector-name">{{ sector.name }}</div>
-        <div class="sector-change" [class.pos]="sector.avg_change > 0" [class.neg]="sector.avg_change < 0">
-          {{ sector.avg_change > 0 ? '&#9650;' : '&#9660;' }} {{ sector.avg_change }}%
-        </div>
-      </div>
-    </div>
-    <div class="no-data" *ngIf="sectors.length === 0">Click "Refresh" to fetch live NSE heatmap data</div>
-    <div class="movers-section" *ngIf="topGainers.length > 0 || topLosers.length > 0">
-      <div class="movers-col">
-        <h4 class="green">Top Gainers</h4>
-        <div *ngFor="let s of topGainers" class="mover-chip gainer" [routerLink]="['/chart']" [queryParams]="{symbol: s.symbol}">
-          <span class="sym">{{ s.display_symbol }}</span>
-          <span class="chg">+{{ s.change_pct }}%</span>
-          <span class="price">&#8377;{{ s.ltp }}</span>
-        </div>
-      </div>
-      <div class="movers-col">
-        <h4 class="red">Top Losers</h4>
-        <div *ngFor="let s of topLosers" class="mover-chip loser" [routerLink]="['/chart']" [queryParams]="{symbol: s.symbol}">
-          <span class="sym">{{ s.display_symbol }}</span>
-          <span class="chg">{{ s.change_pct }}%</span>
-          <span class="price">&#8377;{{ s.ltp }}</span>
-        </div>
-      </div>
-    </div>
-  </div>
-
   <!-- OPEN TRADES -->
   <div class="glass-card trades-panel">
     <div class="card-header">
