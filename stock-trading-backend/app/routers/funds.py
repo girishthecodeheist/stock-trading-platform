@@ -108,7 +108,7 @@ async def get_live_funds(db: AsyncSession = Depends(get_db)):
 
     if is_connected:
         try:
-            funds_resp = fyers_client.fyers.funds()
+            funds_resp = fyers_client.get_funds()
             if funds_resp and funds_resp.get("s") == "ok":
                 fund_list = funds_resp.get("fund_limit", [])
                 for f in fund_list:

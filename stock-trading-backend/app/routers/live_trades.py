@@ -140,7 +140,7 @@ async def create_live_trade(body: LiveTradeCreate, db: AsyncSession = Depends(ge
         "rr": rr,
         "signal_id": body.signal_id,
         "signal_score": body.signal_score,
-        "order_id": f"MANUAL-{trade_ref}",
+        "order_id": fyers_order_id,
     })
     await db.commit()
 
@@ -169,6 +169,26 @@ async def close_live_trade(
 
     price = exit_price or trade["entry_price"]
     now = datetime.now(IST)
+
+    # Place exit order on Fyers (opposite side of entry)
+    if not fyers_client.is_authenticated():
+        return {"success": False, "reason": "Fyers not connected. Please authenticate first."}
+
+    exit_side = -1 if trade["direction"] == "LONG" else 1
+    exit_order_resp = fyers_client.place_order(
+        symbol=trade["symbol"],
+        side=exit_side,
+        qty=trade["quantity"],
+        order_type=2,  # MARKET
+        product_type="INTRADAY",
+    )
+    logger.info(f"Fyers exit order response for trade {trade_id}: {exit_order_resp}")
+
+    if not exit_order_resp or exit_order_resp.get("s") != "ok":
+        err = exit_order_resp.get("message", "Unknown error") if exit_order_resp else "No response"
+        return {"success": False, "reason": f"Fyers exit order failed: {err}"}
+
+    fyers_exit_order_id = exit_order_resp.get("id", "")
 
     # Calculate P&L
     if trade["direction"] == "LONG":
@@ -221,6 +241,7 @@ async def close_live_trade(
         "gross_pnl": round(gross_pnl, 2),
         "charges": charges,
         "net_pnl": round(net_pnl, 2),
+        "fyers_exit_order_id": fyers_exit_order_id,
     }
 
 

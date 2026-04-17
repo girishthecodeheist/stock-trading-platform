@@ -153,6 +153,77 @@ def get_quotes(symbols: list[str]) -> dict:
         return {"status": "error", "message": str(e)}
 
 
+def place_order(
+    symbol: str,
+    side: int,
+    qty: int,
+    order_type: int = 2,
+    product_type: str = "INTRADAY",
+    price: float = 0,
+    stop_price: float = 0,
+) -> dict:
+    """Place a real order on Fyers.
+
+    side: 1=BUY, -1=SELL
+    order_type: 1=LIMIT, 2=MARKET, 3=SL-MARKET, 4=SL-LIMIT
+    product_type: INTRADAY, CNC, MARGIN
+    """
+    if not _fyers_model:
+        return {"s": "error", "status": "error", "message": "Not authenticated"}
+    data = {
+        "symbol": symbol,
+        "qty": qty,
+        "type": order_type,
+        "side": side,
+        "productType": product_type,
+        "limitPrice": price,
+        "stopPrice": stop_price,
+        "validity": "DAY",
+        "disclosedQty": 0,
+        "offlineOrder": False,
+    }
+    try:
+        response = _fyers_model.place_order(data)
+        logger.info(f"Fyers place_order request={data} response={response}")
+        return response
+    except Exception as e:
+        logger.error(f"Fyers place_order error: {e}")
+        return {"s": "error", "status": "error", "message": str(e)}
+
+
+def get_positions() -> dict:
+    """Get current Fyers positions."""
+    if not _fyers_model:
+        return {"s": "error", "status": "error", "message": "Not authenticated"}
+    try:
+        return _fyers_model.positions()
+    except Exception as e:
+        logger.error(f"Fyers positions error: {e}")
+        return {"s": "error", "status": "error", "message": str(e)}
+
+
+def get_orders() -> dict:
+    """Get the Fyers orderbook."""
+    if not _fyers_model:
+        return {"s": "error", "status": "error", "message": "Not authenticated"}
+    try:
+        return _fyers_model.orderbook()
+    except Exception as e:
+        logger.error(f"Fyers orderbook error: {e}")
+        return {"s": "error", "status": "error", "message": str(e)}
+
+
+def get_funds() -> dict:
+    """Get Fyers account fund limits / wallet balance."""
+    if not _fyers_model:
+        return {"s": "error", "status": "error", "message": "Not authenticated"}
+    try:
+        return _fyers_model.funds()
+    except Exception as e:
+        logger.error(f"Fyers funds error: {e}")
+        return {"s": "error", "status": "error", "message": str(e)}
+
+
 def get_market_depth(symbol: str) -> dict:
     """Get market depth for a symbol."""
     if not _fyers_model:
