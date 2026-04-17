@@ -207,4 +207,8 @@ class TradingSettings(Base):
     max_trades_per_day = Column(Integer, default=50)
     min_net_profit_per_trade = Column(Float, default=1.0)
     min_profit_to_cost_ratio = Column(Float, default=1.0)
+    # Internal marker: set to true after the one-time migration relaxes the
+    # old 100 / 2.0 defaults. Prevents the migration from re-overwriting a
+    # user who later explicitly chooses 100 / 2.0 via the settings UI.
+    profit_floor_relaxed = Column(Boolean, default=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

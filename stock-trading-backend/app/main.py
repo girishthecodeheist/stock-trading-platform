@@ -59,6 +59,7 @@ async def ensure_columns():
         ("trading_settings", "max_trades_per_day", "ALTER TABLE trading_settings ADD COLUMN max_trades_per_day INTEGER DEFAULT 50"),
         ("trading_settings", "min_net_profit_per_trade", "ALTER TABLE trading_settings ADD COLUMN min_net_profit_per_trade FLOAT DEFAULT 1"),
         ("trading_settings", "min_profit_to_cost_ratio", "ALTER TABLE trading_settings ADD COLUMN min_profit_to_cost_ratio FLOAT DEFAULT 1.0"),
+        ("trading_settings", "profit_floor_relaxed", "ALTER TABLE trading_settings ADD COLUMN profit_floor_relaxed BOOLEAN DEFAULT false"),
     ]
 
     async with async_session_factory() as db:
@@ -77,20 +78,32 @@ async def ensure_columns():
                 await db.rollback()
                 logger.warning(f"Migration skip {table}.{column}: {e}")
 
-        # One-time: users who were seeded with the original conservative
+        # Truly-one-time: users who were seeded with the original conservative
         # profit floor (net \u2265 \u20b9100, gross \u2265 2\u00d7 charges) were finding the
         # gate blocked almost every signal. Relax to "any net profit works"
-        # for rows still carrying the old defaults. Users who have already
-        # tuned these values (anything other than 100 / 2.0) are left alone.
+        # for rows still carrying the old defaults. Gated on the
+        # ``profit_floor_relaxed`` flag so that if a user later *chooses*
+        # 100/2.0 via the settings UI we won't silently overwrite them on
+        # the next restart.
         try:
             relax_sql = text("""
                 UPDATE trading_settings
                    SET min_net_profit_per_trade = 1,
-                       min_profit_to_cost_ratio = 1.0
-                 WHERE min_net_profit_per_trade = 100
+                       min_profit_to_cost_ratio = 1.0,
+                       profit_floor_relaxed = true
+                 WHERE COALESCE(profit_floor_relaxed, false) = false
+                   AND min_net_profit_per_trade = 100
                    AND min_profit_to_cost_ratio = 2.0
             """)
             r = await db.execute(relax_sql)
+            # Any other rows haven't been touched \u2014 still mark them so the
+            # WHERE clause short-circuits on future restarts.
+            mark_sql = text("""
+                UPDATE trading_settings
+                   SET profit_floor_relaxed = true
+                 WHERE COALESCE(profit_floor_relaxed, false) = false
+            """)
+            await db.execute(mark_sql)
             await db.commit()
             if r.rowcount:
                 logger.info(
