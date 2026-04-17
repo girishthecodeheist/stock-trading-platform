@@ -115,6 +115,27 @@ async def create_live_trade(body: LiveTradeCreate, db: AsyncSession = Depends(ge
     reward = abs(target_price - body.entry_price) if target_price else 0
     rr = round(reward / risk, 2) if risk > 0 else 0
 
+    # Place the real entry order on Fyers. We require an authenticated
+    # session — otherwise we'd end up with a phantom OPEN row in live_trades
+    # that has no corresponding broker order.
+    if not fyers_client.is_authenticated():
+        return {"success": False, "reason": "Fyers not connected. Please authenticate first."}
+
+    fyers_side = 1 if direction == "LONG" else -1
+    entry_order_resp = await fyers_client.place_order_async(
+        symbol=body.symbol,
+        side=fyers_side,
+        qty=body.quantity,
+        order_type=2,  # MARKET
+        product_type="INTRADAY",
+    )
+    logger.info(f"Fyers entry order response ({trade_ref}): {entry_order_resp}")
+    if not entry_order_resp or entry_order_resp.get("s") != "ok":
+        err = entry_order_resp.get("message", "Unknown error") if entry_order_resp else "No response"
+        return {"success": False, "reason": f"Fyers entry order failed: {err}"}
+
+    fyers_order_id = entry_order_resp.get("id", "")
+
     # Insert trade record
     await db.execute(text("""
         INSERT INTO live_trades
