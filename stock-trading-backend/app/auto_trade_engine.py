@@ -74,8 +74,15 @@ def _ist_minute_of_day(now: Optional[datetime] = None) -> int:
 def _choose_product_type(
     entry_price: float, target: Optional[float], qty: int,
     now_minute: Optional[int] = None,
+    side: str = "BUY",
 ) -> tuple[str, str, dict]:
     """Decide INTRADAY vs DELIVERY for an auto-placed trade.
+
+    For a LONG (``side == "BUY"``) trade, ``entry_price`` is the buy leg and
+    ``target`` is the sell leg. For a SHORT (``side == "SELL"``) trade the
+    entry is the sell leg and the target is the buy-back leg \u2014 we swap them
+    before costing so ``compare_intraday_vs_delivery`` sees a positive gross
+    profit and the charge-to-profit guardrail fires correctly.
 
     Returns ``(product_type, reason, comparison)``. Rules:
       * After 14:30 IST \u2192 DELIVERY (not enough runway before MIS cutoff).
@@ -92,7 +99,13 @@ def _choose_product_type(
     if not target or target == entry_price or qty <= 0:
         return "INTRADAY", "Default routing (no target / qty to score)", {}
 
-    cmp_ = compare_intraday_vs_delivery(entry_price, float(target), qty)
+    side_up = (side or "BUY").upper()
+    if side_up == "SELL":
+        buy_price, sell_price = float(target), float(entry_price)
+    else:
+        buy_price, sell_price = float(entry_price), float(target)
+
+    cmp_ = compare_intraday_vs_delivery(buy_price, sell_price, qty)
     gross = cmp_.get("gross_profit") or 0
     intra_charges = cmp_["intraday"]["total_charges"]
     if gross > 0 and intra_charges > 0.5 * gross:
@@ -1012,7 +1025,7 @@ async def _place_auto_trade(
         configured_product_type = str(settings.get("product_type") or "INTRADAY").upper()
         now_min = _ist_minute_of_day()
         auto_product_type, routing_reason, routing_cmp = _choose_product_type(
-            entry_price, target, quantity, now_minute=now_min,
+            entry_price, target, quantity, now_minute=now_min, side=side,
         )
         if configured_product_type == "DELIVERY" and auto_product_type != "DELIVERY":
             product_type = "DELIVERY"
@@ -1778,7 +1791,10 @@ async def _monitor_open_trades(settings: dict) -> int:
                 result_str = "WIN" if pnl_pct > 0 else ("LOSS" if pnl_pct < 0 else "BREAKEVEN")
 
                 # F3: compute Fyers charges using the trade's product_type.
-                charges = calc_brokerage(buy_leg, sell_leg, quantity, product_type=product_type)
+                # calc_brokerage expects total leg values (price * qty), not per-share.
+                buy_value = buy_leg * quantity
+                sell_value = sell_leg * quantity
+                charges = calc_brokerage(buy_value, sell_value, quantity, product_type=product_type)
                 total_charges = float(charges["total_charges"])
                 net_pnl = round(float(pnl_amount) - total_charges, 2)
 
