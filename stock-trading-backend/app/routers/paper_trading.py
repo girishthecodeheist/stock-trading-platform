@@ -193,7 +193,9 @@ async def close_trade(
     )
     result_str = "WIN" if pnl_pct > 0 else ("LOSS" if pnl_pct < 0 else "BREAKEVEN")
 
-    charges = calc_brokerage(buy_price, sell_price, quantity, product_type=product_type)
+    buy_value = buy_price * quantity
+    sell_value = sell_price * quantity
+    charges = calc_brokerage(buy_value, sell_value, quantity, product_type=product_type)
     total_charges = float(charges["total_charges"])
     net_pnl = round(float(gross_pnl) - total_charges, 2)
 
