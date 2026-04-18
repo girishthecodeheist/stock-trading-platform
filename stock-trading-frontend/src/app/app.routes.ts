@@ -9,6 +9,7 @@ export const routes: Routes = [
   { path: 'heatmap', loadComponent: () => import('./pages/heatmap/heatmap.component').then(m => m.HeatmapComponent) },
   { path: 'analytics', loadComponent: () => import('./pages/analytics/analytics.component').then(m => m.AnalyticsComponent) },
   { path: 'settings', loadComponent: () => import('./pages/settings/settings.component').then(m => m.SettingsComponent) },
+  { path: 'trade-journal', loadComponent: () => import('./pages/trade-journal/trade-journal.component').then(m => m.TradeJournalComponent) },
   { path: 'paper-trading', redirectTo: 'trades', pathMatch: 'full' },
   { path: '**', redirectTo: 'dashboard' },
 ];

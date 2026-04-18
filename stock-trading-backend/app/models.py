@@ -112,6 +112,20 @@ class PaperTrade(Base):
     max_runup = Column(Float, nullable=True)
     max_drawdown = Column(Float, nullable=True)
     signal_id = Column(Integer, nullable=True)
+    # Product type (INTRADAY / DELIVERY) and per-trade Fyers charge breakdown.
+    # Populated by paper_trading.close_trade() and the auto-trade engine when
+    # a trade moves to CLOSED. gross_pnl / net_pnl are kept alongside the
+    # legacy pnl_amount column so downstream consumers can pick the flavour
+    # they need.
+    product_type = Column(String(10), default="INTRADAY")
+    brokerage = Column(Float, default=0)
+    stt = Column(Float, default=0)
+    exchange_charges = Column(Float, default=0)
+    gst = Column(Float, default=0)
+    sebi_charges = Column(Float, default=0)
+    stamp_duty = Column(Float, default=0)
+    gross_pnl = Column(Float, nullable=True)
+    net_pnl = Column(Float, nullable=True)
 
 
 class LiveTrade(Base):
@@ -227,3 +241,65 @@ class TradingSettings(Base):
     # user who later explicitly chooses 100 / 2.0 via the settings UI.
     profit_floor_relaxed = Column(Boolean, default=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class TradeAuditLog(Base):
+    """Append-only timeline of every material change to a trade.
+
+    Captures order placement, closure, SL / target moves (trailing profit,
+    trend reversal, re-analysis) and any auxiliary decisions (timing
+    constraints, product-type routing). The Trade Journal UI consumes this
+    to show a per-trade event timeline.
+    """
+
+    __tablename__ = "trade_audit_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_id = Column(Integer, nullable=False, index=True)
+    trade_type = Column(String(10), nullable=False)  # "PAPER" or "LIVE"
+    event_type = Column(String(50), nullable=False)
+    # Canonical event_type values used by the engine:
+    #   "TRADE_PLACED", "TRADE_CLOSED",
+    #   "SL_CHANGED", "TARGET_CHANGED",
+    #   "TRAILING_PROFIT", "TREND_REVERSAL", "REANALYSIS",
+    #   "INTRADAY_SQUARE_OFF", "PRODUCT_TYPE_DECISION",
+    #   "TIMING_REJECTED"
+    symbol = Column(String(100), nullable=True, index=True)
+    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    old_value = Column(JSON, nullable=True)
+    new_value = Column(JSON, nullable=True)
+    reason = Column(Text, nullable=True)
+    trigger_data = Column(JSON, nullable=True)
+    # Renamed from `metadata` because SQLAlchemy's DeclarativeBase reserves
+    # that attribute name on Base subclasses.
+    extra_metadata = Column(JSON, nullable=True)
+
+
+class TradingDaySnapshot(Base):
+    """Per-day summary of engine performance.
+
+    Populated by a post-trading analysis pass that rolls up audit log rows,
+    paper / live trades, and the rejections buffer. The raw event data lives
+    in ``TradeAuditLog``; this is the pre-aggregated view that the analytics
+    UI and scheduled reports consume.
+    """
+
+    __tablename__ = "trading_day_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    date = Column(DateTime, nullable=False, unique=True, index=True)
+    total_trades = Column(Integer, default=0)
+    wins = Column(Integer, default=0)
+    losses = Column(Integer, default=0)
+    gross_pnl = Column(Float, default=0)
+    total_charges = Column(Float, default=0)
+    net_pnl = Column(Float, default=0)
+    win_rate = Column(Float, default=0)
+    avg_trade_duration = Column(Float, default=0)
+    signals_generated = Column(Integer, default=0)
+    signals_traded = Column(Integer, default=0)
+    signals_rejected = Column(Integer, default=0)
+    rejection_reasons = Column(JSON, nullable=True)
+    market_conditions = Column(JSON, nullable=True)
+    settings_snapshot = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

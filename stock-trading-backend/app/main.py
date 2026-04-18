@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from app.database import init_db, async_session_factory
 from app.routers import instruments, candles, signals, paper_trading, fyers, analysis
 from app.routers import heatmap, trade_mode, settings, funds, limits, live_trades, scanner
+from app.routers import audit as audit_router
 from app import fyers_client
 from app import auto_trade_engine
 
@@ -68,6 +69,18 @@ async def ensure_columns():
         ("live_trades", "filled_quantity", "ALTER TABLE live_trades ADD COLUMN filled_quantity INTEGER"),
         ("live_trades", "avg_fill_price", "ALTER TABLE live_trades ADD COLUMN avg_fill_price FLOAT"),
         ("live_trades", "broker_status", "ALTER TABLE live_trades ADD COLUMN broker_status VARCHAR(20)"),
+        # paper_trades — product type + per-trade charge breakdown (F3 / F5).
+        # Mirrors the columns that live_trades already exposes so the
+        # dashboard can show net P&L-after-charges for both modes.
+        ("paper_trades", "product_type", "ALTER TABLE paper_trades ADD COLUMN product_type VARCHAR(10) DEFAULT 'INTRADAY'"),
+        ("paper_trades", "brokerage", "ALTER TABLE paper_trades ADD COLUMN brokerage FLOAT DEFAULT 0"),
+        ("paper_trades", "stt", "ALTER TABLE paper_trades ADD COLUMN stt FLOAT DEFAULT 0"),
+        ("paper_trades", "exchange_charges", "ALTER TABLE paper_trades ADD COLUMN exchange_charges FLOAT DEFAULT 0"),
+        ("paper_trades", "gst", "ALTER TABLE paper_trades ADD COLUMN gst FLOAT DEFAULT 0"),
+        ("paper_trades", "sebi_charges", "ALTER TABLE paper_trades ADD COLUMN sebi_charges FLOAT DEFAULT 0"),
+        ("paper_trades", "stamp_duty", "ALTER TABLE paper_trades ADD COLUMN stamp_duty FLOAT DEFAULT 0"),
+        ("paper_trades", "gross_pnl", "ALTER TABLE paper_trades ADD COLUMN gross_pnl FLOAT"),
+        ("paper_trades", "net_pnl", "ALTER TABLE paper_trades ADD COLUMN net_pnl FLOAT"),
     ]
 
     async with async_session_factory() as db:
@@ -308,6 +321,7 @@ app.include_router(funds.router)
 app.include_router(limits.router)
 app.include_router(live_trades.router)
 app.include_router(scanner.router)
+app.include_router(audit_router.router)
 
 
 @app.get("/healthz")

@@ -1,5 +1,6 @@
 import { Component, OnInit, OnDestroy, NgZone } from '@angular/core';
 import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
 import { RouterLink } from '@angular/router';
 import { Subscription } from 'rxjs';
 
@@ -10,7 +11,7 @@ import { SseService } from '../../services/sse.service';
 @Component({
   selector: 'app-dashboard',
   standalone: true,
-  imports: [CommonModule, RouterLink],
+  imports: [CommonModule, FormsModule, RouterLink],
   templateUrl: './dashboard.component.html',
   styleUrl: './dashboard.component.scss'
 })
@@ -24,6 +25,10 @@ export class DashboardComponent implements OnInit, OnDestroy {
   marketOpen = false;
   livePrices: { [symbol: string]: number } = {};
   autoTradeStatus: any = null;
+  openTradeCharges: { [tradeId: number]: any } = {};
+  editingCapital = false;
+  editCapitalAmount: number | null = null;
+  savingCapital = false;
   private fastInterval: any;
   private slowInterval: any;
   private marketCheckInterval: any;
@@ -181,6 +186,21 @@ export class DashboardComponent implements OnInit, OnDestroy {
     this.state.refreshFunds();
     this.state.refreshOpenTrades();
     this.state.refreshAutoTradeStatus();
+    this.fetchOpenTradeCharges();
+  }
+
+  private fetchOpenTradeCharges() {
+    if (this.openPaperTrades.length === 0) return;
+    this.api.getPaperOpenTradeCharges().subscribe({
+      next: (rows: any[]) => {
+        const map: { [id: number]: any } = {};
+        for (const r of rows || []) {
+          if (r && r.trade_id != null) map[r.trade_id] = r;
+        }
+        this.openTradeCharges = map;
+      },
+      error: () => {},
+    });
   }
 
   private loadSlow() {
@@ -272,6 +292,55 @@ export class DashboardComponent implements OnInit, OnDestroy {
     if (val == null) return '0';
     const sign = val >= 0 ? '+' : '';
     return sign + new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(val);
+  }
+
+  // F4: inline capital edit.
+  editCapital() {
+    this.editingCapital = true;
+    this.editCapitalAmount = this.paperFunds?.simulated_capital ?? 500000;
+  }
+
+  cancelEditCapital() {
+    this.editingCapital = false;
+    this.editCapitalAmount = null;
+  }
+
+  saveCapital() {
+    const amt = Number(this.editCapitalAmount);
+    if (!Number.isFinite(amt) || amt <= 0) {
+      this.showToast('Capital must be a positive number', 'error');
+      return;
+    }
+    this.savingCapital = true;
+    this.api.updateSimulatedCapital(amt).subscribe({
+      next: () => {
+        this.savingCapital = false;
+        this.editingCapital = false;
+        this.editCapitalAmount = null;
+        this.state.invalidateFunds();
+        this.loadAll(false);
+        this.showToast(`Simulated capital updated to \u20B9${this.formatCurrency(amt)}`, 'success');
+      },
+      error: (err) => {
+        this.savingCapital = false;
+        this.showToast(err?.error?.detail || 'Failed to update capital', 'error');
+      },
+    });
+  }
+
+  // F3: estimated round-trip charges lookup for open trades.
+  getEstimatedCharges(trade: any): number | null {
+    const charges = this.openTradeCharges[trade?.id];
+    if (!charges) return null;
+    const val = charges.estimated_charges ?? charges.total_charges;
+    return val != null ? Number(val) : null;
+  }
+
+  getNetUnrealizedPnl(trade: any): number {
+    const gross = this.getUnrealizedPnl(trade);
+    const est = this.getEstimatedCharges(trade);
+    if (est == null) return gross;
+    return gross - est;
   }
 
   // --- Auto-Trade SSE Events ---

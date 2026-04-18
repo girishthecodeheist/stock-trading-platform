@@ -27,9 +27,11 @@ from app.indicator_engine import compute_all_indicators
 from app.signal_engine import generate_signal
 from app.brokerage_calc import (
     calc_brokerage,
+    compare_intraday_vs_delivery,
     is_trade_profitable_after_brokerage,
     min_qty_for_net_profit,
 )
+from app import audit
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,51 @@ TRAILING_PROFIT_STEP_PCT = 0.5      # Move target up by 0.5% each step
 
 # Re-analysis config
 RE_ANALYSIS_INTERVAL_SECS = 120     # Re-analyze open trades every 2 minutes
+
+# F6: Intraday timing guardrails (IST minutes from midnight).
+# Fyers auto-squares-off MIS around 15:15, and rejects MIS orders after that
+# with "RED:'MIS' Orders are disallowed after system square off". We stop
+# opening *new* intraday trades at 14:30 because there's rarely enough runway
+# to hit a meaningful target before square-off.
+INTRADAY_SQUARE_OFF_TIME = 15 * 60 + 15  # 15:15 IST
+INTRADAY_NO_NEW_TRADE_AFTER = 14 * 60 + 30  # 14:30 IST
+
+
+def _ist_minute_of_day(now: Optional[datetime] = None) -> int:
+    now = now or datetime.now(IST)
+    return now.hour * 60 + now.minute
+
+
+def _choose_product_type(
+    entry_price: float, target: Optional[float], qty: int,
+    now_minute: Optional[int] = None,
+) -> tuple[str, str, dict]:
+    """Decide INTRADAY vs DELIVERY for an auto-placed trade.
+
+    Returns ``(product_type, reason, comparison)``. Rules:
+      * After 14:30 IST \u2192 DELIVERY (not enough runway before MIS cutoff).
+      * If intraday charges would eat >50% of expected gross profit \u2192 DELIVERY.
+      * Otherwise prefer INTRADAY (5x leverage is the usual win).
+    """
+    now_min = now_minute if now_minute is not None else _ist_minute_of_day()
+    if now_min >= INTRADAY_NO_NEW_TRADE_AFTER:
+        return "DELIVERY", (
+            f"After 14:30 IST ({now_min // 60:02d}:{now_min % 60:02d}); "
+            "intraday runway insufficient before 15:15 square-off."
+        ), {}
+
+    if not target or target == entry_price or qty <= 0:
+        return "INTRADAY", "Default routing (no target / qty to score)", {}
+
+    cmp_ = compare_intraday_vs_delivery(entry_price, float(target), qty)
+    gross = cmp_.get("gross_profit") or 0
+    intra_charges = cmp_["intraday"]["total_charges"]
+    if gross > 0 and intra_charges > 0.5 * gross:
+        return "DELIVERY", (
+            f"Intraday charges \u20b9{intra_charges:.2f} exceed 50% of gross profit "
+            f"\u20b9{gross:.2f} \u2014 delivery is cheaper."
+        ), cmp_
+    return "INTRADAY", cmp_.get("recommendation_reason") or "Intraday cheaper or comparable", cmp_
 
 # Engine state
 _engine_task: Optional[asyncio.Task] = None
@@ -958,6 +1005,21 @@ async def _place_auto_trade(
                 )
                 return None
 
+        # F1 + F6: pick INTRADAY vs DELIVERY. The user-level default in
+        # ``trading_settings.product_type`` is the fallback; auto-routing
+        # overrides it when intraday charges are uneconomic or when we're
+        # too close to the 15:15 square-off.
+        configured_product_type = str(settings.get("product_type") or "INTRADAY").upper()
+        now_min = _ist_minute_of_day()
+        auto_product_type, routing_reason, routing_cmp = _choose_product_type(
+            entry_price, target, quantity, now_minute=now_min,
+        )
+        if configured_product_type == "DELIVERY" and auto_product_type != "DELIVERY":
+            product_type = "DELIVERY"
+            routing_reason = "Settings force DELIVERY (CNC)"
+        else:
+            product_type = auto_product_type
+
         snapshot = {
             "auto_trade": True,
             "mode": trade_mode,
@@ -967,6 +1029,8 @@ async def _place_auto_trade(
             "analyzed_timeframe": analyzed_timeframe,
             "available_margin_at_entry": round(available_margin, 2),
             "trade_cost": round(trade_cost, 2),
+            "product_type": product_type,
+            "product_type_reason": routing_reason,
         }
 
         full_reasons = list(reasons) if isinstance(reasons, list) else [str(reasons)]
@@ -978,7 +1042,6 @@ async def _place_auto_trade(
             # OPEN row that monitor loops would try to close via a non-existent
             # position.
             fyers_side = 1 if side == "BUY" else -1
-            product_type = str(settings.get("product_type") or "INTRADAY").upper()
             entry_resp = await fyers_client.place_order_async(
                 symbol=symbol,
                 side=fyers_side,
@@ -1148,10 +1211,10 @@ async def _place_auto_trade(
                 result = await db.execute(text(
                     "INSERT INTO paper_trades (symbol, instrument_type, timeframe, side, entry_price, "
                     "entry_time, quantity, stop_loss, target, status, signal_confidence, "
-                    "signal_reasons, indicators_snapshot, is_auto_trade) "
+                    "signal_reasons, indicators_snapshot, is_auto_trade, product_type) "
                     "VALUES (:symbol, 'EQUITY', :timeframe, :side, :entry_price, "
                     ":entry_time, :quantity, :stop_loss, :target, 'OPEN', :signal_confidence, "
-                    ":signal_reasons, :indicators_snapshot, true) "
+                    ":signal_reasons, :indicators_snapshot, true, :product_type) "
                     "RETURNING id"
                 ), {
                     "symbol": symbol,
@@ -1165,9 +1228,45 @@ async def _place_auto_trade(
                     "signal_confidence": confidence,
                     "signal_reasons": json.dumps(full_reasons),
                     "indicators_snapshot": json.dumps(snapshot),
+                    "product_type": product_type,
                 })
                 await db.commit()
                 trade_id = result.scalar()
+
+        # F5: record TRADE_PLACED + PRODUCT_TYPE_DECISION audit rows.
+        try:
+            await audit.log_event(
+                trade_id=trade_id,
+                trade_type=trade_mode,
+                event_type=audit.EVENT_TRADE_PLACED,
+                symbol=symbol,
+                new_value={
+                    "entry_price": entry_price,
+                    "stop_loss": stop_loss,
+                    "target": target,
+                    "quantity": quantity,
+                    "side": side,
+                    "product_type": product_type,
+                },
+                reason=f"Auto-placed {signal_type} signal (score={score})",
+                trigger_data={
+                    "score": score,
+                    "confidence": confidence,
+                    "analyzed_timeframe": analyzed_timeframe,
+                    "reasons": full_reasons,
+                },
+            )
+            await audit.log_event(
+                trade_id=trade_id,
+                trade_type=trade_mode,
+                event_type=audit.EVENT_PRODUCT_TYPE_DECISION,
+                symbol=symbol,
+                new_value={"product_type": product_type},
+                reason=routing_reason,
+                trigger_data=(routing_cmp or None),
+            )
+        except Exception as e:
+            logger.debug(f"Audit hook (TRADE_PLACED) failed: {e}")
 
         # Update cooldown tracking
         _last_trade_time_per_symbol[symbol] = datetime.now(IST)
@@ -1390,7 +1489,8 @@ async def _monitor_open_trades(settings: dict) -> int:
     async with async_session_factory() as db:
         result = await db.execute(text(
             "SELECT id, symbol, side, entry_price, quantity, stop_loss, target, "
-            "entry_time, indicators_snapshot "
+            "entry_time, indicators_snapshot, "
+            "COALESCE(product_type, 'INTRADAY') AS product_type "
             "FROM paper_trades WHERE status = 'OPEN'"
         ))
         open_trades = result.fetchall()
@@ -1419,6 +1519,7 @@ async def _monitor_open_trades(settings: dict) -> int:
         _last_reanalysis_time = now
 
     closed_count = 0
+    now_minute = _ist_minute_of_day(now)
     for trade in open_trades:
         trade_id = trade[0]
         symbol = trade[1]
@@ -1428,6 +1529,7 @@ async def _monitor_open_trades(settings: dict) -> int:
         stop_loss = float(trade[5]) if trade[5] else None
         target = float(trade[6]) if trade[6] else None
         entry_time = trade[7]
+        product_type = (trade[9] or "INTRADAY").upper() if len(trade) > 9 else "INTRADAY"
 
         price_data = all_prices.get(symbol)
         if not price_data:
@@ -1445,6 +1547,7 @@ async def _monitor_open_trades(settings: dict) -> int:
                     new_target = round(ltp * (1 + TRAILING_PROFIT_STEP_PCT / 100), 2)
                     if new_target > target:
                         old_target = target
+                        old_sl = stop_loss
                         target = new_target
                         new_sl = round(max(stop_loss, entry_price * (1 + TRAILING_PROFIT_TRIGGER_PCT / 200)), 2)
                         if new_sl > stop_loss:
@@ -1466,6 +1569,18 @@ async def _monitor_open_trades(settings: dict) -> int:
                             "reason": "trailing_profit",
                             "profit_pct": round(profit_pct, 2),
                         })
+                        try:
+                            await audit.log_event(
+                                trade_id=trade_id, trade_type="PAPER",
+                                event_type=audit.EVENT_TRAILING_PROFIT,
+                                symbol=symbol,
+                                old_value={"target": old_target, "stop_loss": old_sl},
+                                new_value={"target": target, "stop_loss": stop_loss},
+                                reason=f"Trailing profit triggered at {profit_pct:.2f}% profit",
+                                trigger_data={"ltp": ltp, "profit_pct": round(profit_pct, 2)},
+                            )
+                        except Exception:
+                            pass
 
             elif side == "SELL":
                 profit_pct = (entry_price - ltp) / entry_price * 100
@@ -1473,6 +1588,7 @@ async def _monitor_open_trades(settings: dict) -> int:
                     new_target = round(ltp * (1 - TRAILING_PROFIT_STEP_PCT / 100), 2)
                     if new_target < target:
                         old_target = target
+                        old_sl = stop_loss
                         target = new_target
                         new_sl = round(min(stop_loss, entry_price * (1 - TRAILING_PROFIT_TRIGGER_PCT / 200)), 2)
                         if new_sl < stop_loss:
@@ -1494,6 +1610,18 @@ async def _monitor_open_trades(settings: dict) -> int:
                             "reason": "trailing_profit",
                             "profit_pct": round(profit_pct, 2),
                         })
+                        try:
+                            await audit.log_event(
+                                trade_id=trade_id, trade_type="PAPER",
+                                event_type=audit.EVENT_TRAILING_PROFIT,
+                                symbol=symbol,
+                                old_value={"target": old_target, "stop_loss": old_sl},
+                                new_value={"target": target, "stop_loss": stop_loss},
+                                reason=f"Trailing profit triggered at {profit_pct:.2f}% profit",
+                                trigger_data={"ltp": ltp, "profit_pct": round(profit_pct, 2)},
+                            )
+                        except Exception:
+                            pass
 
         # --- Re-Analysis ---
         if do_reanalysis and entry_time:
@@ -1518,6 +1646,7 @@ async def _monitor_open_trades(settings: dict) -> int:
                         else:
                             tighter_sl = round(ltp * 1.002, 2)
 
+                        old_sl_for_audit = stop_loss
                         async with async_session_factory() as db:
                             await db.execute(text(
                                 "UPDATE paper_trades SET stop_loss = :stop_loss "
@@ -1534,6 +1663,25 @@ async def _monitor_open_trades(settings: dict) -> int:
                             "reason": "trend_reversal",
                             "new_signal": new_signal, "new_score": new_score,
                         })
+                        try:
+                            await audit.log_event(
+                                trade_id=trade_id, trade_type="PAPER",
+                                event_type=audit.EVENT_TREND_REVERSAL,
+                                symbol=symbol,
+                                old_value={"stop_loss": old_sl_for_audit},
+                                new_value={"stop_loss": tighter_sl},
+                                reason=(
+                                    f"Trend reversal detected (new signal: {new_signal}, "
+                                    f"score: {new_score}); SL tightened to lock in runner."
+                                ),
+                                trigger_data={
+                                    "new_signal": new_signal,
+                                    "new_score": new_score,
+                                    "ltp": ltp,
+                                },
+                            )
+                        except Exception:
+                            pass
                         stop_loss = tighter_sl
 
                     elif not is_reversal and new_sl and new_tgt:
@@ -1554,6 +1702,8 @@ async def _monitor_open_trades(settings: dict) -> int:
                                 updated = True
 
                         if updated:
+                            prev_sl = float(trade[5]) if trade[5] else None
+                            prev_tgt = float(trade[6]) if trade[6] else None
                             async with async_session_factory() as db:
                                 await db.execute(text(
                                     "UPDATE paper_trades SET stop_loss = :stop_loss, target = :target "
@@ -1568,6 +1718,22 @@ async def _monitor_open_trades(settings: dict) -> int:
                                 "new_stop_loss": stop_loss, "new_target": target,
                                 "reason": "reanalysis_update",
                             })
+                            try:
+                                await audit.log_event(
+                                    trade_id=trade_id, trade_type="PAPER",
+                                    event_type=audit.EVENT_REANALYSIS,
+                                    symbol=symbol,
+                                    old_value={"stop_loss": prev_sl, "target": prev_tgt},
+                                    new_value={"stop_loss": stop_loss, "target": target},
+                                    reason="Re-analysis updated SL/target based on new 15m data",
+                                    trigger_data={
+                                        "new_signal": new_signal,
+                                        "new_score": new_score,
+                                        "ltp": ltp,
+                                    },
+                                )
+                            except Exception:
+                                pass
             except Exception as e:
                 logger.debug(f"Re-analysis failed for trade #{trade_id} ({symbol}): {e}")
 
@@ -1575,7 +1741,13 @@ async def _monitor_open_trades(settings: dict) -> int:
         exit_reason = None
         exit_price = ltp
 
-        if side == "BUY":
+        # F6: 15:15 IST intraday auto-square-off. Runs before the SL/target
+        # check so even an unreached-target MIS position is closed out in
+        # time and doesn't incur Fyers' auto-cut charges.
+        if product_type == "INTRADAY" and now_minute >= INTRADAY_SQUARE_OFF_TIME:
+            exit_reason = "INTRADAY_SQUARE_OFF"
+            exit_price = ltp
+        elif side == "BUY":
             if stop_loss and ltp <= stop_loss:
                 exit_reason = "AUTO_SL_HIT"
                 exit_price = stop_loss
@@ -1595,11 +1767,20 @@ async def _monitor_open_trades(settings: dict) -> int:
                 if side == "BUY":
                     pnl_pct = (exit_price - entry_price) / entry_price * 100
                     pnl_amount = (exit_price - entry_price) * quantity
+                    buy_leg = entry_price
+                    sell_leg = exit_price
                 else:
                     pnl_pct = (entry_price - exit_price) / entry_price * 100
                     pnl_amount = (entry_price - exit_price) * quantity
+                    buy_leg = exit_price
+                    sell_leg = entry_price
 
                 result_str = "WIN" if pnl_pct > 0 else ("LOSS" if pnl_pct < 0 else "BREAKEVEN")
+
+                # F3: compute Fyers charges using the trade's product_type.
+                charges = calc_brokerage(buy_leg, sell_leg, quantity, product_type=product_type)
+                total_charges = float(charges["total_charges"])
+                net_pnl = round(float(pnl_amount) - total_charges, 2)
 
                 async with async_session_factory() as db:
                     await db.execute(text(
@@ -1607,7 +1788,11 @@ async def _monitor_open_trades(settings: dict) -> int:
                         "exit_price = :exit_price, exit_time = :exit_time, "
                         "status = 'CLOSED', result = :result, "
                         "pnl_percent = :pnl_pct, pnl_amount = :pnl_amount, "
-                        "exit_reason = :exit_reason "
+                        "exit_reason = :exit_reason, "
+                        "brokerage = :brokerage, stt = :stt, "
+                        "exchange_charges = :exchange, gst = :gst, "
+                        "sebi_charges = :sebi, stamp_duty = :stamp, "
+                        "gross_pnl = :gross_pnl, net_pnl = :net_pnl "
                         "WHERE id = :id AND status = 'OPEN'"
                     ), {
                         "exit_price": round(exit_price, 2),
@@ -1616,6 +1801,14 @@ async def _monitor_open_trades(settings: dict) -> int:
                         "pnl_pct": round(pnl_pct, 2),
                         "pnl_amount": round(pnl_amount, 2),
                         "exit_reason": exit_reason,
+                        "brokerage": float(charges["brokerage"]),
+                        "stt": float(charges["stt"]),
+                        "exchange": float(charges["exchange_charges"]),
+                        "gst": float(charges["gst"]),
+                        "sebi": float(charges["sebi_charges"]),
+                        "stamp": float(charges["stamp_duty"]),
+                        "gross_pnl": round(float(pnl_amount), 2),
+                        "net_pnl": net_pnl,
                         "id": trade_id,
                     })
                     await db.commit()
@@ -1623,9 +1816,10 @@ async def _monitor_open_trades(settings: dict) -> int:
                 closed_count += 1
                 _add_log("AUTO_CLOSE", symbol,
                          f"Trade #{trade_id}: {exit_reason}, Exit={exit_price}, "
-                         f"P&L={pnl_amount:+.2f} ({pnl_pct:+.2f}%)")
+                         f"P&L={pnl_amount:+.2f} ({pnl_pct:+.2f}%) "
+                         f"net=\u20b9{net_pnl:+.2f} charges=\u20b9{total_charges:.2f}")
                 logger.info(f"Auto-closed trade #{trade_id}: {exit_reason} @ {exit_price}, "
-                             f"P&L={pnl_amount:+.2f}")
+                             f"P&L={pnl_amount:+.2f}, net=\u20b9{net_pnl:+.2f}")
 
                 _push_event("TRADE_CLOSED", {
                     "trade_id": trade_id,
@@ -1634,9 +1828,40 @@ async def _monitor_open_trades(settings: dict) -> int:
                     "exit_price": round(exit_price, 2),
                     "exit_reason": exit_reason,
                     "pnl_amount": round(pnl_amount, 2),
+                    "gross_pnl": round(float(pnl_amount), 2),
+                    "net_pnl": net_pnl,
+                    "total_charges": round(total_charges, 2),
                     "pnl_pct": round(pnl_pct, 2),
                     "result": result_str,
                 })
+
+                try:
+                    close_event = (
+                        audit.EVENT_INTRADAY_SQUARE_OFF
+                        if exit_reason == "INTRADAY_SQUARE_OFF"
+                        else audit.EVENT_TRADE_CLOSED
+                    )
+                    await audit.log_event(
+                        trade_id=trade_id, trade_type="PAPER",
+                        event_type=close_event,
+                        symbol=symbol,
+                        old_value={"status": "OPEN"},
+                        new_value={
+                            "status": "CLOSED",
+                            "exit_price": round(exit_price, 2),
+                            "result": result_str,
+                            "gross_pnl": round(float(pnl_amount), 2),
+                            "net_pnl": net_pnl,
+                        },
+                        reason=exit_reason,
+                        trigger_data={
+                            "charges": charges,
+                            "product_type": product_type,
+                            "ltp": ltp,
+                        },
+                    )
+                except Exception:
+                    pass
 
             except Exception as e:
                 logger.error(f"Auto-close error for trade #{trade_id}: {e}")
