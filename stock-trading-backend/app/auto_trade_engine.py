@@ -254,6 +254,13 @@ _REJECTION_REASONS = {
     # not allowed", insufficient funds on the real account, instrument
     # banned for intraday, etc.). Surfaces the raw broker message.
     "FYERS_REJECTED",
+    # Newer gates — keep in sync with the rejection reasons that
+    # _place_auto_trade passes to _record_rejection, otherwise the
+    # UI's "Blocked signals" panel silently drops them.
+    "FALLBACK_BLOCKED",
+    "LOW_VOLUME",
+    "BAD_RR",
+    "TARGET_TOO_TIGHT",
 }
 
 

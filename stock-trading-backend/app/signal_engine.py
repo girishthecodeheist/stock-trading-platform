@@ -226,8 +226,12 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
             score -= 5
             reasons.append(f"Stochastic overbought (%K={stoch_k:.0f}, %D={stoch_d:.0f})")
 
-    # Volume Analysis (weight: 8%)
+    # Volume Analysis (weight: 8%). The additive boost for high volume can
+    # safely be applied here, but the *multiplicative* haircut for low
+    # volume is deferred to the end of the function so it discounts the
+    # final score — not just the indicators scored so far.
     volume_ratio = indicators.get("volume_ratio")
+    volume_discount_factor = 1.0
     if volume_ratio is not None:
         if volume_ratio >= 2.0:
             if score > 0:
@@ -243,14 +247,14 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
                 score -= 4
         elif volume_ratio < 0.5:
             # Gap 8: very low volume — price action is not well-confirmed,
-            # discount the signal aggressively.
-            score *= 0.7
+            # discount the final signal aggressively.
+            volume_discount_factor = 0.7
             reasons.append(
                 f"Volume {volume_ratio:.1f}x below average - weak conviction, score reduced"
             )
         elif volume_ratio < 0.7:
-            # Gap 8: mildly low volume — smaller haircut.
-            score *= 0.85
+            # Gap 8: mildly low volume — smaller haircut on the final score.
+            volume_discount_factor = 0.85
             reasons.append(
                 f"Volume {volume_ratio:.1f}x below average - reduced conviction"
             )
@@ -368,6 +372,13 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
         reasons.append(f"Guppy GMMA bearish (spread {spread:+.2f}%) - short EMAs below long EMAs")
     elif guppy == "COMPRESSION":
         reasons.append("Guppy GMMA compression - trend change likely, wait for breakout")
+
+    # Gap 8 (final application): discount the *total* technical score for
+    # low-volume setups. Applied last so every indicator above is haircut
+    # uniformly — a simple multiply works in both directions since e.g.
+    # -100 * 0.7 = -70 still has smaller magnitude than the original score.
+    if volume_discount_factor < 1.0:
+        score *= volume_discount_factor
 
     return score, reasons
 
