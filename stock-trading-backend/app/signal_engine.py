@@ -51,15 +51,24 @@ def generate_signal(
     # If the user has disabled any fundamental per-metric, recompute the
     # category score from raw fundamentals excluding those metrics so the
     # combined score reflects the current toggles (rather than the value
-    # yfinance cached alongside the raw fields).
+    # yfinance cached alongside the raw fields). The reason text is also
+    # filtered so we don't surface "P/E ratio 20 - attractively valued"
+    # for a metric the user has toggled off.
+    from app.indicator_catalog import FUNDAMENTAL_INDICATORS as _FUND_META
+    fund_all_keys = {ind["key"] for ind in _FUND_META}
+    fund_metric_keys = {k for k in disabled if k in fund_all_keys}
+    fund_all_off = bool(fund_all_keys) and fund_all_keys.issubset(fund_metric_keys)
     fund_score = 0.0
     fund_reasons: List[str] = []
-    if fundamental and fundamental.get("fundamental_score") is not None:
+    if (
+        fundamental
+        and fundamental.get("fundamental_score") is not None
+        and not fund_all_off
+    ):
         fund_score = fundamental["fundamental_score"]
-        fund_metric_keys = {k for k in disabled if k.startswith("fund_")}
         if fund_metric_keys:
             fund_score = recompute_fundamental_score(fundamental, fund_metric_keys)
-        fund_reasons = _analyze_fundamental(fundamental)
+        fund_reasons = _analyze_fundamental(fundamental, fund_metric_keys)
         reasons.extend(fund_reasons)
 
     # --- SENTIMENT ANALYSIS (weight: 25%) ---
@@ -455,14 +464,24 @@ def _analyze_technical(
     return score, reasons
 
 
-def _analyze_fundamental(data: Dict[str, Any]) -> List[str]:
-    """Generate fundamental analysis reasons."""
+def _analyze_fundamental(
+    data: Dict[str, Any], disabled_metrics: Optional[Set[str]] = None
+) -> List[str]:
+    """Generate fundamental analysis reasons.
+
+    ``disabled_metrics`` is the per-metric subset of the user's disabled set
+    (e.g. ``{"fund_pe_ratio", "fund_roe"}``). Disabled keys are skipped so
+    the reason text matches what actually contributed to the score —
+    otherwise the UI would show "P/E ratio 20 - attractively valued" for a
+    metric the user toggled off.
+    """
     reasons = []
+    disabled = disabled_metrics or set()
     fund_signal = data.get("fundamental_signal", "NEUTRAL")
     fund_score = data.get("fundamental_score", 0)
 
     pe = data.get("pe_ratio")
-    if pe is not None:
+    if pe is not None and "fund_pe_ratio" not in disabled:
         if pe < 15:
             reasons.append(f"P/E ratio {pe:.1f} - attractively valued")
         elif pe > 35:
@@ -471,7 +490,7 @@ def _analyze_fundamental(data: Dict[str, Any]) -> List[str]:
             reasons.append(f"P/E ratio {pe:.1f}")
 
     roe = data.get("roe")
-    if roe is not None:
+    if roe is not None and "fund_roe" not in disabled:
         pct = roe * 100 if abs(roe) < 1 else roe
         if pct > 15:
             reasons.append(f"ROE {pct:.1f}% - strong profitability")
@@ -479,26 +498,29 @@ def _analyze_fundamental(data: Dict[str, Any]) -> List[str]:
             reasons.append(f"ROE {pct:.1f}% - weak profitability")
 
     de = data.get("debt_to_equity")
-    if de is not None:
+    if de is not None and "fund_debt_to_equity" not in disabled:
         if de < 50:
             reasons.append(f"D/E ratio {de:.0f} - low leverage")
         elif de > 150:
             reasons.append(f"D/E ratio {de:.0f} - high leverage risk")
 
     pm = data.get("profit_margin")
-    if pm is not None:
+    if pm is not None and "fund_profit_margin" not in disabled:
         pct = pm * 100 if abs(pm) < 1 else pm
         if pct > 15:
             reasons.append(f"Profit margin {pct:.1f}% - healthy margins")
 
     rg = data.get("revenue_growth")
-    if rg is not None:
+    if rg is not None and "fund_revenue_growth" not in disabled:
         pct = rg * 100 if abs(rg) < 1 else rg
         if pct > 10:
             reasons.append(f"Revenue growth {pct:.1f}% - growing business")
         elif pct < 0:
             reasons.append(f"Revenue growth {pct:.1f}% - declining revenue")
 
+    # Analyst recommendation isn't a disable-able per-metric key in the
+    # catalog today; leave unconditional so users still see it unless/until
+    # we promote ``recommendation`` into its own fund_* toggle.
     rec = data.get("recommendation")
     if rec and rec != "N/A":
         reasons.append(f"Analyst recommendation: {rec.upper()}")
