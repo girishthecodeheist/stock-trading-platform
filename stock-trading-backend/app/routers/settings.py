@@ -42,6 +42,7 @@ class SettingsUpdate(BaseModel):
     min_net_profit_per_trade: Optional[float] = None
     min_profit_to_cost_ratio: Optional[float] = None
     product_type: Optional[str] = None  # INTRADAY | CNC
+    intraday_leverage: Optional[float] = None  # broker-allowed MIS multiplier (e.g. 5.0)
 
 
 @router.get("")
@@ -69,6 +70,18 @@ async def update_settings(body: SettingsUpdate, db: AsyncSession = Depends(get_d
                 "error": "product_type must be 'INTRADAY' or 'CNC'",
             }
         updates["product_type"] = pt
+
+    if "intraday_leverage" in updates:
+        try:
+            lev = float(updates["intraday_leverage"])
+        except (TypeError, ValueError):
+            return {"success": False, "error": "intraday_leverage must be a number"}
+        if lev < 1.0 or lev > 20.0:
+            return {
+                "success": False,
+                "error": "intraday_leverage must be between 1.0 (no leverage) and 20.0",
+            }
+        updates["intraday_leverage"] = lev
 
     set_clauses = ", ".join(f"{k} = :{k}" for k in updates)
     updates["now"] = datetime.utcnow()
@@ -130,6 +143,14 @@ async def calculate_quantity(
         max_loss = abs(settings["day_max_loss_paper"])
         profit_target = settings["day_profit_target_paper"]
 
+    # Apply broker leverage for INTRADAY/MIS sizing so the qty calculator
+    # reflects buying power, not raw wallet cash. CNC stays 1x.
+    product_type = str(settings.get("product_type") or "INTRADAY").upper()
+    raw_leverage = settings.get("intraday_leverage")
+    intraday_leverage = float(raw_leverage) if raw_leverage else 5.0
+    leverage = intraday_leverage if product_type == "INTRADAY" else 1.0
+    buying_power = capital * leverage
+
     # Calculate per-share risk and reward
     sl_per_share = entry_price * sl_pct / 100.0
     target_per_share = entry_price * tgt_pct / 100.0
@@ -141,8 +162,8 @@ async def calculate_quantity(
     qty_from_loss = max_loss / sl_per_share
     # Quantity to achieve profit target
     qty_from_profit = profit_target / target_per_share
-    # Quantity limited by available capital
-    qty_from_capital = capital / entry_price if entry_price > 0 else 0
+    # Quantity limited by buying power (capital * leverage for INTRADAY).
+    qty_from_capital = buying_power / entry_price if entry_price > 0 else 0
 
     # Take the minimum to satisfy all constraints
     optimal_qty = int(math.floor(min(qty_from_loss, qty_from_profit, qty_from_capital)))
@@ -152,7 +173,7 @@ async def calculate_quantity(
     # minimum (clamped by the loss/capital caps above).
     min_net = float(settings.get("min_net_profit_per_trade") or 1.0)
     min_ratio = float(settings.get("min_profit_to_cost_ratio") or 1.0)
-    cap_qty = int(math.floor(min(qty_from_loss, qty_from_capital))) or optimal_qty
+    cap_qty = int(math.floor(min(qty_from_loss, qty_from_capital))) or optimal_qty  # qty_from_capital already honours INTRADAY leverage
     target_price = entry_price * (1 + tgt_pct / 100.0)
     min_qty_net = min_qty_for_net_profit(
         entry_price, target_price,
@@ -182,6 +203,9 @@ async def calculate_quantity(
         "max_loss_limit": max_loss,
         "profit_target": profit_target,
         "capital": capital,
+        "buying_power": round(buying_power, 2),
+        "leverage": leverage,
+        "product_type": product_type,
         "capital_source": capital_source,
         "mode": mode_up,
         "breakdown": {
