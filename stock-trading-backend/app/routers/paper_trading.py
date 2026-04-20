@@ -108,7 +108,12 @@ async def create_trade(
     (INTRADAY/CNC) instead of the old hard-coded INTRADAY default — that
     way the settings dropdown actually controls paper too.
     """
-    product_type = (trade.get("product_type") or "").upper()
+    # ``trade`` is untyped so the incoming value can be anything (None, int,
+    # list, …). Cast through ``str`` before ``.upper()`` so a malformed
+    # payload returns 400-ish behaviour (falls through to the settings
+    # lookup / default) instead of raising AttributeError.
+    raw_pt = trade.get("product_type")
+    product_type = str(raw_pt).upper() if raw_pt else ""
     if not product_type:
         try:
             pt_row = await db.execute(text(
@@ -118,8 +123,21 @@ async def create_trade(
             if pt_val:
                 product_type = str(pt_val).upper()
         except Exception:
-            pass
-    if product_type not in ("INTRADAY", "CNC", "DELIVERY"):
+            # A failed SELECT leaves the async session in an aborted state
+            # on PostgreSQL; every subsequent statement (including the
+            # INSERT below) would then fail with InFailedSqlTransactionError.
+            # Rolling back resets the session so create_trade degrades to
+            # the INTRADAY default instead of breaking paper placement
+            # entirely.
+            await db.rollback()
+    # Normalise DELIVERY → CNC so stored values stay in sync with the
+    # settings table / Fyers product-type vocabulary (trading_settings
+    # only ever stores "INTRADAY" or "CNC"). brokerage_calc treats both
+    # spellings as the same rate card, but downstream callers that
+    # compare ``== "CNC"`` would otherwise miss a DELIVERY-stored row.
+    if product_type == "DELIVERY":
+        product_type = "CNC"
+    if product_type not in ("INTRADAY", "CNC"):
         product_type = "INTRADAY"
     query = text("""
         INSERT INTO paper_trades (symbol, instrument_type, timeframe, side, entry_price,
