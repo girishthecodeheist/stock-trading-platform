@@ -241,6 +241,19 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
                 score += 4
             elif score < 0:
                 score -= 4
+        elif volume_ratio < 0.5:
+            # Gap 8: very low volume — price action is not well-confirmed,
+            # discount the signal aggressively.
+            score *= 0.7
+            reasons.append(
+                f"Volume {volume_ratio:.1f}x below average - weak conviction, score reduced"
+            )
+        elif volume_ratio < 0.7:
+            # Gap 8: mildly low volume — smaller haircut.
+            score *= 0.85
+            reasons.append(
+                f"Volume {volume_ratio:.1f}x below average - reduced conviction"
+            )
 
     # Williams %R (weight: 3%)
     wr = indicators.get("williams_r")
