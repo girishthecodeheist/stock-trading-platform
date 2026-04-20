@@ -1371,6 +1371,106 @@ async def _place_auto_trade(
         else:
             product_type = auto_product_type
 
+        # Quantity was sized with INTRADAY leverage (5x) when product_type in
+        # settings is INTRADAY. If auto-routing flipped to DELIVERY (after
+        # 14:30 IST cutoff, or intraday charges > 50% of gross profit), the
+        # order will be placed as CNC and needs full 1x cash margin — so we
+        # must shrink qty to what raw cash actually covers. Without this,
+        # LIVE orders get rejected by Fyers for insufficient margin and PAPER
+        # records inflated 5x positions.
+        if product_type == "DELIVERY" and configured_product_type == "INTRADAY":
+            original_qty = quantity
+            cash_qty_cap = int(math.floor(available_margin / entry_price)) if entry_price > 0 else 0
+            if quantity > cash_qty_cap:
+                quantity = max(cash_qty_cap, 0)
+                trade_cost = entry_price * quantity
+                if quantity <= 0:
+                    _add_log("CAPITAL_LIMIT", symbol,
+                             f"Rejected after DELIVERY auto-routing: cash=\u20b9{available_margin:.0f} "
+                             f"insufficient for 1 share @ \u20b9{entry_price:.2f}")
+                    _record_rejection(
+                        "CAPITAL_LIMIT", symbol, signal_data, trade_mode,
+                        f"Auto-routed to DELIVERY ({routing_reason}); cash "
+                        f"\u20b9{available_margin:.0f} insufficient for 1 share "
+                        f"@ \u20b9{entry_price:.2f}",
+                        extra={
+                            "available_margin": round(available_margin, 2),
+                            "product_type": product_type,
+                            "routing_reason": routing_reason,
+                        },
+                    )
+                    return None
+                _add_log("QTY_RECAP", symbol,
+                         f"qty {original_qty}\u2192{quantity} after DELIVERY auto-routing "
+                         f"(1x cash \u20b9{available_margin:.0f}; {routing_reason})")
+
+            # Always re-validate brokerage profitability under DELIVERY charges,
+            # regardless of whether qty was actually shrunk. The first gate at
+            # line ~1313 runs with product_type="INTRADAY" (the default), and
+            # DELIVERY has materially higher STT (0.1% on both legs vs 0.025%
+            # sell-side only) — a trade that cleared the floor as MIS can go
+            # net-negative as CNC even at the same qty. Charges also have fixed
+            # components (₹20/leg cap, exchange minimums), so the check is
+            # qty-sensitive too.
+            if target and entry_price and target != entry_price:
+                rc_min_net = float(
+                    settings.get("min_net_profit_per_trade", MIN_NET_PROFIT_PER_TRADE) or 0
+                )
+                rc_min_ratio = float(
+                    settings.get("min_profit_to_cost_ratio", MIN_PROFIT_TO_COST_RATIO) or 0
+                )
+                rc_check = is_trade_profitable_after_brokerage(
+                    entry_price, target, quantity,
+                    min_profit_ratio=rc_min_ratio,
+                    min_net_profit=rc_min_net,
+                    product_type="DELIVERY",
+                )
+                if not rc_check["profitable"]:
+                    rc_reason = []
+                    if not rc_check.get("ratio_ok", True):
+                        rc_reason.append(
+                            f"ratio {rc_check['profit_to_cost_ratio']:.2f}<{rc_min_ratio}"
+                        )
+                    if not rc_check.get("net_ok", True):
+                        rc_reason.append(
+                            f"net \u20b9{rc_check['net_profit']:.2f}<\u20b9{rc_min_net:.0f}"
+                        )
+                    qty_note = (
+                        f"{original_qty}\u2192{quantity}" if quantity != original_qty
+                        else f"qty={quantity}"
+                    )
+                    _add_log(
+                        "BROKERAGE_FILTER", symbol,
+                        f"Rejected under DELIVERY charges ({qty_note}): gross=\u20b9"
+                        f"{rc_check['gross_profit']:.2f}, charges=\u20b9"
+                        f"{rc_check['total_charges']:.2f} "
+                        f"({', '.join(rc_reason) or 'n/a'})",
+                    )
+                    _record_rejection(
+                        "BROKERAGE_FILTER", symbol, signal_data, trade_mode,
+                        f"Auto-routed to DELIVERY ({qty_note}) no longer profitable: "
+                        f"net \u20b9{rc_check['net_profit']:.2f} "
+                        f"(gross \u20b9{rc_check['gross_profit']:.2f} \u2212 charges "
+                        f"\u20b9{rc_check['total_charges']:.2f}); "
+                        f"{', '.join(rc_reason) or 'below floor'}",
+                        extra={
+                            "qty": quantity,
+                            "original_qty": original_qty,
+                            "product_type": product_type,
+                            "routing_reason": routing_reason,
+                            "gross_profit": round(rc_check["gross_profit"], 2),
+                            "total_charges": round(rc_check["total_charges"], 2),
+                            "net_profit": round(rc_check["net_profit"], 2),
+                            "min_net_profit": rc_min_net,
+                            "min_profit_to_cost_ratio": rc_min_ratio,
+                            "profit_to_cost_ratio": round(
+                                rc_check.get("profit_to_cost_ratio") or 0, 3
+                            ),
+                            "charges_breakdown": rc_check.get("charges_breakdown"),
+                        },
+                    )
+                    return None
+
         # Gap 5: persist a richer per-trade snapshot so the audit/journal view
         # can explain WHY each trade was placed (all key indicator values, plus
         # fundamental + sentiment summaries). We pick a fixed whitelist of keys
