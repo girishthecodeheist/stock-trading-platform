@@ -261,6 +261,9 @@ _REJECTION_REASONS = {
     "LOW_VOLUME",
     "BAD_RR",
     "TARGET_TOO_TIGHT",
+    # v5: Nifty-index regime gate. Blocks BUYs in a crashing market and
+    # SELLs in a surging one.
+    "REGIME_BLOCK",
 }
 
 
@@ -829,6 +832,116 @@ async def _confirm_with_daily_trend(symbol: str, intraday_signal: str) -> bool:
         return False
 
 
+# --- Market Regime Detection -------------------------------------------------
+
+# Cached per scan-cycle so we hit Fyers once per cycle rather than per symbol.
+_market_regime_cache: Dict[str, Any] = {"expires_at": 0.0, "data": None}
+_MARKET_REGIME_TTL_SECS = 90  # ~1 scan cycle; refreshed by the scan loop anyway
+
+
+async def _detect_market_regime(force_refresh: bool = False) -> dict:
+    """Detect current market regime using the Nifty 50 index.
+
+    Returns a dict with:
+      - regime: TRENDING_UP | TRENDING_DOWN | RANGING | VOLATILE | UNKNOWN
+      - nifty_change_pct: intraday change %
+      - nifty_trend_score: -100..+100 (≈ nifty_change_pct * 10)
+      - allow_buy: block BUYs when Nifty is crashing hard (≤ -1.5%)
+      - allow_sell: block SELLs when Nifty is surging hard (≥ +1.5%)
+
+    We cache the result for ~90s so a full scan cycle only costs one API call.
+    """
+    now = time.time()
+    if (
+        not force_refresh
+        and _market_regime_cache.get("data")
+        and _market_regime_cache.get("expires_at", 0) > now
+    ):
+        return dict(_market_regime_cache["data"])
+
+    result = {
+        "regime": "UNKNOWN",
+        "nifty_change_pct": 0.0,
+        "nifty_trend_score": 0.0,
+        "allow_buy": True,
+        "allow_sell": True,
+    }
+
+    if not fyers_client.is_authenticated():
+        return result
+
+    try:
+        candles = await fyers_client.get_historical_data_async(
+            "NSE:NIFTY50-INDEX", timeframe="15m", days_back=5
+        )
+        if not candles or len(candles) < 20:
+            return result
+
+        df = pd.DataFrame(candles)
+        df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+
+        prev_close = df["close"].shift(1)
+        tr = pd.concat(
+            [
+                df["high"] - df["low"],
+                (df["high"] - prev_close).abs(),
+                (df["low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr = tr.rolling(14).mean().iloc[-1]
+        current = float(df["close"].iloc[-1])
+        atr_pct = (atr / current) * 100 if current else 0.0
+
+        sma_20 = df["close"].rolling(20).mean().iloc[-1]
+
+        # Intraday change: first candle of the current IST day vs latest close.
+        day_open = None
+        try:
+            ts = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert(IST)
+            today_mask = ts.dt.date == datetime.now(IST).date()
+            today = df[today_mask]
+            if not today.empty:
+                day_open = float(today.iloc[0]["open"])
+        except Exception:
+            day_open = None
+
+        if day_open is None:
+            # Fallback: approx last 26 15m candles (~6.5h session).
+            today_candles = df.tail(26)
+            if len(today_candles) > 1:
+                day_open = float(today_candles.iloc[0]["open"])
+
+        if day_open and day_open > 0:
+            nifty_change_pct = ((current - day_open) / day_open) * 100
+        else:
+            nifty_change_pct = 0.0
+        result["nifty_change_pct"] = round(nifty_change_pct, 2)
+        result["nifty_trend_score"] = round(nifty_change_pct * 10, 1)
+
+        if pd.notna(atr_pct) and atr_pct > 0.8:
+            result["regime"] = "VOLATILE"
+        elif pd.notna(sma_20) and current > float(sma_20) and nifty_change_pct > 0.3:
+            result["regime"] = "TRENDING_UP"
+        elif pd.notna(sma_20) and current < float(sma_20) and nifty_change_pct < -0.3:
+            result["regime"] = "TRENDING_DOWN"
+        else:
+            result["regime"] = "RANGING"
+
+        # Don't fight a strong index move.
+        if nifty_change_pct <= -1.5:
+            result["allow_buy"] = False
+        if nifty_change_pct >= 1.5:
+            result["allow_sell"] = False
+
+    except Exception as e:
+        logger.debug(f"Market regime detection failed: {e}")
+
+    _market_regime_cache["data"] = dict(result)
+    _market_regime_cache["expires_at"] = now + _MARKET_REGIME_TTL_SECS
+    return result
+
+
 # --- Trade Placement ----------------------------------------------------------
 
 async def _place_auto_trade(
@@ -837,6 +950,7 @@ async def _place_auto_trade(
     indicators: Optional[dict] = None,
     fundamental: Optional[dict] = None,
     sentiment: Optional[dict] = None,
+    market_regime: Optional[dict] = None,
 ) -> Optional[int]:
     """Auto-place a paper trade based on signal. Returns trade_id or None.
 
@@ -908,15 +1022,45 @@ async def _place_auto_trade(
             )
             return None
 
-        # Gap 8: reject trades where the move isn't volume-confirmed. Low
+        # Gap 8 / v5: reject trades where the move isn't volume-confirmed. Low
         # volume on a "strong" signal almost always means thin-book noise.
+        # Threshold tightened from 0.5 → 0.8 to drop more low-conviction setups.
         trade_volume_ratio = signal_data.get("volume_ratio")
-        if trade_volume_ratio is not None and trade_volume_ratio < 0.5:
+        if trade_volume_ratio is not None and trade_volume_ratio < 0.8:
             _add_log("LOW_VOLUME", symbol,
-                     f"Volume ratio {trade_volume_ratio:.2f}x too low. Skipping.")
+                     f"Volume ratio {trade_volume_ratio:.2f} below minimum 0.8. Skipping.")
             _record_rejection(
                 "LOW_VOLUME", symbol, signal_data, trade_mode_peek,
-                f"Volume ratio {trade_volume_ratio:.2f}x below 0.5x average",
+                f"Volume ratio {trade_volume_ratio:.2f}x below 0.8x average",
+            )
+            return None
+
+        # v5: REGIME GATE — don't take BUYs into a crashing Nifty or SELLs into a
+        # surging one. Scan loop passes the shared snapshot; fall back to a
+        # cached fetch for monitor-loop re-analysis entries.
+        regime = market_regime or await _detect_market_regime()
+        if side == "BUY" and not regime.get("allow_buy", True):
+            _add_log(
+                "REGIME_BLOCK", symbol,
+                f"BUY blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
+                f"({regime.get('regime', 'UNKNOWN')})",
+            )
+            _record_rejection(
+                "REGIME_BLOCK", symbol, signal_data, trade_mode_peek,
+                f"BUY blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
+                f"({regime.get('regime', 'UNKNOWN')})",
+            )
+            return None
+        if side == "SELL" and not regime.get("allow_sell", True):
+            _add_log(
+                "REGIME_BLOCK", symbol,
+                f"SELL blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
+                f"({regime.get('regime', 'UNKNOWN')})",
+            )
+            _record_rejection(
+                "REGIME_BLOCK", symbol, signal_data, trade_mode_peek,
+                f"SELL blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
+                f"({regime.get('regime', 'UNKNOWN')})",
             )
             return None
 
@@ -1222,10 +1366,55 @@ async def _place_auto_trade(
             "product_type": product_type,
             "product_type_reason": routing_reason,
             "indicators": key_indicators,
-            "fundamental_score": fundamental.get("fundamental_score") if fundamental else None,
-            "sentiment_score": sentiment.get("sentiment_score") if sentiment else None,
+            # v5: flatten the most-queried indicator values next to the dict
+            # so the post-mortem/journal UIs don't have to parse nested JSON.
+            "rsi": (indicators or {}).get("rsi"),
+            "macd_line": (indicators or {}).get("macd_line"),
+            "macd_signal": (indicators or {}).get("macd_signal"),
+            "macd_hist": (indicators or {}).get("macd_hist"),
+            "sma_20": (indicators or {}).get("sma_20"),
+            "sma_50": (indicators or {}).get("sma_50"),
+            "sma_200": (indicators or {}).get("sma_200"),
+            "volume_ratio": (indicators or {}).get("volume_ratio"),
+            "supertrend_direction": (indicators or {}).get("supertrend_direction"),
+            "adx": (indicators or {}).get("adx"),
+            "atr": (indicators or {}).get("atr"),
+            "bb_pct_b": (indicators or {}).get("bb_pct_b"),
+            "stoch_k": (indicators or {}).get("stoch_k"),
+            "stoch_d": (indicators or {}).get("stoch_d"),
+            "vwap": (indicators or {}).get("vwap"),
+            "cci": (indicators or {}).get("cci"),
+            "mfi": (indicators or {}).get("mfi"),
+            "williams_r": (indicators or {}).get("williams_r"),
+            "obv_trend": (indicators or {}).get("obv_trend"),
+            # Score breakdown from signal_engine (40/35/25 weighting).
+            "technical_score": signal_data.get("technical_score"),
+            "fundamental_score": (
+                signal_data.get("fundamental_score")
+                if signal_data.get("fundamental_score") is not None
+                else (fundamental.get("fundamental_score") if fundamental else None)
+            ),
+            "sentiment_score": (
+                signal_data.get("sentiment_score")
+                if signal_data.get("sentiment_score") is not None
+                else (sentiment.get("sentiment_score") if sentiment else None)
+            ),
+            "weight_description": signal_data.get("weight_description"),
+            # Market regime at entry — use the resolved ``regime`` (not the
+            # kwarg) so monitor-loop entries that omit ``market_regime`` still
+            # persist the fetched values the gate actually acted on.
+            "market_regime": regime.get("regime"),
+            "nifty_change_pct": regime.get("nifty_change_pct"),
+            "nifty_trend_score": regime.get("nifty_trend_score"),
+            # Fundamental summary.
             "fundamental_signal": fundamental.get("fundamental_signal") if fundamental else None,
+            "pe_ratio": fundamental.get("pe_ratio") if fundamental else None,
+            "roe": fundamental.get("roe") if fundamental else None,
+            "debt_to_equity": fundamental.get("debt_to_equity") if fundamental else None,
+            # Sentiment summary.
             "sentiment_classification": sentiment.get("sentiment_classification") if sentiment else None,
+            "headline_count": sentiment.get("headline_count") if sentiment else None,
+            "avg_sentiment": sentiment.get("avg_sentiment") if sentiment else None,
         }
 
         full_reasons = list(reasons) if isinstance(reasons, list) else [str(reasons)]
@@ -1617,6 +1806,18 @@ async def _scan_and_trade() -> int:
         _last_scan_time = datetime.now(IST)
         return 0
 
+    # v5: Fetch market regime once per scan cycle (cached ~90s) and pass it to
+    # every trade-placement call so we gate BUYs/SELLs consistently.
+    market_regime = await _detect_market_regime(force_refresh=True)
+    _add_log(
+        "REGIME", "",
+        f"Nifty {market_regime.get('nifty_change_pct', 0):+.2f}% "
+        f"({market_regime.get('regime', 'UNKNOWN')}); "
+        f"allow_buy={market_regime.get('allow_buy', True)}, "
+        f"allow_sell={market_regime.get('allow_sell', True)}",
+    )
+    _push_event("MARKET_REGIME", market_regime)
+
     _add_log(
         "SCAN_START", "",
         f"Scanning {len(top20)} stocks "
@@ -1682,6 +1883,7 @@ async def _scan_and_trade() -> int:
             indicators=pick.get("indicators"),
             fundamental=pick.get("fundamental"),
             sentiment=pick.get("sentiment"),
+            market_regime=market_regime,
         )
         if trade_id:
             placed += 1
