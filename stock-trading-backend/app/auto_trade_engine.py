@@ -1400,10 +1400,12 @@ async def _place_auto_trade(
                 else (sentiment.get("sentiment_score") if sentiment else None)
             ),
             "weight_description": signal_data.get("weight_description"),
-            # Market regime at entry.
-            "market_regime": (market_regime or {}).get("regime"),
-            "nifty_change_pct": (market_regime or {}).get("nifty_change_pct"),
-            "nifty_trend_score": (market_regime or {}).get("nifty_trend_score"),
+            # Market regime at entry — use the resolved ``regime`` (not the
+            # kwarg) so monitor-loop entries that omit ``market_regime`` still
+            # persist the fetched values the gate actually acted on.
+            "market_regime": regime.get("regime"),
+            "nifty_change_pct": regime.get("nifty_change_pct"),
+            "nifty_trend_score": regime.get("nifty_trend_score"),
             # Fundamental summary.
             "fundamental_signal": fundamental.get("fundamental_signal") if fundamental else None,
             "pe_ratio": fundamental.get("pe_ratio") if fundamental else None,
