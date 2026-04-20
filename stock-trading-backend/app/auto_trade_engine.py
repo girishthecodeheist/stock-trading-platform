@@ -3011,8 +3011,16 @@ def get_engine_status() -> dict:
         "trailing_profit_enabled": True,
         "reanalysis_interval_secs": RE_ANALYSIS_INTERVAL_SECS,
         "scan_interval_secs": SCAN_INTERVAL_SECS,
-        "min_score_for_trade": MIN_SCORE_FOR_TRADE,
-        "min_confidence_for_trade": MIN_CONFIDENCE_FOR_TRADE,
+        "min_score_for_trade": int(
+            ((_cached_settings or {}).get("gate_overrides") or {}).get("min_score")
+            or (_cached_settings or {}).get("min_score_for_trade")
+            or MIN_SCORE_FOR_TRADE
+        ),
+        "min_confidence_for_trade": int(
+            ((_cached_settings or {}).get("gate_overrides") or {}).get("min_confidence")
+            or (_cached_settings or {}).get("min_confidence_for_trade")
+            or MIN_CONFIDENCE_FOR_TRADE
+        ),
         "trade_cooldown_secs": TRADE_COOLDOWN_SECS,
         "brokerage_aware": True,
         "multi_timeframe": True,
