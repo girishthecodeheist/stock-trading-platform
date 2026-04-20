@@ -1988,8 +1988,16 @@ async def _monitor_open_trades(settings: dict) -> int:
                                 f"Strong reversal close failed for trade "
                                 f"#{trade_id}: {e}"
                             )
+                            # Fall through to the moderate-reversal branch
+                            # below so we at least tighten the SL; otherwise a
+                            # failed close on a strong reversal would leave the
+                            # original wide stop in place until the next cycle.
 
-                    elif is_reversal and abs(new_score) >= 20:
+                    # Use a standalone `if` (not `elif`) here so that if the
+                    # strong-reversal close above raised and was swallowed,
+                    # we still run the moderate-reversal SL tightening as a
+                    # protective fallback.
+                    if is_reversal and abs(new_score) >= 20:
                         if side == "BUY":
                             tighter_sl = round(ltp * 0.998, 2)
                         else:
