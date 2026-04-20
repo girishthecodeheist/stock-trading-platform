@@ -128,8 +128,14 @@ export class DashboardComponent implements OnInit, OnDestroy {
     let tradeable = this.autoTradeStatus?.tradeable_count;
     let infoOnly = this.autoTradeStatus?.info_only_count;
     if (tradeable == null || infoOnly == null) {
-      const minScore = Number(this.autoTradeStatus?.min_score_for_trade) || 25;
-      const minConf = Number(this.autoTradeStatus?.min_confidence_for_trade) || 30;
+      // Use presence-based checks (not ``||``) so an explicit 0 override
+      // — "accept all scores / confidences" — isn't silently replaced by
+      // the default. This matches the backend's ``resolve_gate`` semantics
+      // and the Signals page's ``isTradeable`` fallback.
+      const rawMinScore = this.autoTradeStatus?.min_score_for_trade;
+      const rawMinConf = this.autoTradeStatus?.min_confidence_for_trade;
+      const minScore = rawMinScore != null ? Number(rawMinScore) : 25;
+      const minConf = rawMinConf != null ? Number(rawMinConf) : 30;
       tradeable = sigs.filter(s => {
         const sc = Math.abs(Number(s?.score) || 0);
         const conf = Number(s?.confidence) || 0;
