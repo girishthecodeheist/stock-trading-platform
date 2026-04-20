@@ -1371,6 +1371,39 @@ async def _place_auto_trade(
         else:
             product_type = auto_product_type
 
+        # Quantity was sized with INTRADAY leverage (5x) when product_type in
+        # settings is INTRADAY. If auto-routing flipped to DELIVERY (after
+        # 14:30 IST cutoff, or intraday charges > 50% of gross profit), the
+        # order will be placed as CNC and needs full 1x cash margin — so we
+        # must shrink qty to what raw cash actually covers. Without this,
+        # LIVE orders get rejected by Fyers for insufficient margin and PAPER
+        # records inflated 5x positions.
+        if product_type == "DELIVERY" and configured_product_type == "INTRADAY":
+            cash_qty_cap = int(math.floor(available_margin / entry_price)) if entry_price > 0 else 0
+            if quantity > cash_qty_cap:
+                original_qty = quantity
+                quantity = max(cash_qty_cap, 0)
+                trade_cost = entry_price * quantity
+                if quantity <= 0:
+                    _add_log("CAPITAL_LIMIT", symbol,
+                             f"Rejected after DELIVERY auto-routing: cash=\u20b9{available_margin:.0f} "
+                             f"insufficient for 1 share @ \u20b9{entry_price:.2f}")
+                    _record_rejection(
+                        "CAPITAL_LIMIT", symbol, signal_data, trade_mode,
+                        f"Auto-routed to DELIVERY ({routing_reason}); cash "
+                        f"\u20b9{available_margin:.0f} insufficient for 1 share "
+                        f"@ \u20b9{entry_price:.2f}",
+                        extra={
+                            "available_margin": round(available_margin, 2),
+                            "product_type": product_type,
+                            "routing_reason": routing_reason,
+                        },
+                    )
+                    return None
+                _add_log("QTY_RECAP", symbol,
+                         f"qty {original_qty}\u2192{quantity} after DELIVERY auto-routing "
+                         f"(1x cash \u20b9{available_margin:.0f}; {routing_reason})")
+
         # Gap 5: persist a richer per-trade snapshot so the audit/journal view
         # can explain WHY each trade was placed (all key indicator values, plus
         # fundamental + sentiment summaries). We pick a fixed whitelist of keys
