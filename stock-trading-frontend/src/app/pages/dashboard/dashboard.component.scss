@@ -170,6 +170,35 @@
   .at-last-scan { font-size: 0.7rem; color: #888; margin-left: auto; }
 }
 
+/* Signal quality summary chips (tradeable / info-only / analysis basis). */
+.signal-quality-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed rgba(255,255,255,0.06);
+  .quality-chip {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 8px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    color: #bbb;
+    .quality-label { font-weight: 500; opacity: 0.85; }
+    .quality-value { font-weight: 700; font-size: 0.8rem; }
+    &.tradeable { background: rgba(102,187,106,0.12); border-color: rgba(102,187,106,0.3); color: #66bb6a; }
+    &.info-only { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.1); color: #999; }
+    &.tech-only { background: rgba(66,165,245,0.12); border-color: rgba(66,165,245,0.3); color: #64b5f6; }
+    &.comprehensive { background: rgba(171,71,188,0.15); border-color: rgba(171,71,188,0.35); color: #ce93d8; }
+  }
+}
+
 /* Toast Notification */
 .toast-notification {
   position: fixed; top: 20px; right: 20px; z-index: 9999;

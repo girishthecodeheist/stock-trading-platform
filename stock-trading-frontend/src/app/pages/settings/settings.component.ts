@@ -36,7 +36,27 @@ export class SettingsComponent implements OnInit {
 
   loadSettings() {
     this.api.getSettings().subscribe({
-      next: (res) => { this.settings = res.settings || res || {}; },
+      next: (res) => {
+        this.settings = res.settings || res || {};
+        // Hydrate the Auto-Trade Engine thresholds from /gates so the form
+        // shows the effective value (override \u2192 settings column \u2192 default)
+        // instead of leaving the inputs empty.
+        this.api.getGates().subscribe({
+          next: (g: any) => {
+            const byKey: { [k: string]: any } = {};
+            (g?.gates || []).forEach((row: any) => { if (row?.key) byKey[row.key] = row; });
+            const minScore = byKey['min_score']?.current;
+            const minConf = byKey['min_confidence']?.current;
+            if (minScore !== undefined && this.settings.min_score_for_trade == null) {
+              this.settings.min_score_for_trade = minScore;
+            }
+            if (minConf !== undefined && this.settings.min_confidence_for_trade == null) {
+              this.settings.min_confidence_for_trade = minConf;
+            }
+          },
+          error: () => {},
+        });
+      },
       error: () => {}
     });
   }
@@ -63,13 +83,43 @@ export class SettingsComponent implements OnInit {
       auto_quantity_enabled: this.settings.auto_quantity_enabled,
       product_type: this.settings.product_type,
     };
+    // The Auto-Trade Engine score / confidence thresholds live in the
+    // ``gate_overrides`` JSON rather than as columns on ``trading_settings``
+    // (Pydantic would silently drop unknown fields otherwise). Persist
+    // them via the /gates/{key} endpoint. Omit the override entirely when
+    // the input is blank so the engine falls back to its default.
+    const minScore = this.toOptionalNumber(this.settings.min_score_for_trade);
+    const minConfidence = this.toOptionalNumber(this.settings.min_confidence_for_trade);
+
     this.api.updateSettings(update).subscribe({
       next: () => {
-        this.saveMessage = 'Settings saved!';
-        setTimeout(() => this.saveMessage = '', 3000);
+        const gateCalls = [
+          this.api.updateGate('min_score', minScore),
+          this.api.updateGate('min_confidence', minConfidence),
+        ];
+        let remaining = gateCalls.length;
+        let errored = false;
+        gateCalls.forEach(obs =>
+          obs.subscribe({
+            next: () => {
+              remaining -= 1;
+              if (remaining === 0 && !errored) {
+                this.saveMessage = 'Settings saved!';
+                setTimeout(() => (this.saveMessage = ''), 3000);
+              }
+            },
+            error: () => { errored = true; this.saveMessage = 'Error saving auto-trade thresholds'; },
+          }),
+        );
       },
       error: () => { this.saveMessage = 'Error saving settings'; }
     });
+  }
+
+  private toOptionalNumber(v: any): number | null {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
   }
 
   calculateQuantity() {

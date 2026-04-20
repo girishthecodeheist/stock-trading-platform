@@ -233,6 +233,12 @@ export class StateService {
     if (this.inflight[key]) return this.inflight[key] as Observable<any>;
     const req = this.api.getDashboardScan(undefined, timeframe).pipe(
       tap((res: any) => {
+        // Pass the raw instrument rows through untouched so every backend
+        // field — including ``analysis_basis``, ``technical_score``,
+        // ``fundamental_score``, ``sentiment_score``, ``weight_description``
+        // and any future additions — stays accessible to the Signals table
+        // and the Dashboard signal-quality summary without needing a new
+        // mapping each time the backend grows.
         this.signalsSubj.next(res?.instruments || res?.signals || []);
         this.signalsTimeframe = timeframe;
         this.tsSignals = Date.now();

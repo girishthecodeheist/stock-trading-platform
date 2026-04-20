@@ -25,6 +25,7 @@ export class DashboardComponent implements OnInit, OnDestroy {
   marketOpen = false;
   livePrices: { [symbol: string]: number } = {};
   autoTradeStatus: any = null;
+  signals: any[] = [];
   openTradeCharges: { [tradeId: number]: any } = {};
   editingCapital = false;
   editCapitalAmount: number | null = null;
@@ -101,7 +102,83 @@ export class DashboardComponent implements OnInit, OnDestroy {
         if (prev !== this.openLiveTrades.length) this.setupAutoRefresh();
       }),
       this.state.autoTradeStatus$.subscribe(v => { this.autoTradeStatus = v; }),
+      this.state.signals$.subscribe(v => { this.signals = v || []; }),
     );
+  }
+
+  /**
+   * Signal quality summary used in the Auto-Trade panel. Prefers the
+   * backend-provided tradeable_count / info_only_count if available
+   * (once the auto-trade status endpoint is extended), otherwise falls
+   * back to computing locally from cached signals using the same three
+   * checks the engine uses: ``abs(score) >= min_score``,
+   * ``confidence >= min_confidence``, and ``signal != NEUTRAL``.
+   */
+  get signalQualitySummary(): {
+    total: number;
+    tradeable: number;
+    infoOnly: number;
+    techOnly: number;
+    comprehensive: number;
+    hasData: boolean;
+  } {
+    const sigs = this.signals || [];
+
+    let tradeable = this.autoTradeStatus?.tradeable_count;
+    let infoOnly = this.autoTradeStatus?.info_only_count;
+    let total: number;
+    if (tradeable != null && infoOnly != null) {
+      // Engine-provided counts: authoritative, match ``signals_count``.
+      total = this.autoTradeStatus?.signals_count ?? (tradeable + infoOnly);
+    } else {
+      // Local-computation fallback: derive everything from the same
+      // ``sigs`` array so tradeable + infoOnly == total (mixing
+      // ``signals_count`` from the engine with a locally-filtered
+      // ``tradeable`` would produce an inconsistent info_only count when
+      // the engine rescans between Signals-page loads).
+      //
+      // Use presence-based checks (not ``||``) so an explicit 0 override
+      // — "accept all scores / confidences" — isn't silently replaced by
+      // the default. This matches the backend's ``resolve_gate`` semantics
+      // and the Signals page's ``isTradeable`` fallback.
+      const rawMinScore = this.autoTradeStatus?.min_score_for_trade;
+      const rawMinConf = this.autoTradeStatus?.min_confidence_for_trade;
+      const minScore = rawMinScore != null ? Number(rawMinScore) : 25;
+      const minConf = rawMinConf != null ? Number(rawMinConf) : 30;
+      tradeable = sigs.filter(s => {
+        const sc = Math.abs(Number(s?.score) || 0);
+        const conf = Number(s?.confidence) || 0;
+        const sig = (s?.signal || s?.signal_type || '').toString().toUpperCase();
+        return sc >= minScore && conf >= minConf && sig !== 'NEUTRAL';
+      }).length;
+      total = sigs.length;
+      infoOnly = Math.max(0, total - tradeable);
+    }
+
+    // Only render the summary when we actually have signal rows to reason
+    // about. The dashboard doesn't call ``refreshSignals`` itself, so
+    // ``signals_count`` from autoTradeStatus can be >0 while the local
+    // cache is empty (user hasn't opened the Signals page yet). Showing
+    // the widget in that state would misleadingly report Tradeable=0.
+    const hasData = total > 0 && sigs.length > 0;
+
+    const techOnly = sigs.filter(s => {
+      const basis = (s?.analysis_basis || '').toString().toLowerCase();
+      return basis === 'technical' || basis === 'heatmap_fallback';
+    }).length;
+    const comprehensive = sigs.filter(s => {
+      const basis = (s?.analysis_basis || '').toString().toLowerCase();
+      return basis.includes('fundamental') || basis.includes('sentiment');
+    }).length;
+
+    return {
+      total,
+      tradeable,
+      infoOnly,
+      techOnly,
+      comprehensive,
+      hasData,
+    };
   }
 
   connectSSE() {

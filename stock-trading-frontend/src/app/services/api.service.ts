@@ -160,6 +160,28 @@ export class ApiService {
     return this.http.put(`${this.baseUrl}/api/v1/settings`, settings);
   }
 
+  /**
+   * Gate catalog plus the user's current numeric overrides, with each
+   * row's ``current`` pre-resolved (override \u2192 settings column \u2192 default).
+   */
+  getGates(): Observable<any> {
+    return this.http.get(`${this.baseUrl}/api/v1/settings/gates`);
+  }
+
+  /**
+   * Set or clear a single numeric gate override
+   * (``min_score``, ``min_confidence``, ``max_open_trades`` etc.).
+   * Pass ``value=null`` to clear the override and fall back to the
+   * settings column / engine default.
+   */
+  updateGate(key: string, value: number | null): Observable<any> {
+    let params = new HttpParams();
+    if (value !== null && value !== undefined && !Number.isNaN(value)) {
+      params = params.set('value', String(value));
+    }
+    return this.http.put(`${this.baseUrl}/api/v1/settings/gates/${key}`, null, { params });
+  }
+
   // Funds
   getPaperFunds(): Observable<any> {
     return this.http.get(`${this.baseUrl}/api/v1/funds/paper`);
