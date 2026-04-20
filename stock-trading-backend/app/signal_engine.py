@@ -4,7 +4,24 @@ Weights: Technical 40%, Fundamental 35%, Sentiment 25%
 Outputs: Signal, confidence, PUT/CALL recommendation for F&O
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
+
+from app.fundamental_engine import recompute_fundamental_score
+
+
+def _normalize_disabled(disabled: Optional[Iterable[str]]) -> Set[str]:
+    """Coerce ``disabled_indicators`` to a set of string keys.
+
+    Accepts None (treated as empty), list, tuple, or pre-built set. Empty /
+    invalid inputs produce an empty set — never None — so call sites can do
+    ``if key in disabled`` without extra None-guarding.
+    """
+    if not disabled:
+        return set()
+    try:
+        return {str(k) for k in disabled}
+    except TypeError:
+        return set()
 
 
 def generate_signal(
@@ -12,36 +29,70 @@ def generate_signal(
     fundamental: Optional[Dict[str, Any]] = None,
     sentiment: Optional[Dict[str, Any]] = None,
     instrument_type: str = "EQUITY",
+    disabled_indicators: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
-    """Generate a comprehensive trading signal combining all analysis types."""
+    """Generate a comprehensive trading signal combining all analysis types.
+
+    ``disabled_indicators`` is the user-controlled on/off set from the
+    Indicators Control page. Keys listed here contribute 0 to the score
+    for this invocation. Unknown keys are no-ops.
+    """
+    disabled = _normalize_disabled(disabled_indicators)
     reasons: List[str] = []
     current_price = indicators.get("current_price", 0)
     if not current_price:
         return _empty_signal()
 
     # --- TECHNICAL ANALYSIS (weight: 40%) ---
-    tech_score, tech_reasons = _analyze_technical(indicators, current_price)
+    tech_score, tech_reasons = _analyze_technical(indicators, current_price, disabled)
     reasons.extend(tech_reasons)
 
     # --- FUNDAMENTAL ANALYSIS (weight: 35%) ---
+    # If the user has disabled any fundamental per-metric, recompute the
+    # category score from raw fundamentals excluding those metrics so the
+    # combined score reflects the current toggles (rather than the value
+    # yfinance cached alongside the raw fields).
     fund_score = 0.0
     fund_reasons: List[str] = []
     if fundamental and fundamental.get("fundamental_score") is not None:
         fund_score = fundamental["fundamental_score"]
+        fund_metric_keys = {k for k in disabled if k.startswith("fund_")}
+        if fund_metric_keys:
+            fund_score = recompute_fundamental_score(fundamental, fund_metric_keys)
         fund_reasons = _analyze_fundamental(fundamental)
         reasons.extend(fund_reasons)
 
     # --- SENTIMENT ANALYSIS (weight: 25%) ---
     sent_score = 0.0
     sent_reasons: List[str] = []
-    if sentiment and sentiment.get("sentiment_score") is not None:
+    if (
+        sentiment
+        and sentiment.get("sentiment_score") is not None
+        and "sentiment" not in disabled
+    ):
         sent_score = sentiment["sentiment_score"]
         sent_reasons = _analyze_sentiment(sentiment)
         reasons.extend(sent_reasons)
 
     # --- WEIGHTED COMBINATION ---
-    has_fundamental = fundamental is not None and fundamental.get("pe_ratio") is not None
-    has_sentiment = sentiment is not None and sentiment.get("headline_count", 0) > 0
+    # When the user has disabled the *whole* sentiment block (sentiment key)
+    # or every fundamental metric, collapse the category so we re-weight the
+    # remaining ones correctly. Otherwise a disabled category would still
+    # consume 25–35% of 0 (harmless for the raw sum but mislabels
+    # ``weight_description`` and dilutes the remaining signal).
+    from app.indicator_catalog import FUNDAMENTAL_INDICATORS
+    _all_fund_keys = {ind["key"] for ind in FUNDAMENTAL_INDICATORS}
+    fund_fully_disabled = bool(_all_fund_keys) and _all_fund_keys.issubset(disabled)
+    has_fundamental = (
+        fundamental is not None
+        and fundamental.get("pe_ratio") is not None
+        and not fund_fully_disabled
+    )
+    has_sentiment = (
+        sentiment is not None
+        and sentiment.get("headline_count", 0) > 0
+        and "sentiment" not in disabled
+    )
 
     if has_fundamental and has_sentiment:
         combined_score = tech_score * 0.40 + fund_score * 0.35 + sent_score * 0.25
@@ -127,14 +178,24 @@ def generate_signal(
     }
 
 
-def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tuple:
-    """Analyze technical indicators and return (score, reasons)."""
+def _analyze_technical(
+    indicators: Dict[str, Any],
+    current_price: float,
+    disabled: Optional[Set[str]] = None,
+) -> tuple:
+    """Analyze technical indicators and return (score, reasons).
+
+    ``disabled`` is the user-controlled on/off set. Each indicator block
+    below short-circuits when its key is present in this set, so the
+    indicator contributes 0 to ``score`` and emits no reason line.
+    """
+    disabled = disabled or set()
     score = 0.0
     reasons = []
 
     # RSI Analysis (weight: 15%)
     rsi = indicators.get("rsi")
-    if rsi is not None:
+    if rsi is not None and "rsi" not in disabled:
         if rsi < 30:
             score += 15
             reasons.append(f"RSI at {rsi:.1f} - Oversold territory (below 30)")
@@ -152,7 +213,10 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
     macd_line = indicators.get("macd_line")
     macd_signal = indicators.get("macd_signal")
     macd_hist = indicators.get("macd_hist")
-    if all(v is not None for v in [macd_line, macd_signal, macd_hist]):
+    if (
+        all(v is not None for v in [macd_line, macd_signal, macd_hist])
+        and "macd" not in disabled
+    ):
         if macd_line > macd_signal and macd_hist > 0:
             score += 15
             reasons.append("MACD bullish crossover - histogram positive")
@@ -170,7 +234,7 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
     sma_20 = indicators.get("sma_20")
     sma_50 = indicators.get("sma_50")
     sma_200 = indicators.get("sma_200")
-    if sma_20 and sma_50 and sma_200:
+    if sma_20 and sma_50 and sma_200 and "moving_averages" not in disabled:
         if current_price > sma_20 > sma_50 > sma_200:
             score += 15
             reasons.append(f"Strong uptrend: Price > SMA20 > SMA50 > SMA200")
@@ -185,7 +249,7 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
             reasons.append(f"Price below 50-day MA ({sma_50})")
 
     # Supertrend (weight: 8%)
-    st_dir = indicators.get("supertrend_direction")
+    st_dir = indicators.get("supertrend_direction") if "supertrend" not in disabled else None
     if st_dir == "BULLISH":
         score += 8
         reasons.append("Supertrend indicates BULLISH trend")
@@ -197,7 +261,12 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
     adx = indicators.get("adx")
     di_plus = indicators.get("di_plus")
     di_minus = indicators.get("di_minus")
-    if adx is not None and di_plus is not None and di_minus is not None:
+    if (
+        adx is not None
+        and di_plus is not None
+        and di_minus is not None
+        and "adx" not in disabled
+    ):
         if adx > 25:
             if di_plus > di_minus:
                 score += 5
@@ -207,7 +276,7 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
                 reasons.append(f"Strong bearish trend (ADX={adx:.0f}, DI-={di_minus:.0f} > DI+={di_plus:.0f})")
 
     # Ichimoku Cloud (weight: 5%)
-    cloud = indicators.get("ichimoku_cloud")
+    cloud = indicators.get("ichimoku_cloud") if "ichimoku" not in disabled else None
     if cloud == "ABOVE":
         score += 5
         reasons.append("Price above Ichimoku Cloud - bullish")
@@ -218,7 +287,7 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
     # Stochastic (weight: 5%)
     stoch_k = indicators.get("stoch_k")
     stoch_d = indicators.get("stoch_d")
-    if stoch_k is not None and stoch_d is not None:
+    if stoch_k is not None and stoch_d is not None and "stochastic" not in disabled:
         if stoch_k < 20 and stoch_d < 20:
             score += 5
             reasons.append(f"Stochastic oversold (%K={stoch_k:.0f}, %D={stoch_d:.0f})")
@@ -232,7 +301,7 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
     # final score — not just the indicators scored so far.
     volume_ratio = indicators.get("volume_ratio")
     volume_discount_factor = 1.0
-    if volume_ratio is not None:
+    if volume_ratio is not None and "volume" not in disabled:
         if volume_ratio >= 2.0:
             if score > 0:
                 score += 8
@@ -261,7 +330,7 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
 
     # Williams %R (weight: 3%)
     wr = indicators.get("williams_r")
-    if wr is not None:
+    if wr is not None and "williams_r" not in disabled:
         if wr < -80:
             score += 3
             reasons.append(f"Williams %R at {wr:.0f} - oversold")
@@ -271,7 +340,7 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
 
     # CCI (weight: 3%)
     cci = indicators.get("cci")
-    if cci is not None:
+    if cci is not None and "cci" not in disabled:
         if cci < -100:
             score += 3
             reasons.append(f"CCI at {cci:.0f} - oversold territory")
@@ -281,7 +350,7 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
 
     # MFI (weight: 3%)
     mfi = indicators.get("mfi")
-    if mfi is not None:
+    if mfi is not None and "mfi" not in disabled:
         if mfi < 20:
             score += 3
             reasons.append(f"MFI at {mfi:.0f} - money flow oversold")
@@ -290,7 +359,7 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
             reasons.append(f"MFI at {mfi:.0f} - money flow overbought")
 
     # OBV Trend (weight: 3%)
-    obv_trend = indicators.get("obv_trend")
+    obv_trend = indicators.get("obv_trend") if "obv" not in disabled else None
     if obv_trend == "BULLISH":
         score += 3
         reasons.append("OBV trend BULLISH - accumulation")
@@ -300,7 +369,7 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
 
     # Bollinger Bands (weight: 3%)
     bb_pct_b = indicators.get("bb_pct_b")
-    if bb_pct_b is not None:
+    if bb_pct_b is not None and "bollinger" not in disabled:
         if bb_pct_b <= 0:
             score += 3
             reasons.append("Price at/below lower Bollinger Band - potential reversal up")
@@ -310,14 +379,17 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
 
     # VWAP (weight: 3%)
     vwap = indicators.get("vwap")
-    if vwap is not None and current_price:
+    if vwap is not None and current_price and "vwap" not in disabled:
         if current_price > vwap * 1.02:
             score += 2
         elif current_price < vwap * 0.98:
             score -= 2
 
     # Candlestick Patterns (weight: up to 10%)
-    patterns = indicators.get("candlestick_patterns", [])
+    patterns = (
+        indicators.get("candlestick_patterns", [])
+        if "candlestick" not in disabled else []
+    )
     pattern_score = 0.0
     for p in patterns:
         strength_mult = 1.0
@@ -338,8 +410,8 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
             reasons.append(f"{direction} candlestick patterns: {', '.join(pattern_names)}")
 
     # Swing Points (weight: 3%)
-    swing_high = indicators.get("swing_high")
-    swing_low = indicators.get("swing_low")
+    swing_high = indicators.get("swing_high") if "swing_points" not in disabled else None
+    swing_low = indicators.get("swing_low") if "swing_points" not in disabled else None
     if swing_high and swing_low and current_price:
         swing_range = swing_high - swing_low
         if swing_range > 0:
@@ -352,7 +424,7 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
                 reasons.append(f"Price near swing low ({swing_low}) - potential support")
 
     # Trend Strength (weight: 3%)
-    trend = indicators.get("trend_strength")
+    trend = indicators.get("trend_strength") if "trend_strength" not in disabled else None
     if trend == "STRONG_UPTREND":
         score += 3
         reasons.append("Strong uptrend confirmed by price action")
@@ -361,7 +433,7 @@ def _analyze_technical(indicators: Dict[str, Any], current_price: float) -> tupl
         reasons.append("Strong downtrend confirmed by price action")
 
     # Guppy GMMA (weight: 5%)
-    guppy = indicators.get("guppy_signal")
+    guppy = indicators.get("guppy_signal") if "guppy" not in disabled else None
     if guppy == "BULLISH":
         score += 5
         spread = indicators.get("guppy_spread", 0)

@@ -130,12 +130,15 @@ async def comprehensive_analysis(
     except Exception:
         sentiment = None
 
-    # 5. Generate unified signal
+    # 5. Generate unified signal, honouring Indicators Control toggles.
+    from app.auto_trade_engine import _get_settings as _get_trading_settings
+    _settings_peek = await _get_trading_settings() or {}
     signal = generate_signal(
         indicators=indicators,
         fundamental=fundamental,
         sentiment=sentiment,
         instrument_type=instrument_type,
+        disabled_indicators=_settings_peek.get("disabled_indicators") or [],
     )
 
     return {

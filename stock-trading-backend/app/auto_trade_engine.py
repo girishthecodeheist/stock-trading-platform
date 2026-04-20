@@ -725,11 +725,18 @@ async def _analyze_stock(stock: dict, timeframe: str = "15m") -> Optional[dict]:
                     _get_sentiment_cached(symbol),
                 )
 
+                # Indicators Control: read the user's disabled list from
+                # trading_settings (cached) and pass it in so the engine
+                # skips every toggled-off indicator for this scan cycle.
+                # Disabling is forward-only — past signals / trades aren't
+                # re-scored.
+                _tg_settings = await _get_settings() or {}
                 signal_data = generate_signal(
                     indicators,
                     fundamental=fundamental,
                     sentiment=sentiment,
                     instrument_type="EQUITY",
+                    disabled_indicators=_tg_settings.get("disabled_indicators") or [],
                 )
 
                 # Gap 8: attach volume info so downstream filters can use it
@@ -837,7 +844,12 @@ async def _confirm_with_daily_trend(symbol: str, intraday_signal: str) -> bool:
         df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
         df["volume"] = df["volume"].astype(float)
         indicators = compute_all_indicators(df)
-        daily_signal = generate_signal(indicators, instrument_type="EQUITY")
+        _tg_settings = await _get_settings() or {}
+        daily_signal = generate_signal(
+            indicators,
+            instrument_type="EQUITY",
+            disabled_indicators=_tg_settings.get("disabled_indicators") or [],
+        )
 
         daily_direction = daily_signal.get("signal", "NEUTRAL")
         daily_score = daily_signal.get("score", 0)
@@ -1016,9 +1028,24 @@ async def _place_auto_trade(
             return None
 
         # v4: MINIMUM SCORE/CONFIDENCE THRESHOLD
-        max_trades_day = settings.get("max_trades_per_day", MAX_TRADES_PER_DAY)
-        min_score = settings.get("min_score_for_trade", MIN_SCORE_FOR_TRADE)
-        min_confidence = settings.get("min_confidence_for_trade", MIN_CONFIDENCE_FOR_TRADE)
+        # Gate overrides (set via the Indicators Control page) win over the
+        # legacy dedicated columns, which in turn win over the module-level
+        # engine defaults — see ``app.indicator_catalog.resolve_gate``.
+        from app.indicator_catalog import resolve_gate as _resolve_gate
+        _gate_overrides = settings.get("gate_overrides") or {}
+        max_trades_day = int(_resolve_gate(
+            "max_trades_per_day", _gate_overrides, settings, MAX_TRADES_PER_DAY
+        ))
+        min_score = _resolve_gate(
+            "min_score", _gate_overrides, settings, MIN_SCORE_FOR_TRADE
+        )
+        min_confidence = _resolve_gate(
+            "min_confidence", _gate_overrides, settings, MIN_CONFIDENCE_FOR_TRADE
+        )
+        # Boolean-flavoured gates are stored as 0/1 in gate_overrides; default
+        # to enabled (1) when the user hasn't overridden them.
+        regime_confirm_enabled = bool(_gate_overrides.get("regime_confirm", 1))
+        duplicate_guard_enabled = bool(_gate_overrides.get("duplicate_guard", 1))
 
         trade_mode_peek = str(settings.get("trade_mode") or "PAPER").upper()
 
@@ -1070,8 +1097,10 @@ async def _place_auto_trade(
         # v5: REGIME GATE — don't take BUYs into a crashing Nifty or SELLs into a
         # surging one. Scan loop passes the shared snapshot; fall back to a
         # cached fetch for monitor-loop re-analysis entries.
+        # The user can disable this gate entirely via the Indicators Control
+        # page (gate_overrides["regime_confirm"] = 0).
         regime = market_regime or await _detect_market_regime()
-        if side == "BUY" and not regime.get("allow_buy", True):
+        if regime_confirm_enabled and side == "BUY" and not regime.get("allow_buy", True):
             _add_log(
                 "REGIME_BLOCK", symbol,
                 f"BUY blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
@@ -1083,7 +1112,7 @@ async def _place_auto_trade(
                 f"({regime.get('regime', 'UNKNOWN')})",
             )
             return None
-        if side == "SELL" and not regime.get("allow_sell", True):
+        if regime_confirm_enabled and side == "SELL" and not regime.get("allow_sell", True):
             _add_log(
                 "REGIME_BLOCK", symbol,
                 f"SELL blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
@@ -1112,8 +1141,8 @@ async def _place_auto_trade(
             )
             return None
 
-        # v4: COOLDOWN CHECK
-        if _is_on_cooldown(symbol):
+        # v4: COOLDOWN CHECK — skippable via the duplicate_guard gate toggle.
+        if duplicate_guard_enabled and _is_on_cooldown(symbol):
             last_time = _last_trade_time_per_symbol.get(symbol)
             elapsed = int((datetime.now(IST) - last_time).total_seconds()) if last_time else 0
             _add_log("COOLDOWN", symbol,
@@ -1873,8 +1902,14 @@ async def _scan_and_trade() -> int:
 
     # v5.1: compute effective thresholds once per cycle so the signal row can
     # show "Score 42 < min 55" even when the user tweaked settings mid-session.
-    min_score = settings.get("min_score_for_trade", MIN_SCORE_FOR_TRADE)
-    min_confidence = settings.get("min_confidence_for_trade", MIN_CONFIDENCE_FOR_TRADE)
+    from app.indicator_catalog import resolve_gate as _resolve_gate
+    _gate_overrides = settings.get("gate_overrides") or {}
+    min_score = _resolve_gate(
+        "min_score", _gate_overrides, settings, MIN_SCORE_FOR_TRADE
+    )
+    min_confidence = _resolve_gate(
+        "min_confidence", _gate_overrides, settings, MIN_CONFIDENCE_FOR_TRADE
+    )
     trade_mode_peek = str(settings.get("trade_mode") or "PAPER").upper()
 
     # --- Slot / cap gates (apply to every analyzed tradeable signal) --------

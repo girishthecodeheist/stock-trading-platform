@@ -63,6 +63,11 @@ async def ensure_columns():
         ("trading_settings", "profit_floor_relaxed", "ALTER TABLE trading_settings ADD COLUMN profit_floor_relaxed BOOLEAN DEFAULT false"),
         ("trading_settings", "product_type", "ALTER TABLE trading_settings ADD COLUMN product_type VARCHAR(10) DEFAULT 'INTRADAY'"),
         ("trading_settings", "intraday_leverage", "ALTER TABLE trading_settings ADD COLUMN intraday_leverage FLOAT DEFAULT 5.0"),
+        # Indicators Control — per-user disabled indicators + numeric gate
+        # threshold overrides. Both default empty so existing deployments
+        # keep their current behaviour until the user edits via the UI.
+        ("trading_settings", "disabled_indicators", "ALTER TABLE trading_settings ADD COLUMN disabled_indicators JSON DEFAULT '[]'::json"),
+        ("trading_settings", "gate_overrides", "ALTER TABLE trading_settings ADD COLUMN gate_overrides JSON DEFAULT '{}'::json"),
         # live_trades — execution reconciliation columns (F4). Added so we
         # can tell FILLED from PARTIAL from REJECTED after place_order and
         # use actual filled qty on exit instead of blindly selling the
