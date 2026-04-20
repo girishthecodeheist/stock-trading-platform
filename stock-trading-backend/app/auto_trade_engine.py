@@ -264,6 +264,11 @@ _REJECTION_REASONS = {
     # v5: Nifty-index regime gate. Blocks BUYs in a crashing market and
     # SELLs in a surging one.
     "REGIME_BLOCK",
+    # v5.1: Scan-level gates that previously dropped silently so the UI could
+    # never explain "why isn't this BUY being placed?". All per-signal gates
+    # now record a rejection and attach a status to the signals row.
+    "NEUTRAL_SIGNAL",
+    "SLOT_FULL",
 }
 
 
@@ -1832,50 +1837,108 @@ async def _scan_and_trade() -> int:
             analyzed.append(result)
         await asyncio.sleep(0.3)
 
-    signals_list = []
-    for item in analyzed:
-        sd = item["signal_data"]
-        signals_list.append({
-            "symbol": item["symbol"],
-            "ltp": item["ltp"],
-            "change_pct": item.get("change_pct", 0),
-            "signal": sd.get("signal", "NEUTRAL"),
-            "score": sd.get("score", 0),
-            "confidence": sd.get("confidence", 0),
-            "entry_price": sd.get("entry_price", 0),
-            "stop_loss": sd.get("stop_loss"),
-            "target": sd.get("target_1") or sd.get("target"),
-            "reasons": sd.get("reasons", []),
-            "analysis_basis": item.get("analysis_basis", "unknown"),
-            "analyzed_timeframe": item.get("analyzed_timeframe", "15m"),
-        })
+    scan_cycle_start = datetime.now(IST)
 
-    signals_list.sort(key=lambda x: abs(x.get("score", 0)), reverse=True)
-    _last_signals = signals_list
-    _push_event("SIGNALS_UPDATED", {"count": len(signals_list)})
+    # v5.1: compute effective thresholds once per cycle so the signal row can
+    # show "Score 42 < min 55" even when the user tweaked settings mid-session.
+    min_score = settings.get("min_score_for_trade", MIN_SCORE_FOR_TRADE)
+    min_confidence = settings.get("min_confidence_for_trade", MIN_CONFIDENCE_FOR_TRADE)
+    trade_mode_peek = str(settings.get("trade_mode") or "PAPER").upper()
 
+    # --- Slot / cap gates (apply to every analyzed tradeable signal) --------
     open_count = await _get_open_trade_count()
-    if open_count >= MAX_ACTIVE_TRADES:
+    slots_full = open_count >= MAX_ACTIVE_TRADES
+    slots = max(0, MAX_ACTIVE_TRADES - open_count)
+    if slots_full:
         _add_log("LIMIT", "", f"Max active trades ({MAX_ACTIVE_TRADES}) reached")
-        _last_scan_time = datetime.now(IST)
-        return 0
 
-    slots = MAX_ACTIVE_TRADES - open_count
-    tradeable = [
-        a for a in analyzed
-        if a["signal_data"].get("signal", "NEUTRAL") != "NEUTRAL"
-        and abs(a["signal_data"].get("score", 0)) >= MIN_SCORE_FOR_TRADE
-        and a["signal_data"].get("confidence", 0) >= MIN_CONFIDENCE_FOR_TRADE
-    ]
-    tradeable.sort(key=lambda x: abs(x["signal_data"].get("score", 0)), reverse=True)
+    # --- Pre-place rejection recording --------------------------------------
+    # The scan loop used to silently drop NEUTRAL / weak / low-conf signals,
+    # which meant the UI showed "BUY" rows with no explanation of why no trade
+    # was placed. Record an explicit rejection for every gate so the signals
+    # table can show the exact reason.
+    open_symbols: set = set()
+    try:
+        async with async_session_factory() as db:
+            rows = await db.execute(
+                text("SELECT symbol FROM paper_trades WHERE status = 'OPEN'")
+            )
+            open_symbols.update(r[0] for r in rows.fetchall())
+            rows = await db.execute(
+                text("SELECT symbol FROM live_trades WHERE status = 'OPEN'")
+            )
+            open_symbols.update(r[0] for r in rows.fetchall())
+    except Exception as ex:
+        logger.debug(f"Open-symbol precheck failed: {ex}")
 
-    placed = 0
-    for pick in tradeable[:slots]:
-        sym = pick["symbol"]
-        if await _has_open_trade_for_symbol(sym):
+    tradeable: list = []
+    for item in analyzed:
+        sym = item["symbol"]
+        sd = item["signal_data"]
+        signal_type = sd.get("signal", "NEUTRAL")
+        score = sd.get("score", 0)
+        confidence = sd.get("confidence", 0)
+
+        if signal_type == "NEUTRAL":
+            _record_rejection(
+                "NEUTRAL_SIGNAL", sym, sd, trade_mode_peek,
+                "Signal is NEUTRAL — nothing to place",
+            )
+            continue
+        if abs(score) < min_score:
+            _record_rejection(
+                "WEAK_SIGNAL", sym, sd, trade_mode_peek,
+                f"Score {score:.1f} below minimum {min_score}",
+            )
+            continue
+        if confidence < min_confidence:
+            _record_rejection(
+                "LOW_CONFIDENCE", sym, sd, trade_mode_peek,
+                f"Confidence {confidence:.1f}% below minimum {min_confidence}%",
+            )
+            continue
+        if daily_cap_hit:
+            _record_rejection(
+                "DAILY_LIMIT", sym, sd, trade_mode_peek,
+                f"Daily trade cap reached ({trades_today}/{max_trades_day})",
+            )
+            continue
+        if sym in open_symbols:
+            _record_rejection(
+                "DUPLICATE_SYMBOL", sym, sd, trade_mode_peek,
+                "Already have an open trade on this symbol",
+            )
             continue
         if _is_on_cooldown(sym):
+            last_time = _last_trade_time_per_symbol.get(sym)
+            elapsed = int((datetime.now(IST) - last_time).total_seconds()) if last_time else 0
+            _record_rejection(
+                "COOLDOWN", sym, sd, trade_mode_peek,
+                f"Re-entry cooldown: {elapsed}s / {TRADE_COOLDOWN_SECS}s",
+            )
             continue
+        if slots_full:
+            _record_rejection(
+                "OPEN_TRADES_FULL", sym, sd, trade_mode_peek,
+                f"Max {MAX_ACTIVE_TRADES} concurrent trades already open",
+            )
+            continue
+        tradeable.append(item)
+
+    tradeable.sort(key=lambda x: abs(x["signal_data"].get("score", 0)), reverse=True)
+
+    # Overflow beyond available slots — record so the user sees "strongest N
+    # placed, rest queued" instead of silent drops.
+    for pick in tradeable[slots:]:
+        _record_rejection(
+            "SLOT_FULL", pick["symbol"], pick["signal_data"], trade_mode_peek,
+            f"Only {slots} slot(s) free this cycle — stronger signals took priority",
+        )
+
+    placed = 0
+    placed_symbols: set = set()
+    for pick in tradeable[:slots]:
+        sym = pick["symbol"]
         trade_id = await _place_auto_trade(
             sym, pick["signal_data"], settings,
             analysis_basis=pick.get("analysis_basis", "technical"),
@@ -1887,8 +1950,74 @@ async def _scan_and_trade() -> int:
         )
         if trade_id:
             placed += 1
+            placed_symbols.add(sym)
             if placed >= slots:
                 break
+
+    # --- Build signals_list with per-row trade_status -----------------------
+    # Attach the most-recent in-cycle rejection to each analyzed signal so the
+    # UI can render "Blocked: <reason>" inline on the signals table.
+    rejections_by_symbol: Dict[str, dict] = {}
+    for rej in reversed(_rejected_signals[-REJECTED_SIGNALS_BUFFER:]):
+        sym = rej.get("symbol")
+        if not sym or sym in rejections_by_symbol:
+            continue
+        try:
+            rej_time = datetime.fromisoformat(rej["time"])
+        except Exception:
+            rej_time = None
+        # Only surface rejections recorded during this scan cycle.
+        if rej_time and rej_time >= scan_cycle_start - timedelta(seconds=1):
+            rejections_by_symbol[sym] = rej
+
+    signals_list = []
+    for item in analyzed:
+        sym = item["symbol"]
+        sd = item["signal_data"]
+        rej = rejections_by_symbol.get(sym)
+        if sym in placed_symbols:
+            trade_status = "PLACED"
+            block_reason = None
+            block_details = None
+        elif rej:
+            trade_status = "BLOCKED"
+            block_reason = rej.get("reason")
+            block_details = rej.get("details")
+        elif sd.get("signal", "NEUTRAL") == "NEUTRAL":
+            trade_status = "NEUTRAL"
+            block_reason = None
+            block_details = None
+        else:
+            # Made it past every recorded gate but no trade_id returned — the
+            # placement attempt hit a broker-level error without recording a
+            # rejection row. Surface as UNKNOWN so we never lie about "placed".
+            trade_status = "PENDING"
+            block_reason = None
+            block_details = None
+
+        signals_list.append({
+            "symbol": sym,
+            "ltp": item["ltp"],
+            "change_pct": item.get("change_pct", 0),
+            "signal": sd.get("signal", "NEUTRAL"),
+            "score": sd.get("score", 0),
+            "confidence": sd.get("confidence", 0),
+            "entry_price": sd.get("entry_price", 0),
+            "stop_loss": sd.get("stop_loss"),
+            "target": sd.get("target_1") or sd.get("target"),
+            "reasons": sd.get("reasons", []),
+            "analysis_basis": item.get("analysis_basis", "unknown"),
+            "analyzed_timeframe": item.get("analyzed_timeframe", "15m"),
+            # v5.1: per-row trade outcome so the UI can show an "Analysis"
+            # column explaining exactly why a BUY/SELL wasn't placed.
+            "trade_status": trade_status,
+            "block_reason": block_reason,
+            "block_details": block_details,
+        })
+
+    signals_list.sort(key=lambda x: abs(x.get("score", 0)), reverse=True)
+    _last_signals = signals_list
+    _push_event("SIGNALS_UPDATED", {"count": len(signals_list)})
 
     _last_scan_time = datetime.now(IST)
     _add_log("SCAN_COMPLETE", "",

@@ -185,6 +185,13 @@ export class SignalsComponent implements OnInit, OnDestroy {
       OPEN_TRADES_FULL: 'Max open trades reached',
       DUPLICATE_SYMBOL: 'Already open on this symbol',
       FYERS_REJECTED: 'Broker rejected order',
+      FALLBACK_BLOCKED: 'Heatmap fallback (no indicators)',
+      LOW_VOLUME: 'Low volume vs 20-bar average',
+      BAD_RR: 'Risk/reward below 1.5',
+      TARGET_TOO_TIGHT: 'Target distance too small',
+      REGIME_BLOCK: 'Blocked by Nifty regime',
+      NEUTRAL_SIGNAL: 'Signal is NEUTRAL',
+      SLOT_FULL: 'Slot limit this cycle',
     };
     return map[reason] || reason;
   }
@@ -194,7 +201,28 @@ export class SignalsComponent implements OnInit, OnDestroy {
     if (reason === 'CAPITAL_LIMIT') return 'reject-capital';
     if (reason === 'LIVE_NOT_CONNECTED' || reason === 'FYERS_REJECTED') return 'reject-live';
     if (reason === 'COOLDOWN' || reason === 'DAILY_LIMIT') return 'reject-cooldown';
+    if (reason === 'REGIME_BLOCK') return 'reject-regime';
+    if (reason === 'LOW_VOLUME' || reason === 'BAD_RR' || reason === 'TARGET_TOO_TIGHT') return 'reject-technical';
+    if (reason === 'NEUTRAL_SIGNAL') return 'reject-neutral';
     return 'reject-generic';
+  }
+
+  /** v5.1: Per-row status chip class for the signals table. */
+  statusChipClass(s: any): string {
+    const status = (s?.trade_status || '').toUpperCase();
+    if (status === 'PLACED') return 'status-placed';
+    if (status === 'BLOCKED') return this.rejectionChipClass(s?.block_reason || '');
+    if (status === 'NEUTRAL') return 'status-neutral';
+    return 'status-pending';
+  }
+
+  /** v5.1: Short status label shown in the Analysis column. */
+  statusLabel(s: any): string {
+    const status = (s?.trade_status || '').toUpperCase();
+    if (status === 'PLACED') return 'Placed';
+    if (status === 'BLOCKED') return this.rejectionLabel(s?.block_reason || 'BLOCKED');
+    if (status === 'NEUTRAL') return 'Neutral — not traded';
+    return 'Awaiting placement';
   }
 
   refreshNow() {
