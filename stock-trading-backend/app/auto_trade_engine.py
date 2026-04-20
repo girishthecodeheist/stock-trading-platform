@@ -1307,12 +1307,18 @@ async def _place_auto_trade(
         # the smallest value that clears the configured net-profit floor
         # (capped by loss/margin budgets); otherwise apply the gate as a filter.
         if target and entry_price and target != entry_price:
-            min_net = float(
-                settings.get("min_net_profit_per_trade", MIN_NET_PROFIT_PER_TRADE) or 0
-            )
-            min_ratio = float(
-                settings.get("min_profit_to_cost_ratio", MIN_PROFIT_TO_COST_RATIO) or 0
-            )
+            # Brokerage-gate thresholds honour gate_overrides → settings column
+            # → engine default (resolve_gate). Previously these bypassed
+            # gate_overrides, so a user who relaxed the brokerage floor from
+            # the Indicators Control page still saw ₹1 / 1.0x enforced here.
+            min_net = float(_resolve_gate(
+                "min_net_profit_per_trade", _gate_overrides, settings,
+                MIN_NET_PROFIT_PER_TRADE,
+            ) or 0)
+            min_ratio = float(_resolve_gate(
+                "min_profit_to_cost_ratio", _gate_overrides, settings,
+                MIN_PROFIT_TO_COST_RATIO,
+            ) or 0)
 
             auto_qty = bool(settings.get("auto_quantity_enabled", True))
             if auto_qty and min_net > 0:
@@ -1867,6 +1873,9 @@ async def _scan_and_trade() -> int:
     max_trades_day = int(_resolve_gate_top(
         "max_trades_per_day", _top_gate_overrides, settings, MAX_TRADES_PER_DAY
     ))
+    max_active_trades = int(_resolve_gate_top(
+        "max_open_trades", _top_gate_overrides, settings, MAX_ACTIVE_TRADES
+    ))
     trades_today = await _get_trades_placed_today()
     daily_cap_hit = trades_today >= max_trades_day
     if daily_cap_hit:
@@ -1927,10 +1936,10 @@ async def _scan_and_trade() -> int:
 
     # --- Slot / cap gates (apply to every analyzed tradeable signal) --------
     open_count = await _get_open_trade_count()
-    slots_full = open_count >= MAX_ACTIVE_TRADES
-    slots = max(0, MAX_ACTIVE_TRADES - open_count)
+    slots_full = open_count >= max_active_trades
+    slots = max(0, max_active_trades - open_count)
     if slots_full:
-        _add_log("LIMIT", "", f"Max active trades ({MAX_ACTIVE_TRADES}) reached")
+        _add_log("LIMIT", "", f"Max active trades ({max_active_trades}) reached")
 
     # --- Pre-place rejection recording --------------------------------------
     # The scan loop used to silently drop NEUTRAL / weak / low-conf signals,
@@ -2000,7 +2009,7 @@ async def _scan_and_trade() -> int:
         if slots_full:
             _record_rejection(
                 "OPEN_TRADES_FULL", sym, sd, trade_mode_peek,
-                f"Max {MAX_ACTIVE_TRADES} concurrent trades already open",
+                f"Max {max_active_trades} concurrent trades already open",
             )
             continue
         tradeable.append(item)
@@ -2902,14 +2911,27 @@ async def _engine_loop():
                         if closed > 0:
                             limits = await _check_daily_limits(settings)
                             if limits["trading_allowed"]:
+                                # Resolve slot/daily caps via gate_overrides →
+                                # settings column → engine default so the
+                                # monitor loop honours the Indicators Control
+                                # page without waiting for the next scan.
+                                from app.indicator_catalog import resolve_gate as _rg_mon
+                                _mon_overrides = settings.get("gate_overrides") or {}
+                                _mon_max_active = int(_rg_mon(
+                                    "max_open_trades", _mon_overrides, settings,
+                                    MAX_ACTIVE_TRADES,
+                                ))
                                 open_count = await _get_open_trade_count()
-                                if open_count < MAX_ACTIVE_TRADES:
+                                if open_count < _mon_max_active:
                                     # v4: Still check daily trade limit before re-scanning
                                     trades_today = await _get_trades_placed_today()
-                                    max_trades_day = settings.get("max_trades_per_day", MAX_TRADES_PER_DAY)
+                                    max_trades_day = int(_rg_mon(
+                                        "max_trades_per_day", _mon_overrides,
+                                        settings, MAX_TRADES_PER_DAY,
+                                    ))
                                     if trades_today < max_trades_day:
                                         _add_log("RESCAN", "",
-                                                 f"Trade closed, {MAX_ACTIVE_TRADES - open_count} slots, "
+                                                 f"Trade closed, {_mon_max_active - open_count} slots, "
                                                  f"{trades_today}/{max_trades_day} trades today, re-scanning")
                                         break
                                     else:
@@ -2973,9 +2995,15 @@ def get_engine_status() -> dict:
         "last_monitor_time": _last_monitor_time.isoformat() if _last_monitor_time else None,
         "last_reanalysis_time": _last_reanalysis_time.isoformat() if _last_reanalysis_time else None,
         "market_open": is_market_open(),
-        "max_active_trades": MAX_ACTIVE_TRADES,
-        "max_trades_per_day": (
-            (_cached_settings or {}).get("max_trades_per_day") or MAX_TRADES_PER_DAY
+        "max_active_trades": int(
+            ((_cached_settings or {}).get("gate_overrides") or {}).get("max_open_trades")
+            or (_cached_settings or {}).get("max_open_trades")
+            or MAX_ACTIVE_TRADES
+        ),
+        "max_trades_per_day": int(
+            ((_cached_settings or {}).get("gate_overrides") or {}).get("max_trades_per_day")
+            or (_cached_settings or {}).get("max_trades_per_day")
+            or MAX_TRADES_PER_DAY
         ),
         "trades_placed_today": _trades_placed_today,
         "signals_count": len(_last_signals),

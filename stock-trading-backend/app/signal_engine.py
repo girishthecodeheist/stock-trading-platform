@@ -84,14 +84,22 @@ def generate_signal(
         reasons.extend(sent_reasons)
 
     # --- WEIGHTED COMBINATION ---
-    # When the user has disabled the *whole* sentiment block (sentiment key)
-    # or every fundamental metric, collapse the category so we re-weight the
-    # remaining ones correctly. Otherwise a disabled category would still
-    # consume 25–35% of 0 (harmless for the raw sum but mislabels
-    # ``weight_description`` and dilutes the remaining signal).
-    from app.indicator_catalog import FUNDAMENTAL_INDICATORS
+    # When the user has disabled the *whole* technical, sentiment, or
+    # fundamental block, collapse that category so we re-weight the
+    # remaining ones correctly. Otherwise a fully-disabled category would
+    # still consume 25–40% of 0 (harmless for the raw sum but mislabels
+    # ``weight_description`` and caps what the surviving categories can
+    # contribute — a BUY with score=100 on the remaining axes would still
+    # read as 60 and silently fail the min_score gate).
+    from app.indicator_catalog import (
+        FUNDAMENTAL_INDICATORS,
+        TECHNICAL_INDICATORS,
+    )
     _all_fund_keys = {ind["key"] for ind in FUNDAMENTAL_INDICATORS}
+    _all_tech_keys = {ind["key"] for ind in TECHNICAL_INDICATORS}
     fund_fully_disabled = bool(_all_fund_keys) and _all_fund_keys.issubset(disabled)
+    tech_fully_disabled = bool(_all_tech_keys) and _all_tech_keys.issubset(disabled)
+    has_technical = not tech_fully_disabled
     has_fundamental = (
         fundamental is not None
         and fundamental.get("pe_ratio") is not None
@@ -103,18 +111,34 @@ def generate_signal(
         and "sentiment" not in disabled
     )
 
-    if has_fundamental and has_sentiment:
+    if has_technical and has_fundamental and has_sentiment:
         combined_score = tech_score * 0.40 + fund_score * 0.35 + sent_score * 0.25
         weight_desc = "Technical 40% + Fundamental 35% + Sentiment 25%"
-    elif has_fundamental:
+    elif has_technical and has_fundamental:
         combined_score = tech_score * 0.55 + fund_score * 0.45
         weight_desc = "Technical 55% + Fundamental 45%"
-    elif has_sentiment:
+    elif has_technical and has_sentiment:
         combined_score = tech_score * 0.65 + sent_score * 0.35
         weight_desc = "Technical 65% + Sentiment 35%"
-    else:
+    elif has_fundamental and has_sentiment:
+        # Technical fully disabled — re-scale fund:sent weighting so together
+        # they sum to 1.0 while preserving their 35:25 ratio (≈0.583:0.417).
+        combined_score = fund_score * 0.583 + sent_score * 0.417
+        weight_desc = "Fundamental 58% + Sentiment 42%"
+    elif has_fundamental:
+        combined_score = fund_score
+        weight_desc = "Fundamental 100%"
+    elif has_sentiment:
+        combined_score = sent_score
+        weight_desc = "Sentiment 100%"
+    elif has_technical:
         combined_score = tech_score
         weight_desc = "Technical 100%"
+    else:
+        # Everything disabled — signal degenerates to neutral rather than
+        # returning a stale tech_score of 0.
+        combined_score = 0.0
+        weight_desc = "All indicators disabled"
 
     combined_score = max(-100, min(100, combined_score))
     signal = _classify(combined_score)
