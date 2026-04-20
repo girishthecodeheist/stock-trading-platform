@@ -1,17 +1,23 @@
 """Signals API router - analyze symbols and generate explainable signals."""
 
+import asyncio
 import json
+import logging
 import time
 from datetime import datetime
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 import pandas as pd
 
 from app.database import get_db
+from app.fundamental_engine import get_fundamental_data
 from app.indicator_engine import compute_all_indicators
+from app.news_engine import get_news_sentiment
 from app.signal_engine import generate_signal
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/signals", tags=["signals"])
 
@@ -23,6 +29,46 @@ router = APIRouter(prefix="/api/signals", tags=["signals"])
 # one expensive scan every DASHBOARD_CACHE_TTL seconds.
 _dashboard_cache: dict = {"data": None, "timestamp": 0.0, "timeframe": None, "segment": None}
 DASHBOARD_CACHE_TTL = 30  # seconds
+
+# --- Fundamental / sentiment caches -----------------------------------------
+# The dashboard scans up to 20 symbols; the analyze endpoint is hit ad-hoc.
+# yfinance fundamental + news pulls can each add hundreds of ms per symbol,
+# so we cache them in-process with a TTL. Fundamentals change slowly (daily),
+# news sentiment moves faster (we refresh a few times an hour).
+_FUNDAMENTAL_TTL_SECS = 10 * 60  # 10 minutes
+_SENTIMENT_TTL_SECS = 5 * 60     # 5 minutes
+_fundamental_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
+_sentiment_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
+
+
+async def _safe_fetch_fundamental(symbol: str) -> Optional[Dict[str, Any]]:
+    """TTL-cached fundamental fetch; swallows fetch errors."""
+    now = time.time()
+    hit = _fundamental_cache.get(symbol)
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        data = await get_fundamental_data(symbol)
+    except Exception as ex:
+        logger.debug(f"Fundamental fetch failed for {symbol}: {ex}")
+        return None
+    _fundamental_cache[symbol] = (now + _FUNDAMENTAL_TTL_SECS, data)
+    return data
+
+
+async def _safe_fetch_sentiment(symbol: str) -> Optional[Dict[str, Any]]:
+    """TTL-cached news sentiment fetch; swallows fetch errors."""
+    now = time.time()
+    hit = _sentiment_cache.get(symbol)
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        data = await get_news_sentiment(symbol)
+    except Exception as ex:
+        logger.debug(f"Sentiment fetch failed for {symbol}: {ex}")
+        return None
+    _sentiment_cache[symbol] = (now + _SENTIMENT_TTL_SECS, data)
+    return data
 
 
 @router.get("/analyze")
@@ -59,8 +105,27 @@ async def analyze_symbol(
     # Compute indicators
     indicators = compute_all_indicators(df)
 
-    # Generate signal (technical only for this endpoint - use /api/analysis/comprehensive for full)
-    signal = generate_signal(indicators, instrument_type=instrument_type)
+    # Fetch fundamental + sentiment concurrently so the signal reflects the
+    # same 40/35/25 weighting as /api/analysis/comprehensive. Fundamentals
+    # are only meaningful for cash equities; options/futures/index signals
+    # stay technical-only.
+    fundamental: Optional[Dict[str, Any]] = None
+    sentiment: Optional[Dict[str, Any]] = None
+    if instrument_type == "EQUITY":
+        fundamental, sentiment = await asyncio.gather(
+            _safe_fetch_fundamental(symbol),
+            _safe_fetch_sentiment(symbol),
+        )
+    else:
+        sentiment = await _safe_fetch_sentiment(symbol)
+
+    # Generate unified signal (technical + fundamental + sentiment).
+    signal = generate_signal(
+        indicators,
+        fundamental=fundamental,
+        sentiment=sentiment,
+        instrument_type=instrument_type,
+    )
 
     # Save signal to database if significant
     if abs(signal["score"]) >= 30:
@@ -234,6 +299,28 @@ async def dashboard_scan(
             except Exception:
                 pass
 
+    # Pre-fetch fundamental + sentiment for all scanned symbols concurrently
+    # so generate_signal uses the 40/35/25 weighting consistently. The
+    # _safe_fetch_* helpers use a TTL cache, so repeated polls of /dashboard
+    # don't hammer yfinance once values are warm.
+    scan_symbols = [s["symbol"] for s in stocks[:limit]]
+    fundamental_results = await asyncio.gather(
+        *(_safe_fetch_fundamental(sym) for sym in scan_symbols),
+        return_exceptions=True,
+    )
+    sentiment_results = await asyncio.gather(
+        *(_safe_fetch_sentiment(sym) for sym in scan_symbols),
+        return_exceptions=True,
+    )
+    fundamentals_by_symbol = {
+        sym: (val if not isinstance(val, BaseException) else None)
+        for sym, val in zip(scan_symbols, fundamental_results)
+    }
+    sentiments_by_symbol = {
+        sym: (val if not isinstance(val, BaseException) else None)
+        for sym, val in zip(scan_symbols, sentiment_results)
+    }
+
     scan_results = []
     for stock in stocks[:limit]:
         symbol = stock["symbol"]
@@ -247,6 +334,9 @@ async def dashboard_scan(
         if not ltp or ltp <= 0:
             continue
 
+        fundamental = fundamentals_by_symbol.get(symbol)
+        sentiment = sentiments_by_symbol.get(symbol)
+
         # Use FULL indicator + signal engine (same as Analyze screen)
         signal_data = None
         indicators = {}
@@ -258,7 +348,12 @@ async def dashboard_scan(
                     df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
                     df["volume"] = df["volume"].astype(float)
                     indicators = compute_all_indicators(df)
-                    signal_data = generate_signal(indicators, instrument_type="EQUITY")
+                    signal_data = generate_signal(
+                        indicators,
+                        fundamental=fundamental,
+                        sentiment=sentiment,
+                        instrument_type="EQUITY",
+                    )
             except Exception:
                 pass
 

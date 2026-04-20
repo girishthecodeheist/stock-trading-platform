@@ -90,7 +90,7 @@ async def _fetch_news_headlines(symbol: str) -> List[Dict[str, str]]:
                 })
             return results
 
-        return await asyncio.get_event_loop().run_in_executor(None, _get_news)
+        return await asyncio.to_thread(_get_news)
     except Exception as e:
         logger.error(f"Error fetching news for {symbol}: {e}")
         return []

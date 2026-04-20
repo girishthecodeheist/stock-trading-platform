@@ -694,9 +694,14 @@ async def _analyze_stock(stock: dict, timeframe: str = "15m") -> Optional[dict]:
 
                 # Gap 1: fetch fundamental + sentiment so generate_signal's
                 # 40/35/25 weighting is actually exercised. Both fetches are
-                # cached per-symbol to avoid slowing the 2-min scan loop.
-                fundamental = await _get_fundamental_cached(symbol)
-                sentiment = await _get_sentiment_cached(symbol)
+                # cached per-symbol to avoid slowing the 2-min scan loop, and
+                # run concurrently via asyncio.gather so the uncached worst
+                # case is bounded by the slower of the two network calls
+                # rather than their sum.
+                fundamental, sentiment = await asyncio.gather(
+                    _get_fundamental_cached(symbol),
+                    _get_sentiment_cached(symbol),
+                )
 
                 signal_data = generate_signal(
                     indicators,
