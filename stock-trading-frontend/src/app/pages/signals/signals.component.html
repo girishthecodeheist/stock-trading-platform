@@ -66,12 +66,19 @@
     <div class="signals-table" *ngIf="filteredSignals.length > 0">
       <table>
         <thead>
-          <tr><th>Symbol</th><th>Signal</th><th>Change%</th><th>Confidence</th><th>Score</th><th>LTP</th><th>SL</th><th>Target</th><th>Time</th><th>Action</th></tr>
+          <tr><th>Symbol</th><th>Signal</th><th>Analysis</th><th>Change%</th><th>Confidence</th><th>Score</th><th>LTP</th><th>SL</th><th>Target</th><th>Time</th><th>Action</th></tr>
         </thead>
         <tbody>
           <tr *ngFor="let s of filteredSignals" [class.highlight-buy]="(s.signal || '').includes('BUY')" [class.highlight-sell]="(s.signal || '').includes('SELL')">
             <td class="sym-cell">{{ s.name || s.symbol }}</td>
             <td><span class="signal-badge" [ngClass]="getSignalClass(s.signal || s.signal_type)">{{ s.signal || s.signal_type }}</span></td>
+            <td class="analysis-cell">
+              <span class="status-chip" [ngClass]="statusChipClass(s)"
+                    [title]="s.block_details || s.block_reason || statusLabel(s)">
+                {{ statusLabel(s) }}
+              </span>
+              <div class="status-details" *ngIf="s.block_details">{{ s.block_details }}</div>
+            </td>
             <td [ngClass]="{'positive': (s.change_pct || 0) > 0, 'negative': (s.change_pct || 0) < 0}">{{ s.change_pct | number:'1.2-2' }}%</td>
             <td>
               <div class="conf-mini-bar">

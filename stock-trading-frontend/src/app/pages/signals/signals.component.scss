@@ -196,6 +196,45 @@
 .reject-capital { color: #ff7043 !important; border-color: rgba(255,112,67,0.4); }
 .reject-live { color: #ab47bc !important; border-color: rgba(171,71,188,0.4); }
 .reject-cooldown { color: #29b6f6 !important; border-color: rgba(41,182,246,0.4); }
+.reject-regime { color: #ffd54f !important; border-color: rgba(255,213,79,0.4); }
+.reject-technical { color: #f06292 !important; border-color: rgba(240,98,146,0.4); }
+.reject-neutral { color: rgba(255,255,255,0.55) !important; border-color: rgba(255,255,255,0.18); }
+
+/* v5.1: per-row Analysis column for the main signals table. */
+.analysis-cell {
+  max-width: 220px;
+  .status-chip {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 10px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    background: rgba(255,255,255,0.05);
+    color: rgba(255,255,255,0.75);
+    border: 1px solid rgba(255,255,255,0.1);
+    white-space: nowrap;
+  }
+  .status-chip.status-placed {
+    color: #4caf50;
+    border-color: rgba(76,175,80,0.4);
+    background: rgba(76,175,80,0.12);
+  }
+  .status-chip.status-neutral {
+    color: rgba(255,255,255,0.55);
+    border-color: rgba(255,255,255,0.18);
+  }
+  .status-chip.status-pending {
+    color: #90caf9;
+    border-color: rgba(144,202,249,0.35);
+  }
+  .status-details {
+    color: rgba(255,255,255,0.55);
+    font-size: 0.72rem;
+    margin-top: 3px;
+    line-height: 1.25;
+    white-space: normal;
+  }
+}
 .rejected-table {
   overflow-x: auto;
   table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
