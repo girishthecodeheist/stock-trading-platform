@@ -257,6 +257,9 @@ _REJECTION_REASONS = {
     # not allowed", insufficient funds on the real account, instrument
     # banned for intraday, etc.). Surfaces the raw broker message.
     "FYERS_REJECTED",
+    # Structural safety: target capping pushed the SL to the wrong side
+    # of entry, so the monitor loop would insta-SL on the next tick.
+    "INVALID_SL",
     # Scan-level sentinels — the "no direction" and "per-scan slot
     # allocator" reasons still surface on the UI so the user can tell
     # a NEUTRAL from a slot-overflow.
@@ -1089,10 +1092,30 @@ async def _place_auto_trade(
                 entry_price, stop_loss, target, side, price_range, atr
             )
 
-        # BAD_RR / TARGET_TOO_TIGHT gates removed — target capping still
-        # runs (see _cap_targets_to_range above) but we no longer reject
-        # trades whose post-cap risk:reward falls below 1.5 or whose
-        # target distance is under 0.3%.
+        # BAD_RR (R:R < 1.5) and TARGET_TOO_TIGHT gates are intentionally
+        # removed — those were signal-quality preferences, not safety.
+        # We DO still reject when target capping has pushed the SL to the
+        # wrong side of entry: e.g. a BUY whose entry=98 but recent 5-day
+        # low=101 gets ``adjusted_sl = max(adjusted_sl, recent_low)`` = 101,
+        # leaving SL above entry. The monitor loop's ``ltp <= stop_loss``
+        # check would fire on the very next tick, exiting for a guaranteed
+        # loss (double brokerage for ~zero move in LIVE, phantom positive
+        # P&L in PAPER). This is a structural defect, not a preference.
+        if stop_loss and target and entry_price:
+            if side == "BUY":
+                risk_distance = entry_price - stop_loss
+            else:
+                risk_distance = stop_loss - entry_price
+            if risk_distance <= 0:
+                _add_log("INVALID_SL", symbol,
+                         f"Stop loss on wrong side of entry after capping. "
+                         f"Entry={entry_price}, SL={stop_loss}, Side={side}. Skipping.")
+                _record_rejection(
+                    "INVALID_SL", symbol, signal_data, trade_mode_peek,
+                    f"SL={stop_loss} on wrong side of entry={entry_price} "
+                    f"for {side} after target capping — would insta-SL",
+                )
+                return None
 
         sl_pct = settings.get("default_sl_percent", 1.0)
         tgt_pct = settings.get("default_target_percent", 1.0)
