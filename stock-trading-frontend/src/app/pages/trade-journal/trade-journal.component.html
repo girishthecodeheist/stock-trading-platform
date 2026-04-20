@@ -1,0 +1,130 @@
+<div class="journal-page">
+  <header class="page-header">
+    <div>
+      <h1>Trade Journal</h1>
+      <p class="sub">Per-trade audit trail: every SL / target change, trailing profit, trend reversal, and close.</p>
+    </div>
+    <button class="btn-refresh" (click)="load()" [disabled]="loading">
+      {{ loading ? 'Loading…' : 'Refresh' }}
+    </button>
+  </header>
+
+  <section class="filters">
+    <label>
+      Symbol
+      <input type="text" placeholder="RELIANCE" [(ngModel)]="symbolFilter" />
+    </label>
+    <label>
+      Result
+      <select [(ngModel)]="resultFilter">
+        <option value="">All</option>
+        <option value="WIN">Win</option>
+        <option value="LOSS">Loss</option>
+      </select>
+    </label>
+    <label>
+      Status
+      <select [(ngModel)]="statusFilter" (change)="load()">
+        <option value="">All</option>
+        <option value="OPEN">Open</option>
+        <option value="CLOSED">Closed</option>
+      </select>
+    </label>
+  </section>
+
+  <div class="table-wrap">
+    <table class="journal-table">
+      <thead>
+        <tr>
+          <th></th>
+          <th>Entry</th>
+          <th>Symbol</th>
+          <th>Side</th>
+          <th>Product</th>
+          <th class="num">Entry ₹</th>
+          <th class="num">SL</th>
+          <th class="num">Target</th>
+          <th class="num">Exit ₹</th>
+          <th>Exit Date</th>
+          <th class="num">Gross P&amp;L</th>
+          <th class="num">Charges</th>
+          <th class="num">Net P&amp;L</th>
+          <th class="num">Duration</th>
+          <th>Result</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr *ngIf="!loading && filteredTrades.length === 0">
+          <td colspan="15" class="empty">No trades match the current filters.</td>
+        </tr>
+
+        <ng-container *ngFor="let t of filteredTrades">
+          <tr class="trade-row" (click)="toggle(t)">
+            <td class="chev">{{ t.expanded ? '▾' : '▸' }}</td>
+            <td>{{ t.entry_time | date: 'yyyy-MM-dd HH:mm' }}</td>
+            <td class="sym">{{ t.symbol }}</td>
+            <td>
+              <span class="badge" [class.badge-buy]="t.side === 'BUY'" [class.badge-sell]="t.side === 'SELL'">
+                {{ t.side }}
+              </span>
+            </td>
+            <td>
+              <span class="badge badge-product" [class.badge-intraday]="t.product_type === 'INTRADAY'">
+                {{ t.product_type || 'INTRADAY' }}
+              </span>
+            </td>
+            <td class="num">{{ t.entry_price | number: '1.2-2' }}</td>
+            <td class="num">{{ t.stop_loss != null ? (t.stop_loss | number: '1.2-2') : '—' }}</td>
+            <td class="num">{{ t.target != null ? (t.target | number: '1.2-2') : '—' }}</td>
+            <td class="num">{{ t.exit_price != null ? (t.exit_price | number: '1.2-2') : '—' }}</td>
+            <td>{{ t.exit_time ? (t.exit_time | date: 'yyyy-MM-dd HH:mm') : '—' }}</td>
+            <td class="num" [ngClass]="pnlClass(t.gross_pnl ?? t.pnl_amount)">
+              {{ (t.gross_pnl ?? t.pnl_amount) != null ? ((t.gross_pnl ?? t.pnl_amount) | number: '1.2-2') : '—' }}
+            </td>
+            <td class="num">{{ totalCharges(t) | number: '1.2-2' }}</td>
+            <td class="num" [ngClass]="pnlClass(t.net_pnl)">
+              {{ t.net_pnl != null ? (t.net_pnl | number: '1.2-2') : '—' }}
+            </td>
+            <td class="num">{{ t.duration_minutes != null ? (t.duration_minutes + ' min') : '—' }}</td>
+            <td>
+              <span
+                class="badge"
+                [class.badge-win]="t.result === 'WIN'"
+                [class.badge-loss]="t.result === 'LOSS'"
+              >
+                {{ t.result || t.status }}
+              </span>
+            </td>
+          </tr>
+
+          <tr *ngIf="t.expanded" class="audit-row">
+            <td colspan="15">
+              <div class="audit-panel">
+                <div *ngIf="t.audit_loading" class="audit-loading">Loading audit trail…</div>
+
+                <div *ngIf="!t.audit_loading && (t.audit?.length || 0) === 0" class="audit-empty">
+                  No audit events recorded for this trade yet.
+                </div>
+
+                <ol *ngIf="!t.audit_loading && (t.audit?.length || 0) > 0" class="timeline">
+                  <li *ngFor="let e of t.audit" class="event" [ngClass]="eventClass(e.event_type)">
+                    <div class="event-head">
+                      <span class="event-type">{{ e.event_type }}</span>
+                      <span class="event-time">{{ e.timestamp | date: 'yyyy-MM-dd HH:mm:ss' }}</span>
+                    </div>
+                    <div *ngIf="e.reason" class="event-reason">{{ e.reason }}</div>
+                    <div class="event-change" *ngIf="e.old_value || e.new_value">
+                      <span class="from" *ngIf="e.old_value">from {{ fmtKV(e.old_value) }}</span>
+                      <span class="to" *ngIf="e.new_value">→ {{ fmtKV(e.new_value) }}</span>
+                    </div>
+                    <pre class="trigger" *ngIf="e.trigger_data">{{ e.trigger_data | json }}</pre>
+                  </li>
+                </ol>
+              </div>
+            </td>
+          </tr>
+        </ng-container>
+      </tbody>
+    </table>
+  </div>
+</div>

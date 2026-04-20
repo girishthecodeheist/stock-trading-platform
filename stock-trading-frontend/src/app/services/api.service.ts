@@ -260,6 +260,14 @@ export class ApiService {
     return this.http.get(`${this.baseUrl}/api/v1/scanner/auto-trade/signals`);
   }
 
+  // Rejected signals — symbols the engine looked at but refused to place
+  // (brokerage filter, capital limit, cooldown, trend conflict, ...).
+  getRejectedSignals(limit: number = 50, reason?: string): Observable<any> {
+    let params = new HttpParams().set('limit', String(limit));
+    if (reason) params = params.set('reason', reason);
+    return this.http.get(`${this.baseUrl}/api/v1/scanner/rejected-signals`, { params });
+  }
+
   // Smart Quantity Calculator
   calculateQuantity(entryPrice: number, slPercent?: number, targetPercent?: number, mode?: string): Observable<any> {
     let params = new HttpParams().set('entry_price', entryPrice.toString());
@@ -272,5 +280,59 @@ export class ApiService {
   // Backdate Simulation
   getBackdateSimulation(date: string): Observable<any> {
     return this.http.get(`${this.baseUrl}/api/v1/heatmap/backdate?date=${date}`);
+  }
+
+  // ========== v3-base feature pack: brokerage / funds / audit ==========
+
+  // F1: intraday vs delivery comparison.
+  getBrokerageComparison(
+    buyPrice: number,
+    sellPrice: number,
+    qty: number = 1,
+    availableMargin?: number,
+  ): Observable<any> {
+    let params = new HttpParams()
+      .set('buy_price', buyPrice.toString())
+      .set('sell_price', sellPrice.toString())
+      .set('qty', qty.toString());
+    if (availableMargin !== undefined) {
+      params = params.set('available_margin', availableMargin.toString());
+    }
+    return this.http.get(`${this.baseUrl}/api/analysis/brokerage-comparison`, { params });
+  }
+
+  // F4: paper-trade simulated capital update.
+  updateSimulatedCapital(newCapital: number): Observable<any> {
+    return this.http.put(`${this.baseUrl}/api/v1/funds/paper/simulate`, { new_capital: newCapital });
+  }
+
+  // F3: per-open-trade estimated charges for the dashboard.
+  getPaperOpenTradeCharges(): Observable<any> {
+    return this.http.get(`${this.baseUrl}/api/v1/funds/paper/open-trades-charges`);
+  }
+
+  // F5: audit trail endpoints.
+  getPaperTradeAudit(tradeId: number): Observable<any> {
+    return this.http.get(`${this.baseUrl}/api/paper-trades/${tradeId}/audit`);
+  }
+
+  getTradeAudit(tradeId: number, tradeType: 'PAPER' | 'LIVE' = 'PAPER'): Observable<any> {
+    const params = new HttpParams().set('trade_type', tradeType);
+    return this.http.get(`${this.baseUrl}/api/audit/trade/${tradeId}`, { params });
+  }
+
+  getDailyAudit(date?: string, eventType?: string): Observable<any> {
+    let params = new HttpParams();
+    if (date) params = params.set('date', date);
+    if (eventType) params = params.set('event_type', eventType);
+    return this.http.get(`${this.baseUrl}/api/audit/daily`, { params });
+  }
+
+  getSlChangeHistory(dateFrom?: string, dateTo?: string, symbol?: string): Observable<any> {
+    let params = new HttpParams();
+    if (dateFrom) params = params.set('date_from', dateFrom);
+    if (dateTo) params = params.set('date_to', dateTo);
+    if (symbol) params = params.set('symbol', symbol);
+    return this.http.get(`${this.baseUrl}/api/audit/sl-changes`, { params });
   }
 }

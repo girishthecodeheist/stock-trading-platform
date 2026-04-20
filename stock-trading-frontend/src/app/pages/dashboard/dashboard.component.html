@@ -27,7 +27,25 @@
       <div class="fund-rows">
         <div class="fund-row main-row">
           <span>Simulated Capital</span>
-          <strong>&#8377;{{ formatCurrency(paperFunds?.simulated_capital) }}</strong>
+          <ng-container *ngIf="!editingCapital; else editCapTpl">
+            <strong>&#8377;{{ formatCurrency(paperFunds?.simulated_capital) }}</strong>
+            <button class="mini-btn" (click)="editCapital()" title="Edit simulated capital">&#x270E;</button>
+          </ng-container>
+          <ng-template #editCapTpl>
+            <span class="edit-capital-row">
+              <input
+                type="number"
+                min="0"
+                step="1000"
+                [(ngModel)]="editCapitalAmount"
+                class="capital-input"
+              />
+              <button class="mini-btn save" (click)="saveCapital()" [disabled]="savingCapital">
+                {{ savingCapital ? '…' : '\u2713' }}
+              </button>
+              <button class="mini-btn cancel" (click)="cancelEditCapital()">\u2715</button>
+            </span>
+          </ng-template>
         </div>
         <div class="fund-row">
           <span>Available Margin</span>
@@ -38,10 +56,26 @@
           <strong>&#8377;{{ formatCurrency(paperFunds?.open_exposure) }}</strong>
         </div>
         <div class="fund-row pnl-row">
-          <span>Today's P&amp;L</span>
-          <strong [class.positive]="paperFunds?.net_pnl_today > 0" [class.negative]="paperFunds?.net_pnl_today < 0">
-            &#8377;{{ formatPnl(paperFunds?.net_pnl_today) }}
+          <span>Today's Gross P&amp;L</span>
+          <strong [class.positive]="(paperFunds?.today_gross_pnl ?? paperFunds?.net_pnl_today) > 0"
+                  [class.negative]="(paperFunds?.today_gross_pnl ?? paperFunds?.net_pnl_today) < 0">
+            &#8377;{{ formatPnl(paperFunds?.today_gross_pnl ?? paperFunds?.net_pnl_today) }}
           </strong>
+        </div>
+        <div class="fund-row pnl-row">
+          <span>Today's Net P&amp;L (after charges)</span>
+          <strong [class.positive]="(paperFunds?.today_net_pnl_after_charges ?? paperFunds?.net_pnl_today) > 0"
+                  [class.negative]="(paperFunds?.today_net_pnl_after_charges ?? paperFunds?.net_pnl_today) < 0">
+            &#8377;{{ formatPnl(paperFunds?.today_net_pnl_after_charges ?? paperFunds?.net_pnl_today) }}
+          </strong>
+        </div>
+        <div class="fund-row charge-row" *ngIf="paperFunds?.today_brokerage != null">
+          <span>Brokerage Paid Today</span>
+          <strong class="subtle">&#8377;{{ formatCurrency(paperFunds?.today_brokerage) }}</strong>
+        </div>
+        <div class="fund-row charge-row" *ngIf="paperFunds?.total_brokerage_paid != null">
+          <span>Total Brokerage (All Time)</span>
+          <strong class="subtle">&#8377;{{ formatCurrency(paperFunds?.total_brokerage_paid) }}</strong>
         </div>
         <div class="limits-section">
           <div class="limit-bar">
@@ -139,44 +173,6 @@
     </div>
   </div>
 
-  <!-- HEATMAP PANEL -->
-  <div class="glass-card heatmap-panel">
-    <div class="card-header">
-      <span class="card-icon">&#x1F525;</span>
-      <span class="card-title">NSE Live Heatmap</span>
-      <span class="last-update" *ngIf="lastHeatmapUpdate">Updated: {{ lastHeatmapUpdate }}</span>
-      <button class="btn-refresh" (click)="refreshHeatmap()">Refresh</button>
-    </div>
-    <div class="sector-row" *ngIf="sectors.length > 0">
-      <div *ngFor="let sector of sectors" class="sector-chip"
-           [class.bullish]="sector.avg_change > 0" [class.bearish]="sector.avg_change < 0">
-        <div class="sector-name">{{ sector.name }}</div>
-        <div class="sector-change" [class.pos]="sector.avg_change > 0" [class.neg]="sector.avg_change < 0">
-          {{ sector.avg_change > 0 ? '&#9650;' : '&#9660;' }} {{ sector.avg_change }}%
-        </div>
-      </div>
-    </div>
-    <div class="no-data" *ngIf="sectors.length === 0">Click "Refresh" to fetch live NSE heatmap data</div>
-    <div class="movers-section" *ngIf="topGainers.length > 0 || topLosers.length > 0">
-      <div class="movers-col">
-        <h4 class="green">Top Gainers</h4>
-        <div *ngFor="let s of topGainers" class="mover-chip gainer" [routerLink]="['/chart']" [queryParams]="{symbol: s.symbol}">
-          <span class="sym">{{ s.display_symbol }}</span>
-          <span class="chg">+{{ s.change_pct }}%</span>
-          <span class="price">&#8377;{{ s.ltp }}</span>
-        </div>
-      </div>
-      <div class="movers-col">
-        <h4 class="red">Top Losers</h4>
-        <div *ngFor="let s of topLosers" class="mover-chip loser" [routerLink]="['/chart']" [queryParams]="{symbol: s.symbol}">
-          <span class="sym">{{ s.display_symbol }}</span>
-          <span class="chg">{{ s.change_pct }}%</span>
-          <span class="price">&#8377;{{ s.ltp }}</span>
-        </div>
-      </div>
-    </div>
-  </div>
-
   <!-- OPEN TRADES -->
   <div class="glass-card trades-panel">
     <div class="card-header">
@@ -190,7 +186,14 @@
     <div class="trades-table" *ngIf="openPaperTrades.length > 0 || openLiveTrades.length > 0">
       <table>
         <thead>
-          <tr><th>Mode</th><th>Source</th><th>Symbol</th><th>Side</th><th>Entry</th><th>LTP</th><th>Qty</th><th>Unrealized P&amp;L</th><th>Action</th></tr>
+          <tr>
+            <th>Mode</th><th>Source</th><th>Symbol</th><th>Side</th><th>Entry</th>
+            <th>LTP</th><th>Qty</th>
+            <th>Unrealized (Gross)</th>
+            <th>Est. Charges</th>
+            <th>Net P&amp;L</th>
+            <th>Action</th>
+          </tr>
         </thead>
         <tbody>
           <tr *ngFor="let t of openPaperTrades" class="paper-row">
@@ -207,6 +210,16 @@
               <span *ngIf="getLTP(t) > 0" [class.positive]="getUnrealizedPnl(t) > 0" [class.negative]="getUnrealizedPnl(t) < 0">
                 &#8377;{{ formatPnl(getUnrealizedPnl(t)) }}
                 <small>({{ getUnrealizedPnlPct(t) | number:'1.2-2' }}%)</small>
+              </span>
+              <span *ngIf="getLTP(t) === 0" class="no-ltp">--</span>
+            </td>
+            <td class="charges-cell">
+              <span *ngIf="getEstimatedCharges(t) != null">&#8377;{{ getEstimatedCharges(t) | number:'1.2-2' }}</span>
+              <span *ngIf="getEstimatedCharges(t) == null" class="no-ltp">--</span>
+            </td>
+            <td>
+              <span *ngIf="getLTP(t) > 0" [class.positive]="getNetUnrealizedPnl(t) > 0" [class.negative]="getNetUnrealizedPnl(t) < 0">
+                &#8377;{{ formatPnl(getNetUnrealizedPnl(t)) }}
               </span>
               <span *ngIf="getLTP(t) === 0" class="no-ltp">--</span>
             </td>
@@ -229,6 +242,8 @@
               </span>
               <span *ngIf="getLTP(t) === 0" class="no-ltp">--</span>
             </td>
+            <td class="no-ltp">—</td>
+            <td class="no-ltp">—</td>
             <td><button class="btn-close-trade live" (click)="closeLiveTrade(t)">Close</button></td>
           </tr>
         </tbody>

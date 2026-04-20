@@ -14,8 +14,53 @@ from app.signal_engine import generate_signal
 from app.fundamental_engine import get_fundamental_data
 from app.news_engine import get_news_sentiment
 from app import fyers_client
+from app.brokerage_calc import (
+    compare_intraday_vs_delivery,
+    calc_max_intraday_quantity,
+    calc_max_delivery_quantity,
+)
 
 router = APIRouter(prefix="/api/analysis", tags=["analysis"])
+
+
+@router.get("/brokerage-comparison")
+async def brokerage_comparison(
+    buy_price: float = Query(..., gt=0, description="Entry / buy price per share"),
+    sell_price: float = Query(..., gt=0, description="Exit / sell price per share"),
+    qty: int = Query(1, ge=1, description="Quantity (shares)"),
+    available_margin: Optional[float] = Query(
+        None, ge=0, description="Available cash — used to compute max qty per mode",
+    ),
+):
+    """Side-by-side intraday vs delivery comparison for a round-trip trade.
+
+    Returns the full Fyers charges breakdown (brokerage, STT, exchange,
+    SEBI, IPFT, stamp duty, GST) for both product types, the net profit
+    after charges, a recommendation, and the max quantity the caller can
+    afford in each mode given ``available_margin``.
+    """
+    result = compare_intraday_vs_delivery(buy_price, sell_price, qty)
+
+    if available_margin is not None:
+        result["max_qty"] = {
+            "intraday": calc_max_intraday_quantity(available_margin, buy_price),
+            "delivery": calc_max_delivery_quantity(available_margin, buy_price),
+            "available_margin": round(float(available_margin), 2),
+        }
+
+    # Risk flag: intraday charges eat a huge fraction of the profit.
+    gross = result.get("gross_profit", 0) or 0
+    intra_charges = result["intraday"]["total_charges"]
+    result["risk_assessment"] = {
+        "intraday_charges_exceed_profit": bool(gross > 0 and intra_charges > gross),
+        "intraday_charges_pct_of_gross": result["intraday"]["charges_pct_of_gross"],
+        "delivery_charges_pct_of_gross": result["delivery"]["charges_pct_of_gross"],
+        "prefer_delivery": bool(
+            gross > 0 and intra_charges > 0.5 * gross
+        ),
+    }
+
+    return result
 
 
 @router.get("/comprehensive")

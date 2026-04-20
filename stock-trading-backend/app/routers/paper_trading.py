@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 
 from app.database import get_db
+from app.brokerage_calc import calc_brokerage
+from app import audit
 
 router = APIRouter(prefix="/api/paper-trades", tags=["paper-trading"])
 
@@ -31,12 +33,23 @@ async def list_trades(
         params["symbol"] = symbol
 
     where = " AND ".join(clauses)
+    # Extended projection including product_type and charge breakdown so the
+    # dashboard / Trade Journal can display net P&L without a second round
+    # trip. Old rows with NULL new-columns coerce to 0.
     query = text(f"""
         SELECT id, symbol, instrument_type, timeframe, side, entry_price, entry_time,
                exit_price, exit_time, quantity, stop_loss, target, status, result,
                pnl_percent, pnl_amount, signal_confidence, signal_reasons,
                indicators_snapshot, duration_minutes, exit_reason,
-               COALESCE(is_auto_trade, false) as is_auto_trade
+               COALESCE(is_auto_trade, false) as is_auto_trade,
+               COALESCE(product_type, 'INTRADAY') as product_type,
+               COALESCE(brokerage, 0) as brokerage,
+               COALESCE(stt, 0) as stt,
+               COALESCE(exchange_charges, 0) as exchange_charges,
+               COALESCE(gst, 0) as gst,
+               COALESCE(sebi_charges, 0) as sebi_charges,
+               COALESCE(stamp_duty, 0) as stamp_duty,
+               gross_pnl, net_pnl
         FROM paper_trades
         WHERE {where}
         ORDER BY entry_time DESC
@@ -67,6 +80,15 @@ async def list_trades(
             "duration_minutes": r[19],
             "exit_reason": r[20],
             "is_auto_trade": bool(r[21]) if r[21] is not None else False,
+            "product_type": r[22],
+            "brokerage": float(r[23]) if r[23] is not None else 0.0,
+            "stt": float(r[24]) if r[24] is not None else 0.0,
+            "exchange_charges": float(r[25]) if r[25] is not None else 0.0,
+            "gst": float(r[26]) if r[26] is not None else 0.0,
+            "sebi_charges": float(r[27]) if r[27] is not None else 0.0,
+            "stamp_duty": float(r[28]) if r[28] is not None else 0.0,
+            "gross_pnl": float(r[29]) if r[29] is not None else None,
+            "net_pnl": float(r[30]) if r[30] is not None else None,
         }
         for r in rows
     ]
@@ -78,16 +100,17 @@ async def create_trade(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new paper trade."""
+    product_type = (trade.get("product_type") or "INTRADAY").upper()
     query = text("""
         INSERT INTO paper_trades (symbol, instrument_type, timeframe, side, entry_price,
             entry_time, quantity, stop_loss, target, status, signal_confidence,
-            signal_reasons, indicators_snapshot)
+            signal_reasons, indicators_snapshot, product_type)
         VALUES (:symbol, :instrument_type, :timeframe, :side, :entry_price,
             :entry_time, :quantity, :stop_loss, :target, 'OPEN', :signal_confidence,
-            :signal_reasons, :indicators_snapshot)
+            :signal_reasons, :indicators_snapshot, :product_type)
         RETURNING id
     """)
-    
+
     result = await db.execute(query, {
         "symbol": trade["symbol"],
         "instrument_type": trade.get("instrument_type", "EQUITY"),
@@ -101,10 +124,32 @@ async def create_trade(
         "signal_confidence": trade.get("signal_confidence"),
         "signal_reasons": json.dumps(trade.get("signal_reasons", [])),
         "indicators_snapshot": json.dumps(trade.get("indicators_snapshot", {})),
+        "product_type": product_type,
     })
     await db.commit()
-    
+
     trade_id = result.scalar()
+
+    await audit.log_event(
+        trade_id=trade_id,
+        trade_type="PAPER",
+        event_type=audit.EVENT_TRADE_PLACED,
+        symbol=trade["symbol"],
+        new_value={
+            "entry_price": trade["entry_price"],
+            "stop_loss": trade.get("stop_loss"),
+            "target": trade.get("target"),
+            "quantity": trade.get("quantity", 1),
+            "side": trade.get("side", "BUY"),
+            "product_type": product_type,
+        },
+        reason="Paper trade created",
+        trigger_data={
+            "signal_confidence": trade.get("signal_confidence"),
+            "signal_reasons": trade.get("signal_reasons", []),
+        },
+    )
+
     return {"id": trade_id, "message": "Paper trade created", "status": "OPEN"}
 
 
@@ -114,31 +159,46 @@ async def close_trade(
     body: dict = Body(...),
     db: AsyncSession = Depends(get_db),
 ):
-    """Close an open paper trade."""
+    """Close an open paper trade with charges breakdown + audit trail."""
     exit_price = body.get("exit_price")
     exit_reason = body.get("exit_reason", "Manual close")
 
-    # Get the trade
-    trade_q = text("SELECT entry_price, side, entry_time, quantity FROM paper_trades WHERE id = :id AND status = 'OPEN'")
+    trade_q = text(
+        "SELECT entry_price, side, entry_time, quantity, symbol, "
+        "       COALESCE(product_type, 'INTRADAY') "
+        "  FROM paper_trades WHERE id = :id AND status = 'OPEN'"
+    )
     result = await db.execute(trade_q, {"id": trade_id})
     row = result.fetchone()
 
     if not row:
         return {"error": "Trade not found or already closed"}
 
-    entry_price, side, entry_time, quantity = row
+    entry_price, side, entry_time, quantity, symbol, product_type = row
     quantity = quantity or 1
-    
-    # Calculate PnL
+
     if side == "BUY":
         pnl_pct = (exit_price - entry_price) / entry_price * 100
+        buy_price, sell_price = float(entry_price), float(exit_price)
     else:
         pnl_pct = (entry_price - exit_price) / entry_price * 100
-    
-    # P&L amount = per-share P&L * quantity
-    pnl_amount = (exit_price - entry_price) * quantity if side == "BUY" else (entry_price - exit_price) * quantity
+        # Short: we "sell" at entry and "buy" back at exit. Fyers still
+        # charges STT on the sell leg and stamp duty on the buy leg.
+        buy_price, sell_price = float(exit_price), float(entry_price)
+
+    gross_pnl = (
+        (exit_price - entry_price) * quantity
+        if side == "BUY"
+        else (entry_price - exit_price) * quantity
+    )
     result_str = "WIN" if pnl_pct > 0 else ("LOSS" if pnl_pct < 0 else "BREAKEVEN")
-    
+
+    buy_value = buy_price * quantity
+    sell_value = sell_price * quantity
+    charges = calc_brokerage(buy_value, sell_value, quantity, product_type=product_type)
+    total_charges = float(charges["total_charges"])
+    net_pnl = round(float(gross_pnl) - total_charges, 2)
+
     now = datetime.utcnow()
     duration = int((now - entry_time).total_seconds() / 60) if entry_time else None
 
@@ -147,7 +207,11 @@ async def close_trade(
             exit_price = :exit_price, exit_time = :exit_time,
             status = 'CLOSED', result = :result,
             pnl_percent = :pnl_pct, pnl_amount = :pnl_amount,
-            duration_minutes = :duration, exit_reason = :exit_reason
+            duration_minutes = :duration, exit_reason = :exit_reason,
+            brokerage = :brokerage, stt = :stt, exchange_charges = :exchange,
+            gst = :gst, sebi_charges = :sebi, stamp_duty = :stamp,
+            gross_pnl = :gross_pnl, net_pnl = :net_pnl,
+            product_type = :product_type
         WHERE id = :id
     """)
     await db.execute(update_q, {
@@ -155,20 +219,81 @@ async def close_trade(
         "exit_time": now,
         "result": result_str,
         "pnl_pct": round(pnl_pct, 2),
-        "pnl_amount": round(pnl_amount, 2),
+        "pnl_amount": round(float(gross_pnl), 2),
         "duration": duration,
         "exit_reason": exit_reason,
+        "brokerage": charges["brokerage"],
+        "stt": charges["stt"],
+        "exchange": charges["exchange_charges"],
+        "gst": charges["gst"],
+        "sebi": charges["sebi_charges"],
+        "stamp": charges["stamp_duty"],
+        "gross_pnl": round(float(gross_pnl), 2),
+        "net_pnl": net_pnl,
+        "product_type": product_type,
         "id": trade_id,
     })
     await db.commit()
+
+    await audit.log_event(
+        trade_id=trade_id,
+        trade_type="PAPER",
+        event_type=audit.EVENT_TRADE_CLOSED,
+        symbol=symbol,
+        old_value={"status": "OPEN"},
+        new_value={
+            "exit_price": exit_price,
+            "result": result_str,
+            "gross_pnl": round(float(gross_pnl), 2),
+            "net_pnl": net_pnl,
+            "total_charges": total_charges,
+            "duration_minutes": duration,
+        },
+        reason=exit_reason,
+        trigger_data={"charges": charges, "product_type": product_type},
+    )
 
     return {
         "id": trade_id,
         "result": result_str,
         "pnl_percent": round(pnl_pct, 2),
-        "pnl_amount": round(pnl_amount, 2),
+        "pnl_amount": round(float(gross_pnl), 2),
+        "gross_pnl": round(float(gross_pnl), 2),
+        "net_pnl": net_pnl,
+        "total_charges": total_charges,
+        "charges": charges,
         "exit_reason": exit_reason,
     }
+
+
+@router.get("/{trade_id}/audit")
+async def paper_trade_audit(
+    trade_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Full audit trail for a single paper trade, oldest first."""
+    q = text(
+        "SELECT id, event_type, symbol, timestamp, old_value, new_value, "
+        "       reason, trigger_data, extra_metadata "
+        "  FROM trade_audit_log "
+        " WHERE trade_id = :id AND trade_type = 'PAPER' "
+        " ORDER BY timestamp ASC, id ASC"
+    )
+    rows = (await db.execute(q, {"id": trade_id})).fetchall()
+    return [
+        {
+            "id": r[0],
+            "event_type": r[1],
+            "symbol": r[2],
+            "timestamp": str(r[3]) if r[3] else None,
+            "old_value": r[4],
+            "new_value": r[5],
+            "reason": r[6],
+            "trigger_data": r[7],
+            "metadata": r[8],
+        }
+        for r in rows
+    ]
 
 
 @router.get("/analytics")

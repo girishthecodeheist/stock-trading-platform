@@ -121,38 +121,149 @@ async def create_live_trade(body: LiveTradeCreate, db: AsyncSession = Depends(ge
     if not fyers_client.is_authenticated():
         return {"success": False, "reason": "Fyers not connected. Please authenticate first."}
 
+    # Resolve product type from settings (INTRADAY default, CNC if user
+    # switched — CNC sidesteps the 15:15 MIS square-off rejection).
+    product_type = "INTRADAY"
+    try:
+        pt_row = await db.execute(text(
+            "SELECT product_type FROM trading_settings ORDER BY id ASC LIMIT 1"
+        ))
+        pt_val = pt_row.scalar()
+        if pt_val:
+            product_type = str(pt_val).upper()
+    except Exception:
+        pass
+
     fyers_side = 1 if direction == "LONG" else -1
     entry_order_resp = await fyers_client.place_order_async(
         symbol=body.symbol,
         side=fyers_side,
         qty=body.quantity,
         order_type=2,  # MARKET
-        product_type="INTRADAY",
+        product_type=product_type,
     )
     logger.info(f"Fyers entry order response ({trade_ref}): {entry_order_resp}")
     if not entry_order_resp or entry_order_resp.get("s") != "ok":
         err = entry_order_resp.get("message", "Unknown error") if entry_order_resp else "No response"
-        return {"success": False, "reason": f"Fyers entry order failed: {err}"}
+        code = entry_order_resp.get("code") if entry_order_resp else None
+        hint = ""
+        lower_err = (err or "").lower()
+        if code == -50 or "algo orders are not allowed" in lower_err:
+            hint = (
+                " — Enable API/Algo trading for this app in Fyers "
+                "(myaccount.fyers.in → My APIs → request algo activation)."
+            )
+        elif "square off" in lower_err or "disallowed after system" in lower_err:
+            hint = (
+                " — MIS orders are blocked after 15:15 IST. Switch Product "
+                "Type to CNC in Settings, or retry tomorrow during market hours."
+            )
+        elif "whitelisted ip" in lower_err:
+            hint = (
+                " — Your current egress IP is not whitelisted on the Fyers "
+                "app. Update the whitelist on the Fyers API dashboard."
+            )
+        return {
+            "success": False,
+            "reason": f"Fyers entry order failed: {err}{hint}",
+            "code": code,
+        }
 
     fyers_order_id = entry_order_resp.get("id", "")
 
-    # Insert trade record
+    # Post-placement reconciliation (F4). Poll Fyers for the terminal
+    # status of the order so we know how much actually filled. Without
+    # this we'd blindly create an OPEN row for `quantity` shares even if
+    # only some (or none) filled, and the exit leg would then try to sell
+    # shares we don't own.
+    fill_info = await fyers_client.reconcile_order_async(
+        fyers_order_id, timeout_seconds=15.0, poll_interval_seconds=0.5
+    )
+    logger.info(f"Fyers fill reconciliation ({trade_ref}): {fill_info}")
+
+    filled_qty = int(fill_info.get("filled_qty") or 0)
+    avg_fill = float(fill_info.get("avg_price") or 0.0) or None
+    broker_status = str(fill_info.get("status") or "PENDING")
+
+    if broker_status in ("REJECTED", "CANCELLED") or (
+        broker_status == "UNKNOWN" and filled_qty == 0
+    ):
+        # Broker rejected / cancelled the order — don't leave a phantom
+        # OPEN row. Record it as a rejected attempt for audit.
+        await db.execute(text("""
+            INSERT INTO live_trades
+            (trade_ref, symbol, display_symbol, direction, entry_price, entry_time,
+             quantity, filled_quantity, avg_fill_price, broker_status,
+             stop_loss, sl_percent, target_price, target_percent, product_type,
+             strategy, risk_reward, signal_id, signal_score, status, fyers_order_id,
+             exit_reason)
+            VALUES (:trade_ref, :symbol, :display_sym, :direction, :entry_price, :entry_time,
+                    :quantity, 0, NULL, :broker_status,
+                    :stop_loss, :sl_pct, :target_price, :tgt_pct, :product_type,
+                    :strategy, :rr, :signal_id, :signal_score, 'REJECTED', :order_id,
+                    :exit_reason)
+        """), {
+            "trade_ref": trade_ref,
+            "symbol": body.symbol,
+            "display_sym": display_sym,
+            "direction": direction,
+            "entry_price": body.entry_price,
+            "entry_time": now,
+            "quantity": body.quantity,
+            "broker_status": broker_status,
+            "stop_loss": body.stop_loss,
+            "sl_pct": sl_pct,
+            "target_price": target_price,
+            "tgt_pct": tgt_pct,
+            "product_type": product_type,
+            "strategy": body.strategy,
+            "rr": rr,
+            "signal_id": body.signal_id,
+            "signal_score": body.signal_score,
+            "order_id": fyers_order_id,
+            "exit_reason": (fill_info.get("message") or broker_status)[:50],
+        })
+        await db.commit()
+        return {
+            "success": False,
+            "reason": f"Broker {broker_status.lower()}: {fill_info.get('message') or 'no shares filled'}",
+            "trade_ref": trade_ref,
+            "broker_status": broker_status,
+        }
+
+    if filled_qty == 0:
+        # Still pending after the ack window — keep the row but flag it so
+        # the UI can show "awaiting fill" rather than a false OPEN.
+        broker_status = "PENDING"
+
+    # PARTIAL / FILLED (or PENDING-with-some-fill) — use the filled qty as
+    # the canonical position size. The exit leg will use this, *not* the
+    # originally requested quantity.
+    effective_qty = filled_qty if filled_qty > 0 else body.quantity
+    effective_entry = avg_fill if avg_fill else body.entry_price
+
     await db.execute(text("""
         INSERT INTO live_trades
         (trade_ref, symbol, display_symbol, direction, entry_price, entry_time,
-         quantity, stop_loss, sl_percent, target_price, target_percent,
+         quantity, filled_quantity, avg_fill_price, broker_status, product_type,
+         stop_loss, sl_percent, target_price, target_percent,
          strategy, risk_reward, signal_id, signal_score, status, fyers_order_id)
         VALUES (:trade_ref, :symbol, :display_sym, :direction, :entry_price, :entry_time,
-                :quantity, :stop_loss, :sl_pct, :target_price, :tgt_pct,
+                :quantity, :filled_qty, :avg_fill, :broker_status, :product_type,
+                :stop_loss, :sl_pct, :target_price, :tgt_pct,
                 :strategy, :rr, :signal_id, :signal_score, 'OPEN', :order_id)
     """), {
         "trade_ref": trade_ref,
         "symbol": body.symbol,
         "display_sym": display_sym,
         "direction": direction,
-        "entry_price": body.entry_price,
+        "entry_price": effective_entry,
         "entry_time": now,
-        "quantity": body.quantity,
+        "quantity": effective_qty,
+        "filled_qty": filled_qty,
+        "avg_fill": avg_fill,
+        "broker_status": broker_status,
+        "product_type": product_type,
         "stop_loss": body.stop_loss,
         "sl_pct": sl_pct,
         "target_price": target_price,
@@ -165,11 +276,24 @@ async def create_live_trade(body: LiveTradeCreate, db: AsyncSession = Depends(ge
     })
     await db.commit()
 
+    msg = "Live trade created"
+    if broker_status == "PARTIAL":
+        msg = (
+            f"Partial fill: {filled_qty}/{body.quantity} @ "
+            f"₹{(avg_fill or body.entry_price):.2f} — using filled qty as position size."
+        )
+    elif broker_status == "PENDING":
+        msg = "Order accepted; fill still pending at broker. Monitoring."
+
     return {
         "success": True,
         "trade_ref": trade_ref,
         "mode": "LIVE",
-        "message": "Live trade created",
+        "broker_status": broker_status,
+        "filled_quantity": filled_qty,
+        "avg_fill_price": avg_fill,
+        "requested_quantity": body.quantity,
+        "message": msg,
     }
 
 
@@ -195,15 +319,45 @@ async def close_live_trade(
     if not fyers_client.is_authenticated():
         return {"success": False, "reason": "Fyers not connected. Please authenticate first."}
 
+    # Use the actual filled qty from the entry leg — never sell more than
+    # we own. Falls back to the requested qty only for legacy rows that
+    # existed before the F4 reconciliation column was added.
+    filled_from_entry = trade.get("filled_quantity") if isinstance(trade, dict) else trade["filled_quantity"]
+    exit_qty = int(filled_from_entry) if filled_from_entry else int(trade["quantity"])
+    if exit_qty <= 0:
+        # Nothing actually filled — just mark the row closed without
+        # hitting Fyers.
+        await db.execute(text("""
+            UPDATE live_trades SET
+                status = 'CLOSED',
+                exit_time = :exit_time,
+                exit_reason = :exit_reason,
+                broker_status = COALESCE(broker_status, 'NO_FILL')
+            WHERE id = :id
+        """), {"id": trade_id, "exit_time": now, "exit_reason": exit_reason or "NO_FILL"})
+        await db.commit()
+        return {
+            "success": True,
+            "trade_id": trade_id,
+            "skipped_broker": True,
+            "reason": "No shares were ever filled on entry; closed without broker exit.",
+        }
+
+    exit_product_type = trade.get("product_type") if isinstance(trade, dict) else trade["product_type"]
+    exit_product_type = (exit_product_type or "INTRADAY").upper()
+
     exit_side = -1 if trade["direction"] == "LONG" else 1
     exit_order_resp = await fyers_client.place_order_async(
         symbol=trade["symbol"],
         side=exit_side,
-        qty=trade["quantity"],
+        qty=exit_qty,
         order_type=2,  # MARKET
-        product_type="INTRADAY",
+        product_type=exit_product_type,
     )
-    logger.info(f"Fyers exit order response for trade {trade_id}: {exit_order_resp}")
+    logger.info(
+        f"Fyers exit order response for trade {trade_id} (qty={exit_qty}, "
+        f"product={exit_product_type}): {exit_order_resp}"
+    )
 
     if not exit_order_resp or exit_order_resp.get("s") != "ok":
         err = exit_order_resp.get("message", "Unknown error") if exit_order_resp else "No response"
@@ -211,14 +365,28 @@ async def close_live_trade(
 
     fyers_exit_order_id = exit_order_resp.get("id", "")
 
-    # Calculate P&L
-    if trade["direction"] == "LONG":
-        gross_pnl = (price - trade["entry_price"]) * trade["quantity"]
-    else:
-        gross_pnl = (trade["entry_price"] - price) * trade["quantity"]
+    # Reconcile the exit order too so we know the real exit price / qty.
+    exit_fill = await fyers_client.reconcile_order_async(
+        fyers_exit_order_id, timeout_seconds=10.0, poll_interval_seconds=0.5
+    )
+    # Use the broker's actual fill price whenever shares actually executed
+    # — both FILLED and PARTIAL report a valid avg_price. Entry-side
+    # reconciliation treats the two the same way; keep exit P&L consistent.
+    if exit_fill.get("status") in ("FILLED", "PARTIAL") and exit_fill.get("avg_price"):
+        price = float(exit_fill["avg_price"])
+    if exit_fill.get("filled_qty"):
+        exit_qty = int(exit_fill["filled_qty"])
 
-    trade_value = price * trade["quantity"]
-    charges = calc_brokerage(trade_value, trade["quantity"])
+    # Calculate P&L
+    entry_basis = trade.get("avg_fill_price") if isinstance(trade, dict) else trade["avg_fill_price"]
+    entry_basis = float(entry_basis) if entry_basis else float(trade["entry_price"])
+    if trade["direction"] == "LONG":
+        gross_pnl = (price - entry_basis) * exit_qty
+    else:
+        gross_pnl = (entry_basis - price) * exit_qty
+
+    trade_value = price * exit_qty
+    charges = calc_brokerage(trade_value, exit_qty)
     net_pnl = gross_pnl - charges["total_charges"]
 
     duration = int((now - trade["entry_time"]).total_seconds() / 60) if trade["entry_time"] else 0

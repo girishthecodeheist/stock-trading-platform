@@ -2,12 +2,39 @@
 
 import os
 import json
+import socket
 import hashlib
 import logging
 import asyncio
 from datetime import datetime, timedelta
 from typing import Optional
 from pathlib import Path
+
+# --- Force IPv4 for all outbound HTTP traffic from this process ---
+# Fyers' SEBI-compliant algo apps enforce IP whitelisting per request. If the
+# OS happens to resolve their endpoints over IPv6, the outbound address does
+# NOT match the whitelisted IPv4 the user registered on the Fyers dashboard,
+# and the broker rejects every order with:
+#   "Orders are only allowed from whitelisted IP addresses. This request was
+#    received from IP: <v6-addr>."
+# urllib3 (used transitively by fyers-apiv3 \u2192 requests) picks the address
+# family via ``urllib3.util.connection.allowed_gai_family``. Overriding it to
+# AF_INET guarantees every socket opened from this Python process uses IPv4.
+# We also patch ``socket.getaddrinfo`` directly so anything talking raw
+# sockets (e.g. websockets, httpx) behaves the same way.
+if os.environ.get("FYERS_FORCE_IPV4", "1") not in ("0", "false", "False"):
+    try:
+        import urllib3.util.connection as _u3c
+        _u3c.allowed_gai_family = lambda: socket.AF_INET
+    except Exception:
+        pass
+
+    _original_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        return _original_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 from fyers_apiv3 import fyersModel
 
@@ -213,6 +240,111 @@ def get_orders() -> dict:
         return {"s": "error", "status": "error", "message": str(e)}
 
 
+# Fyers order status codes (from Fyers API v3 docs). We mostly care about
+# the three *terminal* ones — the rest mean "still in flight".
+FYERS_STATUS_FILLED = 2
+FYERS_STATUS_REJECTED = 5
+FYERS_STATUS_CANCELLED = 1
+FYERS_TERMINAL_STATUSES = {
+    FYERS_STATUS_FILLED,
+    FYERS_STATUS_REJECTED,
+    FYERS_STATUS_CANCELLED,
+}
+
+
+def _normalise_status(code) -> str:
+    mapping = {
+        1: "CANCELLED",
+        2: "FILLED",
+        3: "PENDING",
+        4: "PENDING",
+        5: "REJECTED",
+        6: "PENDING",
+    }
+    try:
+        return mapping.get(int(code), "PENDING")
+    except (TypeError, ValueError):
+        return "PENDING"
+
+
+def get_order_by_id(order_id: str) -> dict:
+    """Look up a single Fyers order by ID.
+
+    Returns a dict with keys {status, filled_qty, avg_price, remaining_qty,
+    message, raw}. ``status`` is one of FILLED / PARTIAL / PENDING /
+    REJECTED / CANCELLED / UNKNOWN. A PARTIAL fill (``tradedQty > 0`` but
+    ``status != FILLED``) is reported so the caller can decide whether to
+    cancel the remainder.
+    """
+    if not _fyers_model:
+        return {
+            "status": "UNKNOWN",
+            "filled_qty": 0,
+            "avg_price": 0.0,
+            "remaining_qty": 0,
+            "message": "Not authenticated",
+            "raw": None,
+        }
+    try:
+        resp = _fyers_model.orderbook({"id": order_id})
+        if resp.get("s") != "ok":
+            return {
+                "status": "UNKNOWN",
+                "filled_qty": 0,
+                "avg_price": 0.0,
+                "remaining_qty": 0,
+                "message": resp.get("message") or "orderbook fetch failed",
+                "raw": resp,
+            }
+
+        orders = resp.get("orderBook") or []
+        if not orders and resp.get("id") == order_id:
+            orders = [resp]
+        match = None
+        for o in orders:
+            if str(o.get("id")) == str(order_id):
+                match = o
+                break
+        if match is None:
+            return {
+                "status": "UNKNOWN",
+                "filled_qty": 0,
+                "avg_price": 0.0,
+                "remaining_qty": 0,
+                "message": "Order not found in orderbook",
+                "raw": resp,
+            }
+
+        traded = int(match.get("tradedQty") or match.get("filledQty") or 0)
+        req = int(match.get("qty") or 0)
+        remaining = int(match.get("remainingQuantity") or max(req - traded, 0))
+        avg = float(match.get("tradedPrice") or match.get("avgPrice") or 0.0)
+        broker_status = _normalise_status(match.get("status"))
+        # Upgrade PENDING → PARTIAL if some but not all qty has filled.
+        if broker_status == "PENDING" and traded > 0 and traded < req:
+            broker_status = "PARTIAL"
+        if broker_status == "FILLED" and 0 < traded < req:
+            broker_status = "PARTIAL"
+        return {
+            "status": broker_status,
+            "filled_qty": traded,
+            "avg_price": avg,
+            "remaining_qty": remaining,
+            "message": match.get("message") or "",
+            "raw": match,
+        }
+    except Exception as e:
+        logger.error(f"Fyers get_order_by_id error for {order_id}: {e}")
+        return {
+            "status": "UNKNOWN",
+            "filled_qty": 0,
+            "avg_price": 0.0,
+            "remaining_qty": 0,
+            "message": str(e),
+            "raw": None,
+        }
+
+
 def get_funds() -> dict:
     """Get Fyers account fund limits / wallet balance."""
     if not _fyers_model:
@@ -391,6 +523,56 @@ async def get_positions_async() -> dict:
 async def get_orders_async() -> dict:
     """Async wrapper around ``get_orders``."""
     return await asyncio.to_thread(get_orders)
+
+
+async def get_order_by_id_async(order_id: str) -> dict:
+    """Async wrapper around ``get_order_by_id``."""
+    return await asyncio.to_thread(get_order_by_id, order_id)
+
+
+async def reconcile_order_async(
+    order_id: str,
+    *,
+    timeout_seconds: float = 15.0,
+    poll_interval_seconds: float = 0.5,
+) -> dict:
+    """Poll Fyers until the order hits a terminal state or we time out.
+
+    Returns the same shape as ``get_order_by_id``. Callers should inspect
+    ``status`` (FILLED / PARTIAL / REJECTED / CANCELLED / PENDING /
+    UNKNOWN) and ``filled_qty`` before committing trade rows — partial
+    fills must never be treated as full fills.
+    """
+    if not order_id:
+        return {
+            "status": "UNKNOWN",
+            "filled_qty": 0,
+            "avg_price": 0.0,
+            "remaining_qty": 0,
+            "message": "Missing order id",
+            "raw": None,
+        }
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max(timeout_seconds, 0.0)
+    last: dict = {
+        "status": "PENDING",
+        "filled_qty": 0,
+        "avg_price": 0.0,
+        "remaining_qty": 0,
+        "message": "",
+        "raw": None,
+    }
+    terminal = {"FILLED", "REJECTED", "CANCELLED"}
+    while True:
+        info = await get_order_by_id_async(order_id)
+        last = info
+        if info.get("status") in terminal:
+            return info
+        # PARTIAL means some qty traded but order is still live — keep
+        # polling; the remainder might fill before the deadline.
+        if loop.time() >= deadline:
+            return info
+        await asyncio.sleep(max(poll_interval_seconds, 0.05))
 
 
 async def get_market_depth_async(symbol: str) -> dict:

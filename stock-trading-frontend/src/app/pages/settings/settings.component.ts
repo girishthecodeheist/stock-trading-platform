@@ -61,6 +61,7 @@ export class SettingsComponent implements OnInit {
       min_volume: this.settings.min_volume,
       auto_trade_enabled: this.settings.auto_trade_enabled,
       auto_quantity_enabled: this.settings.auto_quantity_enabled,
+      product_type: this.settings.product_type,
     };
     this.api.updateSettings(update).subscribe({
       next: () => {

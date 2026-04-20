@@ -25,6 +25,15 @@ export class SignalsComponent implements OnInit, OnDestroy {
   loading = true;
   refreshing = false;
   lastUpdate = '';
+  // Blocked signals — answers "I see strong signals, why zero trades?"
+  rejected: any[] = [];
+  rejectedFilter: string = 'ALL';
+  showRejected = true;
+  // TTL/dedup guard — loadSignals() fires on a 15s timer + SSE + toggles;
+  // we don't want to hammer /rejected-signals every single tick.
+  private rejectedLastFetch = 0;
+  private rejectedInFlight = false;
+  private static readonly REJECTED_TTL_MS = 10_000;
   private refreshInterval: any;
   private marketCheckInterval: any;
   private subs: Subscription[] = [];
@@ -129,12 +138,98 @@ export class SignalsComponent implements OnInit, OnDestroy {
       error: () => { this.loading = false; this.refreshing = false; },
     });
     this.state.refreshScannerStatus(isInitial);
+    this.loadRejected();
+  }
+
+  loadRejected(force: boolean = false) {
+    if (this.rejectedInFlight) return;
+    const now = Date.now();
+    if (!force && now - this.rejectedLastFetch < SignalsComponent.REJECTED_TTL_MS) return;
+    this.rejectedInFlight = true;
+    this.api.getRejectedSignals(50).subscribe({
+      next: (res) => {
+        this.rejected = res?.rejections || [];
+        this.rejectedLastFetch = Date.now();
+        this.rejectedInFlight = false;
+      },
+      error: () => {
+        this.rejectedInFlight = false;
+      },
+    });
+  }
+
+  get filteredRejected(): any[] {
+    if (this.rejectedFilter === 'ALL') return this.rejected;
+    return this.rejected.filter(r => (r.reason || '') === this.rejectedFilter);
+  }
+
+  get rejectedReasons(): string[] {
+    const set = new Set<string>();
+    for (const r of this.rejected) if (r.reason) set.add(r.reason);
+    return Array.from(set).sort();
+  }
+
+  setRejectedFilter(r: string) { this.rejectedFilter = r; }
+
+  rejectionLabel(reason: string): string {
+    const map: { [k: string]: string } = {
+      WEAK_SIGNAL: 'Score below threshold',
+      LOW_CONFIDENCE: 'Confidence too low',
+      DAILY_LIMIT: 'Daily trade cap reached',
+      COOLDOWN: 'Re-entry cooldown',
+      TREND_CONFLICT: '15m vs 1D trend conflict',
+      LIVE_NOT_CONNECTED: 'Fyers not connected',
+      CAPITAL_LIMIT: 'Insufficient capital',
+      BROKERAGE_FILTER: 'Not profitable after charges',
+      TRADING_HALTED: 'Daily P&L limit hit',
+      OPEN_TRADES_FULL: 'Max open trades reached',
+      DUPLICATE_SYMBOL: 'Already open on this symbol',
+      FYERS_REJECTED: 'Broker rejected order',
+      FALLBACK_BLOCKED: 'Heatmap fallback (no indicators)',
+      LOW_VOLUME: 'Low volume vs 20-bar average',
+      BAD_RR: 'Risk/reward below 1.5',
+      TARGET_TOO_TIGHT: 'Target distance too small',
+      REGIME_BLOCK: 'Blocked by Nifty regime',
+      NEUTRAL_SIGNAL: 'Signal is NEUTRAL',
+      SLOT_FULL: 'Slot limit this cycle',
+    };
+    return map[reason] || reason;
+  }
+
+  rejectionChipClass(reason: string): string {
+    if (reason === 'BROKERAGE_FILTER') return 'reject-brokerage';
+    if (reason === 'CAPITAL_LIMIT') return 'reject-capital';
+    if (reason === 'LIVE_NOT_CONNECTED' || reason === 'FYERS_REJECTED') return 'reject-live';
+    if (reason === 'COOLDOWN' || reason === 'DAILY_LIMIT') return 'reject-cooldown';
+    if (reason === 'REGIME_BLOCK') return 'reject-regime';
+    if (reason === 'LOW_VOLUME' || reason === 'BAD_RR' || reason === 'TARGET_TOO_TIGHT') return 'reject-technical';
+    if (reason === 'NEUTRAL_SIGNAL') return 'reject-neutral';
+    return 'reject-generic';
+  }
+
+  /** v5.1: Per-row status chip class for the signals table. */
+  statusChipClass(s: any): string {
+    const status = (s?.trade_status || '').toUpperCase();
+    if (status === 'PLACED') return 'status-placed';
+    if (status === 'BLOCKED') return this.rejectionChipClass(s?.block_reason || '');
+    if (status === 'NEUTRAL') return 'status-neutral';
+    return 'status-pending';
+  }
+
+  /** v5.1: Short status label shown in the Analysis column. */
+  statusLabel(s: any): string {
+    const status = (s?.trade_status || '').toUpperCase();
+    if (status === 'PLACED') return 'Placed';
+    if (status === 'BLOCKED') return this.rejectionLabel(s?.block_reason || 'BLOCKED');
+    if (status === 'NEUTRAL') return 'Neutral — not traded';
+    return 'Awaiting placement';
   }
 
   refreshNow() {
     this.refreshing = true;
     this.state.invalidateSignals();
     this.state.invalidateScanner();
+    this.loadRejected(true);
     this.loadSignals();
   }
 

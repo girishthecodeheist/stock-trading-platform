@@ -25,11 +25,15 @@ from app import fyers_client
 from app.heatmap_poller import heatmap_poller
 from app.indicator_engine import compute_all_indicators
 from app.signal_engine import generate_signal
+from app.fundamental_engine import get_fundamental_data
+from app.news_engine import get_news_sentiment
 from app.brokerage_calc import (
     calc_brokerage,
+    compare_intraday_vs_delivery,
     is_trade_profitable_after_brokerage,
     min_qty_for_net_profit,
 )
+from app import audit
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +49,8 @@ MIN_CONFIDENCE_FOR_TRADE = 40        # Minimum confidence to place trade
 
 # v5: Brokerage-aware sizing floor. Overridden by
 # ``trading_settings.min_net_profit_per_trade`` / ``min_profit_to_cost_ratio``.
-MIN_NET_PROFIT_PER_TRADE = 100.0     # Rs — skip setups that can't clear this after charges
-MIN_PROFIT_TO_COST_RATIO = 2.0       # gross profit must be >= N× total charges
+MIN_NET_PROFIT_PER_TRADE = 1.0       # Rs — skip setups that can't clear this after charges
+MIN_PROFIT_TO_COST_RATIO = 1.0       # gross profit must be >= N× total charges (>=1 = any net profit)
 
 # Trailing profit config
 TRAILING_PROFIT_TRIGGER_PCT = 1.0   # Start trailing after 1% profit
@@ -54,6 +58,64 @@ TRAILING_PROFIT_STEP_PCT = 0.5      # Move target up by 0.5% each step
 
 # Re-analysis config
 RE_ANALYSIS_INTERVAL_SECS = 120     # Re-analyze open trades every 2 minutes
+
+# F6: Intraday timing guardrails (IST minutes from midnight).
+# Fyers auto-squares-off MIS around 15:15, and rejects MIS orders after that
+# with "RED:'MIS' Orders are disallowed after system square off". We stop
+# opening *new* intraday trades at 14:30 because there's rarely enough runway
+# to hit a meaningful target before square-off.
+INTRADAY_SQUARE_OFF_TIME = 15 * 60 + 15  # 15:15 IST
+INTRADAY_NO_NEW_TRADE_AFTER = 14 * 60 + 30  # 14:30 IST
+
+
+def _ist_minute_of_day(now: Optional[datetime] = None) -> int:
+    now = now or datetime.now(IST)
+    return now.hour * 60 + now.minute
+
+
+def _choose_product_type(
+    entry_price: float, target: Optional[float], qty: int,
+    now_minute: Optional[int] = None,
+    side: str = "BUY",
+) -> tuple[str, str, dict]:
+    """Decide INTRADAY vs DELIVERY for an auto-placed trade.
+
+    For a LONG (``side == "BUY"``) trade, ``entry_price`` is the buy leg and
+    ``target`` is the sell leg. For a SHORT (``side == "SELL"``) trade the
+    entry is the sell leg and the target is the buy-back leg \u2014 we swap them
+    before costing so ``compare_intraday_vs_delivery`` sees a positive gross
+    profit and the charge-to-profit guardrail fires correctly.
+
+    Returns ``(product_type, reason, comparison)``. Rules:
+      * After 14:30 IST \u2192 DELIVERY (not enough runway before MIS cutoff).
+      * If intraday charges would eat >50% of expected gross profit \u2192 DELIVERY.
+      * Otherwise prefer INTRADAY (5x leverage is the usual win).
+    """
+    now_min = now_minute if now_minute is not None else _ist_minute_of_day()
+    if now_min >= INTRADAY_NO_NEW_TRADE_AFTER:
+        return "DELIVERY", (
+            f"After 14:30 IST ({now_min // 60:02d}:{now_min % 60:02d}); "
+            "intraday runway insufficient before 15:15 square-off."
+        ), {}
+
+    if not target or target == entry_price or qty <= 0:
+        return "INTRADAY", "Default routing (no target / qty to score)", {}
+
+    side_up = (side or "BUY").upper()
+    if side_up == "SELL":
+        buy_price, sell_price = float(target), float(entry_price)
+    else:
+        buy_price, sell_price = float(entry_price), float(target)
+
+    cmp_ = compare_intraday_vs_delivery(buy_price, sell_price, qty)
+    gross = cmp_.get("gross_profit") or 0
+    intra_charges = cmp_["intraday"]["total_charges"]
+    if gross > 0 and intra_charges > 0.5 * gross:
+        return "DELIVERY", (
+            f"Intraday charges \u20b9{intra_charges:.2f} exceed 50% of gross profit "
+            f"\u20b9{gross:.2f} \u2014 delivery is cheaper."
+        ), cmp_
+    return "INTRADAY", cmp_.get("recommendation_reason") or "Intraday cheaper or comparable", cmp_
 
 # Engine state
 _engine_task: Optional[asyncio.Task] = None
@@ -66,11 +128,57 @@ _daily_target_met = False
 _trades_placed_today: int = 0
 _last_trade_time_per_symbol: Dict[str, datetime] = {}
 
+# Gap 1: In-memory caches for fundamental + sentiment data so the per-scan
+# analysis loop doesn't re-fetch them for every stock every 2 minutes.
+# Fundamentals don't change intraday; news sentiment refreshes a bit faster.
+_FUNDAMENTAL_CACHE_TTL_SECS = 10 * 60  # 10 minutes
+_SENTIMENT_CACHE_TTL_SECS = 5 * 60     # 5 minutes
+_fundamental_cache: Dict[str, tuple] = {}  # symbol -> (expires_at, data)
+_sentiment_cache: Dict[str, tuple] = {}    # symbol -> (expires_at, data)
+
+
+async def _get_fundamental_cached(symbol: str) -> Optional[dict]:
+    """Fetch fundamental data with a TTL cache to avoid hammering the API."""
+    now = time.time()
+    hit = _fundamental_cache.get(symbol)
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        data = await get_fundamental_data(symbol)
+    except Exception as ex:
+        logger.debug(f"Fundamental fetch failed for {symbol}: {ex}")
+        return None
+    _fundamental_cache[symbol] = (now + _FUNDAMENTAL_CACHE_TTL_SECS, data)
+    return data
+
+
+async def _get_sentiment_cached(symbol: str) -> Optional[dict]:
+    """Fetch news sentiment with a short TTL cache."""
+    now = time.time()
+    hit = _sentiment_cache.get(symbol)
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        data = await get_news_sentiment(symbol)
+    except Exception as ex:
+        logger.debug(f"Sentiment fetch failed for {symbol}: {ex}")
+        return None
+    _sentiment_cache[symbol] = (now + _SENTIMENT_CACHE_TTL_SECS, data)
+    return data
+
+
 # SSE subscribers: list of asyncio.Queue objects
 _sse_subscribers: list = []
 
 # Last analyzed signals (shared with signals dashboard)
 _last_signals: list = []
+
+# Recently-rejected signals (ring buffer). Each scan cycle a signal can be
+# dropped at one of several gates (weak score, low confidence, capital limit,
+# brokerage filter, cooldown, etc). The UI surfaces this so the user can see
+# *why* nothing was placed even though signals looked strong.
+_rejected_signals: list = []
+REJECTED_SIGNALS_BUFFER = 100
 
 # Cached settings (refreshed on demand, TTL-bounded)
 _cached_settings: Optional[dict] = None
@@ -126,6 +234,95 @@ def _add_log(action: str, symbol: str, details: str):
     })
     if len(_auto_trade_log) > 200:
         _auto_trade_log = _auto_trade_log[-200:]
+
+
+# Reasons we expose to the UI as "blocked" — everything else is either a
+# success or an internal error and shouldn't show up on the rejected panel.
+_REJECTION_REASONS = {
+    "WEAK_SIGNAL",
+    "LOW_CONFIDENCE",
+    "DAILY_LIMIT",
+    "COOLDOWN",
+    "TREND_CONFLICT",
+    "LIVE_NOT_CONNECTED",
+    "CAPITAL_LIMIT",
+    "BROKERAGE_FILTER",
+    "TRADING_HALTED",
+    "OPEN_TRADES_FULL",
+    "DUPLICATE_SYMBOL",
+    # Broker rejected the order at the Fyers API (e.g. -50 "algo orders
+    # not allowed", insufficient funds on the real account, instrument
+    # banned for intraday, etc.). Surfaces the raw broker message.
+    "FYERS_REJECTED",
+    # Newer gates — keep in sync with the rejection reasons that
+    # _place_auto_trade passes to _record_rejection, otherwise the
+    # UI's "Blocked signals" panel silently drops them.
+    "FALLBACK_BLOCKED",
+    "LOW_VOLUME",
+    "BAD_RR",
+    "TARGET_TOO_TIGHT",
+    # v5: Nifty-index regime gate. Blocks BUYs in a crashing market and
+    # SELLs in a surging one.
+    "REGIME_BLOCK",
+    # v5.1: Scan-level gates that previously dropped silently so the UI could
+    # never explain "why isn't this BUY being placed?". All per-signal gates
+    # now record a rejection and attach a status to the signals row.
+    "NEUTRAL_SIGNAL",
+    "SLOT_FULL",
+}
+
+
+def _record_rejection(
+    reason: str,
+    symbol: str,
+    signal_data: Optional[dict] = None,
+    trade_mode: Optional[str] = None,
+    details: str = "",
+    extra: Optional[dict] = None,
+) -> None:
+    """Record a rejected signal for the UI's "Blocked" panel.
+
+    Entries are dedup'd on (symbol, reason) within a 60s window so that a
+    stuck gate (e.g. CAPITAL_LIMIT every 15s) shows up as one row that keeps
+    refreshing rather than spamming the buffer.
+    """
+    if reason not in _REJECTION_REASONS:
+        return
+    global _rejected_signals
+    now = datetime.now(IST)
+    sig = signal_data or {}
+    payload = {
+        "time": now.isoformat(),
+        "reason": reason,
+        "symbol": symbol,
+        "trade_mode": trade_mode,
+        "details": details,
+        "signal": sig.get("signal"),
+        "score": sig.get("score"),
+        "confidence": sig.get("confidence"),
+        "entry_price": sig.get("entry_price"),
+        "stop_loss": sig.get("stop_loss"),
+        "target": sig.get("target_1") or sig.get("target"),
+        "extra": extra or {},
+    }
+    # Dedup: same symbol+reason within 60s → overwrite the existing row.
+    for idx, row in enumerate(_rejected_signals):
+        if row.get("symbol") == symbol and row.get("reason") == reason:
+            try:
+                prev_t = datetime.fromisoformat(row["time"])
+            except Exception:
+                prev_t = None
+            if prev_t and (now - prev_t).total_seconds() < 60:
+                _rejected_signals[idx] = payload
+                return
+    _rejected_signals.append(payload)
+    if len(_rejected_signals) > REJECTED_SIGNALS_BUFFER:
+        _rejected_signals = _rejected_signals[-REJECTED_SIGNALS_BUFFER:]
+
+
+def get_recent_rejections(limit: int = 50) -> list:
+    """Return the most recent rejections, newest first."""
+    return list(reversed(_rejected_signals[-limit:]))
 
 
 def is_market_open() -> bool:
@@ -210,8 +407,13 @@ async def _get_available_margin(settings: dict) -> float:
 async def _get_live_available_margin() -> float:
     """Return the broker-reported available margin for LIVE trading.
 
-    Queries Fyers ``funds`` and reads ``limitAmount`` from the equity bucket
-    (id=10), matching how :mod:`routers.funds` surfaces this in the UI.
+    Queries Fyers ``funds`` and reads ``equityAmount`` from row id=10
+    ("Available Balance"). The Fyers v3 payload exposes balances as
+    ``equityAmount`` / ``commodityAmount`` per row — the legacy
+    ``limitAmount`` field we previously read is absent in v3, which meant
+    every LIVE scan was rejecting with margin=0. We fall back to
+    ``limitAmount`` for forward-compat with any v2-style response.
+
     Returns 0 if we're not authenticated or the call fails — callers treat
     that as "no capacity" and skip the trade.
     """
@@ -223,11 +425,15 @@ async def _get_live_available_margin() -> float:
         logger.warning(f"Fyers funds lookup failed: {e}")
         return 0.0
     if not resp or resp.get("s") != "ok":
+        logger.warning(f"Fyers funds returned non-ok: {resp}")
         return 0.0
     for row in resp.get("fund_limit", []) or []:
         if row.get("id") == 10:
+            raw = row.get("equityAmount")
+            if raw is None:
+                raw = row.get("limitAmount", 0)
             try:
-                return float(row.get("limitAmount", 0) or 0)
+                return float(raw or 0)
             except (TypeError, ValueError):
                 return 0.0
     return 0.0
@@ -293,14 +499,23 @@ def _is_on_cooldown(symbol: str) -> bool:
 
 async def _calculate_quantity(
     entry_price: float, sl_pct: float, tgt_pct: float,
-    settings: dict, available_margin: float
+    settings: dict, available_margin: float,
+    trade_mode: str = "PAPER",
 ) -> int:
     """Calculate optimal trade quantity based on settings AND available margin.
 
+    Loss/profit caps are mode-aware — previously we only read the PAPER caps
+    which meant a user who'd tuned ``day_max_loss_live`` / ``day_profit_target_live``
+    had no effect on LIVE auto-trades.
+
     Capital limit enforcement: quantity * entry_price must not exceed available_margin.
     """
-    max_loss = abs(settings.get("day_max_loss_paper", 1000))
-    profit_target = settings.get("day_profit_target_paper", 2000)
+    if str(trade_mode).upper() == "LIVE":
+        max_loss = abs(settings.get("day_max_loss_live", 2000) or 0)
+        profit_target = settings.get("day_profit_target_live", 4000) or 0
+    else:
+        max_loss = abs(settings.get("day_max_loss_paper", 1000) or 0)
+        profit_target = settings.get("day_profit_target_paper", 2000) or 0
 
     sl_per_share = entry_price * sl_pct / 100.0
     target_per_share = entry_price * tgt_pct / 100.0
@@ -310,14 +525,19 @@ async def _calculate_quantity(
             return 1
         return 0
 
-    qty_from_loss = max_loss / sl_per_share
-    qty_from_profit = profit_target / target_per_share
+    qty_from_loss = max_loss / sl_per_share if sl_per_share > 0 and max_loss > 0 else float("inf")
+    qty_from_profit = profit_target / target_per_share if target_per_share > 0 and profit_target > 0 else float("inf")
     qty_from_margin = available_margin / entry_price if entry_price > 0 else 0
 
     optimal_qty = int(math.floor(min(qty_from_loss, qty_from_profit, qty_from_margin)))
 
     if optimal_qty <= 0:
-        logger.info(f"Capital limit: qty=0 (margin={available_margin:.0f}, price={entry_price:.2f})")
+        logger.info(
+            f"Capital limit: qty=0 mode={trade_mode} "
+            f"margin={available_margin:.0f} price={entry_price:.2f} "
+            f"qty_from_loss={qty_from_loss:.2f} qty_from_profit={qty_from_profit:.2f} "
+            f"qty_from_margin={qty_from_margin:.2f}"
+        )
         return 0
 
     return optimal_qty
@@ -459,6 +679,9 @@ async def _analyze_stock(stock: dict, timeframe: str = "15m") -> Optional[dict]:
 
     signal_data = None
     analysis_basis = "heatmap_fallback"
+    indicators: Optional[dict] = None
+    fundamental: Optional[dict] = None
+    sentiment: Optional[dict] = None
 
     if fyers_client.is_authenticated():
         try:
@@ -468,7 +691,25 @@ async def _analyze_stock(stock: dict, timeframe: str = "15m") -> Optional[dict]:
                 df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
                 df["volume"] = df["volume"].astype(float)
                 indicators = compute_all_indicators(df)
-                signal_data = generate_signal(indicators, instrument_type="EQUITY")
+
+                # Gap 1: fetch fundamental + sentiment so generate_signal's
+                # 40/35/25 weighting is actually exercised. Both fetches are
+                # cached per-symbol to avoid slowing the 2-min scan loop.
+                fundamental = await _get_fundamental_cached(symbol)
+                sentiment = await _get_sentiment_cached(symbol)
+
+                signal_data = generate_signal(
+                    indicators,
+                    fundamental=fundamental,
+                    sentiment=sentiment,
+                    instrument_type="EQUITY",
+                )
+
+                # Gap 8: attach volume info so downstream filters can use it
+                # without re-peeking at the indicators dict.
+                if signal_data is not None:
+                    signal_data["volume"] = stock.get("volume", 0)
+                    signal_data["volume_ratio"] = indicators.get("volume_ratio")
 
                 has_tech = signal_data.get("technical_score", 0) != 0
                 has_fund = signal_data.get("fundamental_score", 0) != 0
@@ -541,6 +782,9 @@ async def _analyze_stock(stock: dict, timeframe: str = "15m") -> Optional[dict]:
         "signal_data": signal_data,
         "analysis_basis": analysis_basis,
         "analyzed_timeframe": timeframe,
+        "indicators": indicators,
+        "fundamental": fundamental,
+        "sentiment": sentiment,
     }
 
 
@@ -553,12 +797,14 @@ async def _confirm_with_daily_trend(symbol: str, intraday_signal: str) -> bool:
     Returns True if daily trend confirms the intraday signal.
     """
     if not fyers_client.is_authenticated():
-        return True  # Can't confirm, allow the trade
+        # Gap 10: can't confirm, REJECT rather than allowing the trade blind.
+        return False
 
     try:
         candles = await fyers_client.get_historical_data_async(symbol, timeframe="1D", days_back=20)
         if not candles or len(candles) < 10:
-            return True  # Not enough data, allow
+            # Gap 10: not enough data to confirm, REJECT.
+            return False
 
         df = pd.DataFrame(candles)
         df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
@@ -569,16 +815,17 @@ async def _confirm_with_daily_trend(symbol: str, intraday_signal: str) -> bool:
         daily_direction = daily_signal.get("signal", "NEUTRAL")
         daily_score = daily_signal.get("score", 0)
 
-        # Check for conflict
+        # Check for conflict. Gap 4: lowered conflict threshold from ±30 to ±15
+        # so even moderately opposing daily trend blocks the intraday trade.
         if "BUY" in intraday_signal.upper():
-            # Intraday wants to BUY - check daily isn't strongly bearish
-            if "SELL" in daily_direction.upper() and daily_score <= -30:
+            # Intraday wants to BUY - check daily isn't bearish
+            if "SELL" in daily_direction.upper() and daily_score <= -15:
                 _add_log("TREND_CONFLICT", symbol,
                          f"Intraday={intraday_signal} but Daily={daily_direction} (score={daily_score}). Skipping.")
                 return False
         elif "SELL" in intraday_signal.upper():
-            # Intraday wants to SELL - check daily isn't strongly bullish
-            if "BUY" in daily_direction.upper() and daily_score >= 30:
+            # Intraday wants to SELL - check daily isn't bullish
+            if "BUY" in daily_direction.upper() and daily_score >= 15:
                 _add_log("TREND_CONFLICT", symbol,
                          f"Intraday={intraday_signal} but Daily={daily_direction} (score={daily_score}). Skipping.")
                 return False
@@ -586,14 +833,129 @@ async def _confirm_with_daily_trend(symbol: str, intraday_signal: str) -> bool:
         return True
     except Exception as e:
         logger.debug(f"Daily trend confirmation failed for {symbol}: {e}")
-        return True  # On error, allow the trade
+        # Gap 10: on error, REJECT — never assume a daily trend is fine.
+        return False
+
+
+# --- Market Regime Detection -------------------------------------------------
+
+# Cached per scan-cycle so we hit Fyers once per cycle rather than per symbol.
+_market_regime_cache: Dict[str, Any] = {"expires_at": 0.0, "data": None}
+_MARKET_REGIME_TTL_SECS = 90  # ~1 scan cycle; refreshed by the scan loop anyway
+
+
+async def _detect_market_regime(force_refresh: bool = False) -> dict:
+    """Detect current market regime using the Nifty 50 index.
+
+    Returns a dict with:
+      - regime: TRENDING_UP | TRENDING_DOWN | RANGING | VOLATILE | UNKNOWN
+      - nifty_change_pct: intraday change %
+      - nifty_trend_score: -100..+100 (≈ nifty_change_pct * 10)
+      - allow_buy: block BUYs when Nifty is crashing hard (≤ -1.5%)
+      - allow_sell: block SELLs when Nifty is surging hard (≥ +1.5%)
+
+    We cache the result for ~90s so a full scan cycle only costs one API call.
+    """
+    now = time.time()
+    if (
+        not force_refresh
+        and _market_regime_cache.get("data")
+        and _market_regime_cache.get("expires_at", 0) > now
+    ):
+        return dict(_market_regime_cache["data"])
+
+    result = {
+        "regime": "UNKNOWN",
+        "nifty_change_pct": 0.0,
+        "nifty_trend_score": 0.0,
+        "allow_buy": True,
+        "allow_sell": True,
+    }
+
+    if not fyers_client.is_authenticated():
+        return result
+
+    try:
+        candles = await fyers_client.get_historical_data_async(
+            "NSE:NIFTY50-INDEX", timeframe="15m", days_back=5
+        )
+        if not candles or len(candles) < 20:
+            return result
+
+        df = pd.DataFrame(candles)
+        df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+
+        prev_close = df["close"].shift(1)
+        tr = pd.concat(
+            [
+                df["high"] - df["low"],
+                (df["high"] - prev_close).abs(),
+                (df["low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr = tr.rolling(14).mean().iloc[-1]
+        current = float(df["close"].iloc[-1])
+        atr_pct = (atr / current) * 100 if current else 0.0
+
+        sma_20 = df["close"].rolling(20).mean().iloc[-1]
+
+        # Intraday change: first candle of the current IST day vs latest close.
+        day_open = None
+        try:
+            ts = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert(IST)
+            today_mask = ts.dt.date == datetime.now(IST).date()
+            today = df[today_mask]
+            if not today.empty:
+                day_open = float(today.iloc[0]["open"])
+        except Exception:
+            day_open = None
+
+        if day_open is None:
+            # Fallback: approx last 26 15m candles (~6.5h session).
+            today_candles = df.tail(26)
+            if len(today_candles) > 1:
+                day_open = float(today_candles.iloc[0]["open"])
+
+        if day_open and day_open > 0:
+            nifty_change_pct = ((current - day_open) / day_open) * 100
+        else:
+            nifty_change_pct = 0.0
+        result["nifty_change_pct"] = round(nifty_change_pct, 2)
+        result["nifty_trend_score"] = round(nifty_change_pct * 10, 1)
+
+        if pd.notna(atr_pct) and atr_pct > 0.8:
+            result["regime"] = "VOLATILE"
+        elif pd.notna(sma_20) and current > float(sma_20) and nifty_change_pct > 0.3:
+            result["regime"] = "TRENDING_UP"
+        elif pd.notna(sma_20) and current < float(sma_20) and nifty_change_pct < -0.3:
+            result["regime"] = "TRENDING_DOWN"
+        else:
+            result["regime"] = "RANGING"
+
+        # Don't fight a strong index move.
+        if nifty_change_pct <= -1.5:
+            result["allow_buy"] = False
+        if nifty_change_pct >= 1.5:
+            result["allow_sell"] = False
+
+    except Exception as e:
+        logger.debug(f"Market regime detection failed: {e}")
+
+    _market_regime_cache["data"] = dict(result)
+    _market_regime_cache["expires_at"] = now + _MARKET_REGIME_TTL_SECS
+    return result
 
 
 # --- Trade Placement ----------------------------------------------------------
 
 async def _place_auto_trade(
     symbol: str, signal_data: dict, settings: dict,
-    analysis_basis: str = "technical", analyzed_timeframe: str = "15m"
+    analysis_basis: str = "technical", analyzed_timeframe: str = "15m",
+    indicators: Optional[dict] = None,
+    fundamental: Optional[dict] = None,
+    sentiment: Optional[dict] = None,
+    market_regime: Optional[dict] = None,
 ) -> Optional[int]:
     """Auto-place a paper trade based on signal. Returns trade_id or None.
 
@@ -631,14 +993,80 @@ async def _place_auto_trade(
         min_score = settings.get("min_score_for_trade", MIN_SCORE_FOR_TRADE)
         min_confidence = settings.get("min_confidence_for_trade", MIN_CONFIDENCE_FOR_TRADE)
 
+        trade_mode_peek = str(settings.get("trade_mode") or "PAPER").upper()
+
         if abs(score) < min_score:
             _add_log("WEAK_SIGNAL", symbol,
                      f"Score {score:.1f} below threshold {min_score}. Skipping.")
+            _record_rejection(
+                "WEAK_SIGNAL", symbol, signal_data, trade_mode_peek,
+                f"Score {score:.1f} < min {min_score}",
+            )
             return None
 
         if confidence < min_confidence:
             _add_log("LOW_CONFIDENCE", symbol,
                      f"Confidence {confidence:.1f} below threshold {min_confidence}. Skipping.")
+            _record_rejection(
+                "LOW_CONFIDENCE", symbol, signal_data, trade_mode_peek,
+                f"Confidence {confidence:.1f} < min {min_confidence}",
+            )
+            return None
+
+        # Gap 2: never auto-trade heatmap-fallback signals. They exist only
+        # because the real indicator pipeline couldn't be run (no Fyers auth
+        # or not enough candles), so they're fine to *display* but must not
+        # drive real placements.
+        if analysis_basis == "heatmap_fallback":
+            _add_log("FALLBACK_BLOCKED", symbol,
+                     "Heatmap fallback signal blocked from auto-trade "
+                     "(no technical analysis available)")
+            _record_rejection(
+                "FALLBACK_BLOCKED", symbol, signal_data, trade_mode_peek,
+                "Heatmap fallback signal blocked from auto-trade",
+            )
+            return None
+
+        # Gap 8 / v5: reject trades where the move isn't volume-confirmed. Low
+        # volume on a "strong" signal almost always means thin-book noise.
+        # Threshold tightened from 0.5 → 0.8 to drop more low-conviction setups.
+        trade_volume_ratio = signal_data.get("volume_ratio")
+        if trade_volume_ratio is not None and trade_volume_ratio < 0.8:
+            _add_log("LOW_VOLUME", symbol,
+                     f"Volume ratio {trade_volume_ratio:.2f} below minimum 0.8. Skipping.")
+            _record_rejection(
+                "LOW_VOLUME", symbol, signal_data, trade_mode_peek,
+                f"Volume ratio {trade_volume_ratio:.2f}x below 0.8x average",
+            )
+            return None
+
+        # v5: REGIME GATE — don't take BUYs into a crashing Nifty or SELLs into a
+        # surging one. Scan loop passes the shared snapshot; fall back to a
+        # cached fetch for monitor-loop re-analysis entries.
+        regime = market_regime or await _detect_market_regime()
+        if side == "BUY" and not regime.get("allow_buy", True):
+            _add_log(
+                "REGIME_BLOCK", symbol,
+                f"BUY blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
+                f"({regime.get('regime', 'UNKNOWN')})",
+            )
+            _record_rejection(
+                "REGIME_BLOCK", symbol, signal_data, trade_mode_peek,
+                f"BUY blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
+                f"({regime.get('regime', 'UNKNOWN')})",
+            )
+            return None
+        if side == "SELL" and not regime.get("allow_sell", True):
+            _add_log(
+                "REGIME_BLOCK", symbol,
+                f"SELL blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
+                f"({regime.get('regime', 'UNKNOWN')})",
+            )
+            _record_rejection(
+                "REGIME_BLOCK", symbol, signal_data, trade_mode_peek,
+                f"SELL blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
+                f"({regime.get('regime', 'UNKNOWN')})",
+            )
             return None
 
         # v4: DAILY TRADE LIMIT
@@ -651,6 +1079,10 @@ async def _place_auto_trade(
                 "trades_today": _trades_placed_today,
                 "max_trades": max_trades_day,
             })
+            _record_rejection(
+                "DAILY_LIMIT", symbol, signal_data, trade_mode_peek,
+                f"{_trades_placed_today}/{max_trades_day} trades placed today",
+            )
             return None
 
         # v4: COOLDOWN CHECK
@@ -659,12 +1091,20 @@ async def _place_auto_trade(
             elapsed = int((datetime.now(IST) - last_time).total_seconds()) if last_time else 0
             _add_log("COOLDOWN", symbol,
                      f"On cooldown ({elapsed}s / {TRADE_COOLDOWN_SECS}s). Skipping.")
+            _record_rejection(
+                "COOLDOWN", symbol, signal_data, trade_mode_peek,
+                f"Re-entry cooldown: {elapsed}s / {TRADE_COOLDOWN_SECS}s",
+            )
             return None
 
         # v4: MULTI-TIMEFRAME CONFIRMATION
         if analyzed_timeframe != "1D":
             confirmed = await _confirm_with_daily_trend(symbol, signal_type)
             if not confirmed:
+                _record_rejection(
+                    "TREND_CONFLICT", symbol, signal_data, trade_mode_peek,
+                    f"{analyzed_timeframe} {signal_type} conflicts with 1D trend",
+                )
                 return None
 
         # v4: REALISTIC TARGET CAPPING
@@ -673,6 +1113,58 @@ async def _place_auto_trade(
             stop_loss, target = _cap_targets_to_range(
                 entry_price, stop_loss, target, side, price_range, atr
             )
+
+        # Gap 7: once targets are capped to recent price action, re-check the
+        # risk:reward. If capping crushed the reward side down to where R:R
+        # is below 1.5 (or the target distance collapsed to <0.3%), there's
+        # no edge left — skip the trade rather than placing a negative-EV one.
+        if stop_loss and target and entry_price:
+            if side == "BUY":
+                reward_distance = target - entry_price
+                risk_distance = entry_price - stop_loss
+            else:
+                reward_distance = entry_price - target
+                risk_distance = stop_loss - entry_price
+
+            # If target capping pushed the SL to the wrong side of entry
+            # (e.g. entry=98 but recent_low=101 clamped SL up to 101 on a
+            # BUY), risk_distance is zero/negative and the trade would fill
+            # into an instant SL hit on the next monitor tick. Reject these
+            # outright instead of silently skipping the R:R check.
+            if risk_distance <= 0:
+                _add_log("BAD_RR", symbol,
+                         f"Stop loss on wrong side of entry after capping. "
+                         f"Entry={entry_price}, SL={stop_loss}, Side={side}. Skipping.")
+                _record_rejection(
+                    "BAD_RR", symbol, signal_data, trade_mode_peek,
+                    f"Invalid SL placement: SL={stop_loss} vs entry={entry_price} "
+                    f"for {side} trade (risk_distance={risk_distance:.2f})",
+                )
+                return None
+
+            rr_ratio = reward_distance / risk_distance
+            if rr_ratio < 1.5:
+                _add_log("BAD_RR", symbol,
+                         f"Risk:Reward {rr_ratio:.2f} below 1.5 after capping. "
+                         f"Entry={entry_price}, SL={stop_loss}, Target={target}. Skipping.")
+                _record_rejection(
+                    "BAD_RR", symbol, signal_data, trade_mode_peek,
+                    f"R:R {rr_ratio:.2f} < 1.5 after target capping "
+                    f"(entry={entry_price}, SL={stop_loss}, target={target})",
+                )
+                return None
+
+            min_target_pct = 0.3
+            target_pct_actual = abs(reward_distance / entry_price * 100) if entry_price else 0
+            if target_pct_actual < min_target_pct:
+                _add_log("TARGET_TOO_TIGHT", symbol,
+                         f"Target distance {target_pct_actual:.2f}% below minimum "
+                         f"{min_target_pct}%. Skipping.")
+                _record_rejection(
+                    "TARGET_TOO_TIGHT", symbol, signal_data, trade_mode_peek,
+                    f"Target distance {target_pct_actual:.2f}% < min {min_target_pct}%",
+                )
+                return None
 
         sl_pct = settings.get("default_sl_percent", 1.0)
         tgt_pct = settings.get("default_target_percent", 1.0)
@@ -696,6 +1188,10 @@ async def _place_auto_trade(
                 "symbol": symbol,
                 "message": "Fyers not connected; connect to place live trades.",
             })
+            _record_rejection(
+                "LIVE_NOT_CONNECTED", symbol, signal_data, trade_mode,
+                "Fyers not authenticated — connect in the UI to place live trades.",
+            )
             return None
 
         # CAPITAL LIMIT ENFORCEMENT
@@ -703,7 +1199,9 @@ async def _place_auto_trade(
             available_margin = await _get_live_available_margin()
         else:
             available_margin = await _get_available_margin(settings)
-        quantity = await _calculate_quantity(entry_price, sl_pct, tgt_pct, settings, available_margin)
+        quantity = await _calculate_quantity(
+            entry_price, sl_pct, tgt_pct, settings, available_margin, trade_mode,
+        )
 
         if quantity <= 0:
             _add_log("CAPITAL_LIMIT", symbol,
@@ -716,6 +1214,15 @@ async def _place_auto_trade(
                 "required": round(entry_price, 2),
                 "message": "Insufficient capital to place trade"
             })
+            _record_rejection(
+                "CAPITAL_LIMIT", symbol, signal_data, trade_mode,
+                f"Available {trade_mode} margin \u20b9{available_margin:.0f} insufficient "
+                f"for 1 share @ \u20b9{entry_price:.2f}",
+                extra={
+                    "available_margin": round(available_margin, 2),
+                    "required": round(entry_price, 2),
+                },
+            )
             return None
 
         trade_cost = entry_price * quantity
@@ -725,6 +1232,11 @@ async def _place_auto_trade(
                 _add_log("CAPITAL_LIMIT", symbol,
                          f"Rejected after margin check: mode={trade_mode}, "
                          f"margin={available_margin:.0f}")
+                _record_rejection(
+                    "CAPITAL_LIMIT", symbol, signal_data, trade_mode,
+                    f"Trade cost exceeds {trade_mode} margin \u20b9{available_margin:.0f}",
+                    extra={"available_margin": round(available_margin, 2)},
+                )
                 return None
             trade_cost = entry_price * quantity
 
@@ -791,7 +1303,61 @@ async def _place_auto_trade(
                     "min_required_ratio": min_ratio,
                     "message": "Trade rejected: would not be profitable after charges"
                 })
+                _record_rejection(
+                    "BROKERAGE_FILTER", symbol, signal_data, trade_mode,
+                    f"Net \u20b9{brokerage_check['net_profit']:.2f} at qty={quantity} "
+                    f"(gross \u20b9{brokerage_check['gross_profit']:.2f} \u2212 charges "
+                    f"\u20b9{brokerage_check['total_charges']:.2f}); "
+                    f"{', '.join(reason) or 'below floor'}",
+                    extra={
+                        "qty": quantity,
+                        "gross_profit": round(brokerage_check["gross_profit"], 2),
+                        "total_charges": round(brokerage_check["total_charges"], 2),
+                        "net_profit": round(brokerage_check["net_profit"], 2),
+                        "min_net_profit": min_net,
+                        "min_profit_to_cost_ratio": min_ratio,
+                        "profit_to_cost_ratio": round(
+                            brokerage_check.get("profit_to_cost_ratio") or 0, 3
+                        ),
+                        "charges_breakdown": brokerage_check.get("charges_breakdown"),
+                    },
+                )
                 return None
+
+        # F1 + F6: pick INTRADAY vs DELIVERY. The user-level default in
+        # ``trading_settings.product_type`` is the fallback; auto-routing
+        # overrides it when intraday charges are uneconomic or when we're
+        # too close to the 15:15 square-off.
+        configured_product_type = str(settings.get("product_type") or "INTRADAY").upper()
+        now_min = _ist_minute_of_day()
+        auto_product_type, routing_reason, routing_cmp = _choose_product_type(
+            entry_price, target, quantity, now_minute=now_min, side=side,
+        )
+        if configured_product_type == "DELIVERY" and auto_product_type != "DELIVERY":
+            product_type = "DELIVERY"
+            routing_reason = "Settings force DELIVERY (CNC)"
+        else:
+            product_type = auto_product_type
+
+        # Gap 5: persist a richer per-trade snapshot so the audit/journal view
+        # can explain WHY each trade was placed (all key indicator values, plus
+        # fundamental + sentiment summaries). We pick a fixed whitelist of keys
+        # to avoid dumping the entire indicator DataFrame into JSON.
+        key_indicators: Dict[str, Any] = {}
+        if indicators:
+            for key in (
+                "rsi", "macd_line", "macd_signal", "macd_hist",
+                "sma_20", "sma_50", "sma_200", "ema_9", "ema_20",
+                "bb_upper", "bb_mid", "bb_lower", "bb_pct_b",
+                "atr", "adx", "di_plus", "di_minus",
+                "supertrend", "supertrend_direction",
+                "volume_ratio", "volume_trend", "vwap",
+                "stoch_k", "stoch_d", "williams_r", "cci", "mfi",
+                "obv_trend", "current_price", "trend_strength",
+                "support_1", "resistance_1", "guppy_signal",
+            ):
+                if key in indicators:
+                    key_indicators[key] = indicators[key]
 
         snapshot = {
             "auto_trade": True,
@@ -802,6 +1368,58 @@ async def _place_auto_trade(
             "analyzed_timeframe": analyzed_timeframe,
             "available_margin_at_entry": round(available_margin, 2),
             "trade_cost": round(trade_cost, 2),
+            "product_type": product_type,
+            "product_type_reason": routing_reason,
+            "indicators": key_indicators,
+            # v5: flatten the most-queried indicator values next to the dict
+            # so the post-mortem/journal UIs don't have to parse nested JSON.
+            "rsi": (indicators or {}).get("rsi"),
+            "macd_line": (indicators or {}).get("macd_line"),
+            "macd_signal": (indicators or {}).get("macd_signal"),
+            "macd_hist": (indicators or {}).get("macd_hist"),
+            "sma_20": (indicators or {}).get("sma_20"),
+            "sma_50": (indicators or {}).get("sma_50"),
+            "sma_200": (indicators or {}).get("sma_200"),
+            "volume_ratio": (indicators or {}).get("volume_ratio"),
+            "supertrend_direction": (indicators or {}).get("supertrend_direction"),
+            "adx": (indicators or {}).get("adx"),
+            "atr": (indicators or {}).get("atr"),
+            "bb_pct_b": (indicators or {}).get("bb_pct_b"),
+            "stoch_k": (indicators or {}).get("stoch_k"),
+            "stoch_d": (indicators or {}).get("stoch_d"),
+            "vwap": (indicators or {}).get("vwap"),
+            "cci": (indicators or {}).get("cci"),
+            "mfi": (indicators or {}).get("mfi"),
+            "williams_r": (indicators or {}).get("williams_r"),
+            "obv_trend": (indicators or {}).get("obv_trend"),
+            # Score breakdown from signal_engine (40/35/25 weighting).
+            "technical_score": signal_data.get("technical_score"),
+            "fundamental_score": (
+                signal_data.get("fundamental_score")
+                if signal_data.get("fundamental_score") is not None
+                else (fundamental.get("fundamental_score") if fundamental else None)
+            ),
+            "sentiment_score": (
+                signal_data.get("sentiment_score")
+                if signal_data.get("sentiment_score") is not None
+                else (sentiment.get("sentiment_score") if sentiment else None)
+            ),
+            "weight_description": signal_data.get("weight_description"),
+            # Market regime at entry — use the resolved ``regime`` (not the
+            # kwarg) so monitor-loop entries that omit ``market_regime`` still
+            # persist the fetched values the gate actually acted on.
+            "market_regime": regime.get("regime"),
+            "nifty_change_pct": regime.get("nifty_change_pct"),
+            "nifty_trend_score": regime.get("nifty_trend_score"),
+            # Fundamental summary.
+            "fundamental_signal": fundamental.get("fundamental_signal") if fundamental else None,
+            "pe_ratio": fundamental.get("pe_ratio") if fundamental else None,
+            "roe": fundamental.get("roe") if fundamental else None,
+            "debt_to_equity": fundamental.get("debt_to_equity") if fundamental else None,
+            # Sentiment summary.
+            "sentiment_classification": sentiment.get("sentiment_classification") if sentiment else None,
+            "headline_count": sentiment.get("headline_count") if sentiment else None,
+            "avg_sentiment": sentiment.get("avg_sentiment") if sentiment else None,
         }
 
         full_reasons = list(reasons) if isinstance(reasons, list) else [str(reasons)]
@@ -818,23 +1436,109 @@ async def _place_auto_trade(
                 side=fyers_side,
                 qty=quantity,
                 order_type=2,  # MARKET
-                product_type="INTRADAY",
+                product_type=product_type,
             )
             logger.info(f"Fyers auto entry response for {symbol}: {entry_resp}")
             if not entry_resp or entry_resp.get("s") != "ok":
                 err = entry_resp.get("message", "Unknown") if entry_resp else "No response"
-                _add_log("LIVE_ORDER_FAILED", symbol, f"Fyers rejected: {err}")
+                code = entry_resp.get("code") if entry_resp else None
+                # Fyers returns -50 "Algo orders are not allowed from this
+                # app <APP_ID>" when the app hasn't been whitelisted for
+                # API/algo trading. It's an app-level Fyers setting — the
+                # user has to request enablement from Fyers (myaccount →
+                # My APIs → Algo). Surface that as actionable text, not
+                # just the raw broker message.
+                hint = ""
+                if code == -50 or "algo orders are not allowed" in (err or "").lower():
+                    hint = (
+                        " — Enable API/Algo trading for this app in Fyers "
+                        "(myaccount.fyers.in → My APIs → request algo "
+                        "activation). Orders will keep failing until that's on."
+                    )
+                _add_log("LIVE_ORDER_FAILED", symbol, f"Fyers rejected: {err}{hint}")
                 _push_event("LIVE_ORDER_FAILED", {
                     "symbol": symbol, "side": side, "qty": quantity,
-                    "error": err,
+                    "error": err, "code": code,
+                    "hint": hint.strip(" —") or None,
                 })
+                # Surface broker rejection in the "Blocked signals" panel so
+                # the user sees *why* LIVE orders aren't going through.
+                _record_rejection(
+                    "FYERS_REJECTED",
+                    symbol,
+                    signal_data={
+                        "signal": signal_type,
+                        "score": score,
+                        "confidence": confidence,
+                        "entry_price": entry_price,
+                        "stop_loss": stop_loss,
+                        "target_1": target,
+                    },
+                    trade_mode=trade_mode,
+                    details=f"Fyers: {err}{hint}",
+                    extra={
+                        "code": code,
+                        "qty": quantity,
+                        "side": side,
+                        "hint": hint.strip(" —") or None,
+                    },
+                )
                 return None
             fyers_order_id = entry_resp.get("id", "") or ""
 
+            # Post-placement reconciliation (F4). Ask Fyers how much
+            # actually filled before we create the live_trades row. This
+            # protects against partial fills (where we'd otherwise try to
+            # exit more shares than we own) and post-ack rejects.
+            fill_info = await fyers_client.reconcile_order_async(
+                fyers_order_id, timeout_seconds=15.0, poll_interval_seconds=0.5
+            )
+            logger.info(f"Fyers auto fill reconciliation for {symbol}: {fill_info}")
+            broker_status = str(fill_info.get("status") or "PENDING")
+            filled_qty = int(fill_info.get("filled_qty") or 0)
+            avg_fill = float(fill_info.get("avg_price") or 0.0) or None
+
+            if broker_status in ("REJECTED", "CANCELLED") or (
+                broker_status == "UNKNOWN" and filled_qty == 0
+            ):
+                err_msg = fill_info.get("message") or broker_status.lower()
+                _add_log(
+                    "LIVE_ORDER_NO_FILL",
+                    symbol,
+                    f"Fyers {broker_status.lower()}: {err_msg}",
+                )
+                _record_rejection(
+                    "FYERS_REJECTED",
+                    symbol,
+                    signal_data={
+                        "signal": signal_type,
+                        "score": score,
+                        "confidence": confidence,
+                        "entry_price": entry_price,
+                        "stop_loss": stop_loss,
+                        "target_1": target,
+                    },
+                    trade_mode=trade_mode,
+                    details=f"Broker {broker_status}: {err_msg}",
+                    extra={
+                        "qty": quantity,
+                        "side": side,
+                        "broker_status": broker_status,
+                        "order_id": fyers_order_id,
+                    },
+                )
+                return None
+
+            if filled_qty == 0:
+                broker_status = "PENDING"
+
+            effective_qty = filled_qty if filled_qty > 0 else quantity
+            effective_entry = avg_fill if avg_fill else entry_price
+
             direction = "LONG" if side == "BUY" else "SHORT"
             display_sym = symbol.replace("NSE:", "").replace("-EQ", "")
-            risk = abs(entry_price - stop_loss) if stop_loss else 0
-            reward = abs(target - entry_price) if target else 0
+            risk = abs(effective_entry - stop_loss) if stop_loss else 0
+            reward = abs(target - effective_entry) if target else 0
             rr = round(reward / risk, 2) if risk > 0 else 0
 
             now_ist = datetime.now(IST)
@@ -848,22 +1552,28 @@ async def _place_auto_trade(
                 result = await db.execute(text(
                     "INSERT INTO live_trades "
                     "(trade_ref, symbol, display_symbol, direction, entry_price, "
-                    " entry_time, quantity, stop_loss, sl_percent, target_price, "
-                    " target_percent, strategy, risk_reward, signal_score, "
-                    " signal_strength, status, fyers_order_id) "
+                    " entry_time, quantity, filled_quantity, avg_fill_price, "
+                    " broker_status, product_type, stop_loss, sl_percent, "
+                    " target_price, target_percent, strategy, risk_reward, "
+                    " signal_score, signal_strength, status, fyers_order_id) "
                     "VALUES (:trade_ref, :symbol, :display_sym, :direction, :entry_price, "
-                    " :entry_time, :quantity, :stop_loss, :sl_pct, :target_price, "
-                    " :tgt_pct, 'AUTO', :rr, :signal_score, :signal_strength, "
-                    " 'OPEN', :order_id) "
+                    " :entry_time, :quantity, :filled_qty, :avg_fill, "
+                    " :broker_status, :product_type, :stop_loss, :sl_pct, "
+                    " :target_price, :tgt_pct, 'AUTO', :rr, "
+                    " :signal_score, :signal_strength, 'OPEN', :order_id) "
                     "RETURNING id"
                 ), {
                     "trade_ref": trade_ref,
                     "symbol": symbol,
                     "display_sym": display_sym,
                     "direction": direction,
-                    "entry_price": entry_price,
+                    "entry_price": effective_entry,
                     "entry_time": now_ist.replace(tzinfo=None),
-                    "quantity": quantity,
+                    "quantity": effective_qty,
+                    "filled_qty": filled_qty,
+                    "avg_fill": avg_fill,
+                    "broker_status": broker_status,
+                    "product_type": product_type,
                     "stop_loss": stop_loss,
                     "sl_pct": round(sl_pct, 2),
                     "target_price": target,
@@ -875,15 +1585,25 @@ async def _place_auto_trade(
                 })
                 await db.commit()
                 trade_id = result.scalar()
+                if broker_status == "PARTIAL":
+                    _add_log(
+                        "LIVE_PARTIAL_FILL",
+                        symbol,
+                        f"Partial fill: {filled_qty}/{quantity} @ ₹{(avg_fill or entry_price):.2f}",
+                    )
+            # Log/SSE downstream must reflect what actually filled, not what
+            # we requested. PAPER mode trivially uses the original values.
+            quantity = effective_qty
+            entry_price = effective_entry
         else:
             async with async_session_factory() as db:
                 result = await db.execute(text(
                     "INSERT INTO paper_trades (symbol, instrument_type, timeframe, side, entry_price, "
                     "entry_time, quantity, stop_loss, target, status, signal_confidence, "
-                    "signal_reasons, indicators_snapshot, is_auto_trade) "
+                    "signal_reasons, indicators_snapshot, is_auto_trade, product_type) "
                     "VALUES (:symbol, 'EQUITY', :timeframe, :side, :entry_price, "
                     ":entry_time, :quantity, :stop_loss, :target, 'OPEN', :signal_confidence, "
-                    ":signal_reasons, :indicators_snapshot, true) "
+                    ":signal_reasons, :indicators_snapshot, true, :product_type) "
                     "RETURNING id"
                 ), {
                     "symbol": symbol,
@@ -897,9 +1617,45 @@ async def _place_auto_trade(
                     "signal_confidence": confidence,
                     "signal_reasons": json.dumps(full_reasons),
                     "indicators_snapshot": json.dumps(snapshot),
+                    "product_type": product_type,
                 })
                 await db.commit()
                 trade_id = result.scalar()
+
+        # F5: record TRADE_PLACED + PRODUCT_TYPE_DECISION audit rows.
+        try:
+            await audit.log_event(
+                trade_id=trade_id,
+                trade_type=trade_mode,
+                event_type=audit.EVENT_TRADE_PLACED,
+                symbol=symbol,
+                new_value={
+                    "entry_price": entry_price,
+                    "stop_loss": stop_loss,
+                    "target": target,
+                    "quantity": quantity,
+                    "side": side,
+                    "product_type": product_type,
+                },
+                reason=f"Auto-placed {signal_type} signal (score={score})",
+                trigger_data={
+                    "score": score,
+                    "confidence": confidence,
+                    "analyzed_timeframe": analyzed_timeframe,
+                    "reasons": full_reasons,
+                },
+            )
+            await audit.log_event(
+                trade_id=trade_id,
+                trade_type=trade_mode,
+                event_type=audit.EVENT_PRODUCT_TYPE_DECISION,
+                symbol=symbol,
+                new_value={"product_type": product_type},
+                reason=routing_reason,
+                trigger_data=(routing_cmp or None),
+            )
+        except Exception as e:
+            logger.debug(f"Audit hook (TRADE_PLACED) failed: {e}")
 
         # Update cooldown tracking
         _last_trade_time_per_symbol[symbol] = datetime.now(IST)
@@ -941,24 +1697,41 @@ async def _place_auto_trade(
 # --- Heatmap Top 20 -----------------------------------------------------------
 
 async def _get_top20_stocks() -> list:
-    """Get top 10 gainers + top 10 losers from heatmap = 20 stocks max."""
-    gainers = heatmap_poller.get_top_gainers(10)
-    losers = heatmap_poller.get_top_losers(10)
+    """Get stocks for analysis - mix of movers with room to run.
+
+    Gap 3: scan a wider universe (top 20 gainers + top 20 losers) and then
+    filter out:
+      * Stocks that already ran >MAX_CHANGE_PCT% (likely exhausted their move)
+      * Stocks barely moving (<MIN_CHANGE_PCT%, no momentum)
+      * Illiquid names (below minimum traded volume)
+    """
+    gainers = heatmap_poller.get_top_gainers(20)
+    losers = heatmap_poller.get_top_losers(20)
     if not gainers and not losers:
         try:
             await heatmap_poller.poll_heatmap()
-            gainers = heatmap_poller.get_top_gainers(10)
-            losers = heatmap_poller.get_top_losers(10)
+            gainers = heatmap_poller.get_top_gainers(20)
+            losers = heatmap_poller.get_top_losers(20)
         except Exception as e:
             logger.warning(f"Heatmap poll failed: {e}")
+
+    MAX_CHANGE_PCT = 4.0   # Skip stocks that already moved too much
+    MIN_CHANGE_PCT = 0.3   # Skip stocks barely moving
+    MIN_VOLUME = 100000    # Minimum traded volume (liquidity filter)
 
     seen: set = set()
     top20: list = []
     for s in gainers + losers:
         sym = s["symbol"]
-        if sym not in seen and s.get("ltp", 0) > 0:
+        abs_change = abs(s.get("change_pct", 0))
+        if (sym not in seen
+                and s.get("ltp", 0) > 0
+                and MIN_CHANGE_PCT <= abs_change <= MAX_CHANGE_PCT
+                and s.get("volume", 0) >= MIN_VOLUME):
             seen.add(sym)
             top20.append(s)
+        if len(top20) >= 20:
+            break
     return top20
 
 
@@ -1038,7 +1811,23 @@ async def _scan_and_trade() -> int:
         _last_scan_time = datetime.now(IST)
         return 0
 
-    _add_log("SCAN_START", "", f"Scanning top {len(top20)} stocks (10 gainers + 10 losers)")
+    # v5: Fetch market regime once per scan cycle (cached ~90s) and pass it to
+    # every trade-placement call so we gate BUYs/SELLs consistently.
+    market_regime = await _detect_market_regime(force_refresh=True)
+    _add_log(
+        "REGIME", "",
+        f"Nifty {market_regime.get('nifty_change_pct', 0):+.2f}% "
+        f"({market_regime.get('regime', 'UNKNOWN')}); "
+        f"allow_buy={market_regime.get('allow_buy', True)}, "
+        f"allow_sell={market_regime.get('allow_sell', True)}",
+    )
+    _push_event("MARKET_REGIME", market_regime)
+
+    _add_log(
+        "SCAN_START", "",
+        f"Scanning {len(top20)} stocks "
+        f"(filtered from top 20 gainers + top 20 losers)",
+    )
 
     # v4: Use 15m timeframe for intraday analysis
     analyzed: list = []
@@ -1048,11 +1837,170 @@ async def _scan_and_trade() -> int:
             analyzed.append(result)
         await asyncio.sleep(0.3)
 
+    scan_cycle_start = datetime.now(IST)
+
+    # v5.1: compute effective thresholds once per cycle so the signal row can
+    # show "Score 42 < min 55" even when the user tweaked settings mid-session.
+    min_score = settings.get("min_score_for_trade", MIN_SCORE_FOR_TRADE)
+    min_confidence = settings.get("min_confidence_for_trade", MIN_CONFIDENCE_FOR_TRADE)
+    trade_mode_peek = str(settings.get("trade_mode") or "PAPER").upper()
+
+    # --- Slot / cap gates (apply to every analyzed tradeable signal) --------
+    open_count = await _get_open_trade_count()
+    slots_full = open_count >= MAX_ACTIVE_TRADES
+    slots = max(0, MAX_ACTIVE_TRADES - open_count)
+    if slots_full:
+        _add_log("LIMIT", "", f"Max active trades ({MAX_ACTIVE_TRADES}) reached")
+
+    # --- Pre-place rejection recording --------------------------------------
+    # The scan loop used to silently drop NEUTRAL / weak / low-conf signals,
+    # which meant the UI showed "BUY" rows with no explanation of why no trade
+    # was placed. Record an explicit rejection for every gate so the signals
+    # table can show the exact reason.
+    open_symbols: set = set()
+    try:
+        async with async_session_factory() as db:
+            rows = await db.execute(
+                text("SELECT symbol FROM paper_trades WHERE status = 'OPEN'")
+            )
+            open_symbols.update(r[0] for r in rows.fetchall())
+            rows = await db.execute(
+                text("SELECT symbol FROM live_trades WHERE status = 'OPEN'")
+            )
+            open_symbols.update(r[0] for r in rows.fetchall())
+    except Exception as ex:
+        logger.debug(f"Open-symbol precheck failed: {ex}")
+
+    tradeable: list = []
+    for item in analyzed:
+        sym = item["symbol"]
+        sd = item["signal_data"]
+        signal_type = sd.get("signal", "NEUTRAL")
+        score = sd.get("score", 0)
+        confidence = sd.get("confidence", 0)
+
+        if signal_type == "NEUTRAL":
+            _record_rejection(
+                "NEUTRAL_SIGNAL", sym, sd, trade_mode_peek,
+                "Signal is NEUTRAL — nothing to place",
+            )
+            continue
+        if abs(score) < min_score:
+            _record_rejection(
+                "WEAK_SIGNAL", sym, sd, trade_mode_peek,
+                f"Score {score:.1f} below minimum {min_score}",
+            )
+            continue
+        if confidence < min_confidence:
+            _record_rejection(
+                "LOW_CONFIDENCE", sym, sd, trade_mode_peek,
+                f"Confidence {confidence:.1f}% below minimum {min_confidence}%",
+            )
+            continue
+        if daily_cap_hit:
+            _record_rejection(
+                "DAILY_LIMIT", sym, sd, trade_mode_peek,
+                f"Daily trade cap reached ({trades_today}/{max_trades_day})",
+            )
+            continue
+        if sym in open_symbols:
+            _record_rejection(
+                "DUPLICATE_SYMBOL", sym, sd, trade_mode_peek,
+                "Already have an open trade on this symbol",
+            )
+            continue
+        if _is_on_cooldown(sym):
+            last_time = _last_trade_time_per_symbol.get(sym)
+            elapsed = int((datetime.now(IST) - last_time).total_seconds()) if last_time else 0
+            _record_rejection(
+                "COOLDOWN", sym, sd, trade_mode_peek,
+                f"Re-entry cooldown: {elapsed}s / {TRADE_COOLDOWN_SECS}s",
+            )
+            continue
+        if slots_full:
+            _record_rejection(
+                "OPEN_TRADES_FULL", sym, sd, trade_mode_peek,
+                f"Max {MAX_ACTIVE_TRADES} concurrent trades already open",
+            )
+            continue
+        tradeable.append(item)
+
+    tradeable.sort(key=lambda x: abs(x["signal_data"].get("score", 0)), reverse=True)
+
+    # Overflow beyond available slots — record so the user sees "strongest N
+    # placed, rest queued" instead of silent drops.
+    for pick in tradeable[slots:]:
+        _record_rejection(
+            "SLOT_FULL", pick["symbol"], pick["signal_data"], trade_mode_peek,
+            f"Only {slots} slot(s) free this cycle — stronger signals took priority",
+        )
+
+    placed = 0
+    placed_symbols: set = set()
+    for pick in tradeable[:slots]:
+        sym = pick["symbol"]
+        trade_id = await _place_auto_trade(
+            sym, pick["signal_data"], settings,
+            analysis_basis=pick.get("analysis_basis", "technical"),
+            analyzed_timeframe=pick.get("analyzed_timeframe", "15m"),
+            indicators=pick.get("indicators"),
+            fundamental=pick.get("fundamental"),
+            sentiment=pick.get("sentiment"),
+            market_regime=market_regime,
+        )
+        if trade_id:
+            placed += 1
+            placed_symbols.add(sym)
+            if placed >= slots:
+                break
+
+    # --- Build signals_list with per-row trade_status -----------------------
+    # Attach the most-recent in-cycle rejection to each analyzed signal so the
+    # UI can render "Blocked: <reason>" inline on the signals table.
+    rejections_by_symbol: Dict[str, dict] = {}
+    for rej in reversed(_rejected_signals[-REJECTED_SIGNALS_BUFFER:]):
+        sym = rej.get("symbol")
+        if not sym or sym in rejections_by_symbol:
+            continue
+        try:
+            rej_time = datetime.fromisoformat(rej["time"])
+        except Exception:
+            rej_time = None
+        # Only surface rejections recorded during this scan cycle.
+        if rej_time and rej_time >= scan_cycle_start - timedelta(seconds=1):
+            rejections_by_symbol[sym] = rej
+
     signals_list = []
     for item in analyzed:
+        sym = item["symbol"]
         sd = item["signal_data"]
+        rej = rejections_by_symbol.get(sym)
+        if sym in placed_symbols:
+            trade_status = "PLACED"
+            block_reason = None
+            block_details = None
+        elif sd.get("signal", "NEUTRAL") == "NEUTRAL":
+            # NEUTRAL takes precedence over the BLOCKED branch: every NEUTRAL
+            # signal also has a NEUTRAL_SIGNAL rejection recorded, but the UI
+            # treats "no directional signal" as a distinct status from
+            # "signal existed but a gate killed it".
+            trade_status = "NEUTRAL"
+            block_reason = None
+            block_details = None
+        elif rej:
+            trade_status = "BLOCKED"
+            block_reason = rej.get("reason")
+            block_details = rej.get("details")
+        else:
+            # Made it past every recorded gate but no trade_id returned — the
+            # placement attempt hit a broker-level error without recording a
+            # rejection row. Surface as UNKNOWN so we never lie about "placed".
+            trade_status = "PENDING"
+            block_reason = None
+            block_details = None
+
         signals_list.append({
-            "symbol": item["symbol"],
+            "symbol": sym,
             "ltp": item["ltp"],
             "change_pct": item.get("change_pct", 0),
             "signal": sd.get("signal", "NEUTRAL"),
@@ -1064,43 +2012,16 @@ async def _scan_and_trade() -> int:
             "reasons": sd.get("reasons", []),
             "analysis_basis": item.get("analysis_basis", "unknown"),
             "analyzed_timeframe": item.get("analyzed_timeframe", "15m"),
+            # v5.1: per-row trade outcome so the UI can show an "Analysis"
+            # column explaining exactly why a BUY/SELL wasn't placed.
+            "trade_status": trade_status,
+            "block_reason": block_reason,
+            "block_details": block_details,
         })
 
     signals_list.sort(key=lambda x: abs(x.get("score", 0)), reverse=True)
     _last_signals = signals_list
     _push_event("SIGNALS_UPDATED", {"count": len(signals_list)})
-
-    open_count = await _get_open_trade_count()
-    if open_count >= MAX_ACTIVE_TRADES:
-        _add_log("LIMIT", "", f"Max active trades ({MAX_ACTIVE_TRADES}) reached")
-        _last_scan_time = datetime.now(IST)
-        return 0
-
-    slots = MAX_ACTIVE_TRADES - open_count
-    tradeable = [
-        a for a in analyzed
-        if a["signal_data"].get("signal", "NEUTRAL") != "NEUTRAL"
-        and abs(a["signal_data"].get("score", 0)) >= MIN_SCORE_FOR_TRADE
-        and a["signal_data"].get("confidence", 0) >= MIN_CONFIDENCE_FOR_TRADE
-    ]
-    tradeable.sort(key=lambda x: abs(x["signal_data"].get("score", 0)), reverse=True)
-
-    placed = 0
-    for pick in tradeable[:slots]:
-        sym = pick["symbol"]
-        if await _has_open_trade_for_symbol(sym):
-            continue
-        if _is_on_cooldown(sym):
-            continue
-        trade_id = await _place_auto_trade(
-            sym, pick["signal_data"], settings,
-            analysis_basis=pick.get("analysis_basis", "technical"),
-            analyzed_timeframe=pick.get("analyzed_timeframe", "15m")
-        )
-        if trade_id:
-            placed += 1
-            if placed >= slots:
-                break
 
     _last_scan_time = datetime.now(IST)
     _add_log("SCAN_COMPLETE", "",
@@ -1122,7 +2043,8 @@ async def _monitor_open_trades(settings: dict) -> int:
     async with async_session_factory() as db:
         result = await db.execute(text(
             "SELECT id, symbol, side, entry_price, quantity, stop_loss, target, "
-            "entry_time, indicators_snapshot "
+            "entry_time, indicators_snapshot, "
+            "COALESCE(product_type, 'INTRADAY') AS product_type "
             "FROM paper_trades WHERE status = 'OPEN'"
         ))
         open_trades = result.fetchall()
@@ -1151,6 +2073,7 @@ async def _monitor_open_trades(settings: dict) -> int:
         _last_reanalysis_time = now
 
     closed_count = 0
+    now_minute = _ist_minute_of_day(now)
     for trade in open_trades:
         trade_id = trade[0]
         symbol = trade[1]
@@ -1160,6 +2083,7 @@ async def _monitor_open_trades(settings: dict) -> int:
         stop_loss = float(trade[5]) if trade[5] else None
         target = float(trade[6]) if trade[6] else None
         entry_time = trade[7]
+        product_type = (trade[9] or "INTRADAY").upper() if len(trade) > 9 else "INTRADAY"
 
         price_data = all_prices.get(symbol)
         if not price_data:
@@ -1169,6 +2093,41 @@ async def _monitor_open_trades(settings: dict) -> int:
         if ltp <= 0:
             continue
 
+        # --- Gap 6: MFE/MAE Tracking ---
+        # Update highest/lowest observed price and max run-up / max drawdown
+        # so the trade journal can show how much of the move was captured.
+        # Use SQL GREATEST/LEAST to stay race-free across the monitor loop.
+        try:
+            if side == "BUY":
+                runup_pct = (ltp - entry_price) / entry_price * 100 if entry_price else 0
+                drawdown_pct = (
+                    (entry_price - ltp) / entry_price * 100
+                    if entry_price and ltp < entry_price else 0
+                )
+            else:
+                runup_pct = (entry_price - ltp) / entry_price * 100 if entry_price else 0
+                drawdown_pct = (
+                    (ltp - entry_price) / entry_price * 100
+                    if entry_price and ltp > entry_price else 0
+                )
+            async with async_session_factory() as db:
+                await db.execute(text(
+                    "UPDATE paper_trades SET "
+                    "highest_price = GREATEST(COALESCE(highest_price, 0), :ltp), "
+                    "lowest_price = LEAST(COALESCE(lowest_price, 999999), :ltp), "
+                    "max_runup = GREATEST(COALESCE(max_runup, 0), :runup), "
+                    "max_drawdown = GREATEST(COALESCE(max_drawdown, 0), :drawdown) "
+                    "WHERE id = :id AND status = 'OPEN'"
+                ), {
+                    "ltp": ltp,
+                    "runup": round(runup_pct, 2),
+                    "drawdown": round(drawdown_pct, 2),
+                    "id": trade_id,
+                })
+                await db.commit()
+        except Exception as e:
+            logger.debug(f"MFE/MAE update failed for trade #{trade_id}: {e}")
+
         # --- Trailing Profit Protection ---
         if target and stop_loss:
             if side == "BUY":
@@ -1177,6 +2136,7 @@ async def _monitor_open_trades(settings: dict) -> int:
                     new_target = round(ltp * (1 + TRAILING_PROFIT_STEP_PCT / 100), 2)
                     if new_target > target:
                         old_target = target
+                        old_sl = stop_loss
                         target = new_target
                         new_sl = round(max(stop_loss, entry_price * (1 + TRAILING_PROFIT_TRIGGER_PCT / 200)), 2)
                         if new_sl > stop_loss:
@@ -1198,6 +2158,18 @@ async def _monitor_open_trades(settings: dict) -> int:
                             "reason": "trailing_profit",
                             "profit_pct": round(profit_pct, 2),
                         })
+                        try:
+                            await audit.log_event(
+                                trade_id=trade_id, trade_type="PAPER",
+                                event_type=audit.EVENT_TRAILING_PROFIT,
+                                symbol=symbol,
+                                old_value={"target": old_target, "stop_loss": old_sl},
+                                new_value={"target": target, "stop_loss": stop_loss},
+                                reason=f"Trailing profit triggered at {profit_pct:.2f}% profit",
+                                trigger_data={"ltp": ltp, "profit_pct": round(profit_pct, 2)},
+                            )
+                        except Exception:
+                            pass
 
             elif side == "SELL":
                 profit_pct = (entry_price - ltp) / entry_price * 100
@@ -1205,6 +2177,7 @@ async def _monitor_open_trades(settings: dict) -> int:
                     new_target = round(ltp * (1 - TRAILING_PROFIT_STEP_PCT / 100), 2)
                     if new_target < target:
                         old_target = target
+                        old_sl = stop_loss
                         target = new_target
                         new_sl = round(min(stop_loss, entry_price * (1 - TRAILING_PROFIT_TRIGGER_PCT / 200)), 2)
                         if new_sl < stop_loss:
@@ -1226,6 +2199,18 @@ async def _monitor_open_trades(settings: dict) -> int:
                             "reason": "trailing_profit",
                             "profit_pct": round(profit_pct, 2),
                         })
+                        try:
+                            await audit.log_event(
+                                trade_id=trade_id, trade_type="PAPER",
+                                event_type=audit.EVENT_TRAILING_PROFIT,
+                                symbol=symbol,
+                                old_value={"target": old_target, "stop_loss": old_sl},
+                                new_value={"target": target, "stop_loss": stop_loss},
+                                reason=f"Trailing profit triggered at {profit_pct:.2f}% profit",
+                                trigger_data={"ltp": ltp, "profit_pct": round(profit_pct, 2)},
+                            )
+                        except Exception:
+                            pass
 
         # --- Re-Analysis ---
         if do_reanalysis and entry_time:
@@ -1244,12 +2229,116 @@ async def _monitor_open_trades(settings: dict) -> int:
                     elif side == "SELL" and "BUY" in new_signal.upper():
                         is_reversal = True
 
+                    # Gap 9: on a *strong* reversal (|score| >= 40) close the
+                    # trade immediately at market instead of just tightening
+                    # the stop — waiting for the SL to get hit gives back more
+                    # of the move than the reversal score justifies.
+                    if is_reversal and abs(new_score) >= 40:
+                        try:
+                            if side == "BUY":
+                                pnl_pct = (ltp - entry_price) / entry_price * 100 if entry_price else 0
+                                pnl_amount = (ltp - entry_price) * quantity
+                                buy_leg = entry_price
+                                sell_leg = ltp
+                            else:
+                                pnl_pct = (entry_price - ltp) / entry_price * 100 if entry_price else 0
+                                pnl_amount = (entry_price - ltp) * quantity
+                                buy_leg = ltp
+                                sell_leg = entry_price
+
+                            if pnl_pct > 0:
+                                result_str = "WIN"
+                            elif pnl_pct < 0:
+                                result_str = "LOSS"
+                            else:
+                                result_str = "BREAKEVEN"
+
+                            # Mirror the SL/target close path: persist Fyers
+                            # charges so net_pnl / gross_pnl / brokerage columns
+                            # aren't NULL for reversal-exit trades.
+                            buy_value = buy_leg * quantity
+                            sell_value = sell_leg * quantity
+                            charges = calc_brokerage(
+                                buy_value, sell_value, quantity,
+                                product_type=product_type,
+                            )
+                            total_charges = float(charges["total_charges"])
+                            net_pnl = round(float(pnl_amount) - total_charges, 2)
+
+                            async with async_session_factory() as db:
+                                await db.execute(text(
+                                    "UPDATE paper_trades SET "
+                                    "exit_price = :exit_price, exit_time = :exit_time, "
+                                    "status = 'CLOSED', result = :result, "
+                                    "pnl_percent = :pnl_pct, pnl_amount = :pnl_amount, "
+                                    "exit_reason = :exit_reason, "
+                                    "brokerage = :brokerage, stt = :stt, "
+                                    "exchange_charges = :exchange, gst = :gst, "
+                                    "sebi_charges = :sebi, stamp_duty = :stamp, "
+                                    "gross_pnl = :gross_pnl, net_pnl = :net_pnl "
+                                    "WHERE id = :id AND status = 'OPEN'"
+                                ), {
+                                    "exit_price": round(ltp, 2),
+                                    "exit_time": datetime.now(IST).replace(tzinfo=None),
+                                    "result": result_str,
+                                    "pnl_pct": round(pnl_pct, 2),
+                                    "pnl_amount": round(pnl_amount, 2),
+                                    "exit_reason": "STRONG_REVERSAL_EXIT",
+                                    "brokerage": float(charges["brokerage"]),
+                                    "stt": float(charges["stt"]),
+                                    "exchange": float(charges["exchange_charges"]),
+                                    "gst": float(charges["gst"]),
+                                    "sebi": float(charges["sebi_charges"]),
+                                    "stamp": float(charges["stamp_duty"]),
+                                    "gross_pnl": round(float(pnl_amount), 2),
+                                    "net_pnl": net_pnl,
+                                    "id": trade_id,
+                                })
+                                await db.commit()
+
+                            closed_count += 1
+                            _add_log(
+                                "REVERSAL_CLOSE", symbol,
+                                f"Trade #{trade_id}: Strong reversal ({new_signal}, "
+                                f"score={new_score}). Closed at {ltp}, "
+                                f"P&L={pnl_amount:+.2f} net=\u20b9{net_pnl:+.2f} "
+                                f"charges=\u20b9{total_charges:.2f}",
+                            )
+                            _push_event("TRADE_CLOSED", {
+                                "trade_id": trade_id,
+                                "symbol": symbol,
+                                "side": side,
+                                "exit_price": round(ltp, 2),
+                                "exit_reason": "STRONG_REVERSAL_EXIT",
+                                "pnl_amount": round(pnl_amount, 2),
+                                "gross_pnl": round(float(pnl_amount), 2),
+                                "net_pnl": net_pnl,
+                                "total_charges": round(total_charges, 2),
+                                "pnl_pct": round(pnl_pct, 2),
+                                "result": result_str,
+                            })
+                            continue  # Skip remaining handling for this trade
+                        except Exception as e:
+                            logger.error(
+                                f"Strong reversal close failed for trade "
+                                f"#{trade_id}: {e}"
+                            )
+                            # Fall through to the moderate-reversal branch
+                            # below so we at least tighten the SL; otherwise a
+                            # failed close on a strong reversal would leave the
+                            # original wide stop in place until the next cycle.
+
+                    # Use a standalone `if` (not `elif`) here so that if the
+                    # strong-reversal close above raised and was swallowed,
+                    # we still run the moderate-reversal SL tightening as a
+                    # protective fallback.
                     if is_reversal and abs(new_score) >= 20:
                         if side == "BUY":
                             tighter_sl = round(ltp * 0.998, 2)
                         else:
                             tighter_sl = round(ltp * 1.002, 2)
 
+                        old_sl_for_audit = stop_loss
                         async with async_session_factory() as db:
                             await db.execute(text(
                                 "UPDATE paper_trades SET stop_loss = :stop_loss "
@@ -1266,6 +2355,25 @@ async def _monitor_open_trades(settings: dict) -> int:
                             "reason": "trend_reversal",
                             "new_signal": new_signal, "new_score": new_score,
                         })
+                        try:
+                            await audit.log_event(
+                                trade_id=trade_id, trade_type="PAPER",
+                                event_type=audit.EVENT_TREND_REVERSAL,
+                                symbol=symbol,
+                                old_value={"stop_loss": old_sl_for_audit},
+                                new_value={"stop_loss": tighter_sl},
+                                reason=(
+                                    f"Trend reversal detected (new signal: {new_signal}, "
+                                    f"score: {new_score}); SL tightened to lock in runner."
+                                ),
+                                trigger_data={
+                                    "new_signal": new_signal,
+                                    "new_score": new_score,
+                                    "ltp": ltp,
+                                },
+                            )
+                        except Exception:
+                            pass
                         stop_loss = tighter_sl
 
                     elif not is_reversal and new_sl and new_tgt:
@@ -1286,6 +2394,8 @@ async def _monitor_open_trades(settings: dict) -> int:
                                 updated = True
 
                         if updated:
+                            prev_sl = float(trade[5]) if trade[5] else None
+                            prev_tgt = float(trade[6]) if trade[6] else None
                             async with async_session_factory() as db:
                                 await db.execute(text(
                                     "UPDATE paper_trades SET stop_loss = :stop_loss, target = :target "
@@ -1300,6 +2410,22 @@ async def _monitor_open_trades(settings: dict) -> int:
                                 "new_stop_loss": stop_loss, "new_target": target,
                                 "reason": "reanalysis_update",
                             })
+                            try:
+                                await audit.log_event(
+                                    trade_id=trade_id, trade_type="PAPER",
+                                    event_type=audit.EVENT_REANALYSIS,
+                                    symbol=symbol,
+                                    old_value={"stop_loss": prev_sl, "target": prev_tgt},
+                                    new_value={"stop_loss": stop_loss, "target": target},
+                                    reason="Re-analysis updated SL/target based on new 15m data",
+                                    trigger_data={
+                                        "new_signal": new_signal,
+                                        "new_score": new_score,
+                                        "ltp": ltp,
+                                    },
+                                )
+                            except Exception:
+                                pass
             except Exception as e:
                 logger.debug(f"Re-analysis failed for trade #{trade_id} ({symbol}): {e}")
 
@@ -1307,7 +2433,13 @@ async def _monitor_open_trades(settings: dict) -> int:
         exit_reason = None
         exit_price = ltp
 
-        if side == "BUY":
+        # F6: 15:15 IST intraday auto-square-off. Runs before the SL/target
+        # check so even an unreached-target MIS position is closed out in
+        # time and doesn't incur Fyers' auto-cut charges.
+        if product_type == "INTRADAY" and now_minute >= INTRADAY_SQUARE_OFF_TIME:
+            exit_reason = "INTRADAY_SQUARE_OFF"
+            exit_price = ltp
+        elif side == "BUY":
             if stop_loss and ltp <= stop_loss:
                 exit_reason = "AUTO_SL_HIT"
                 exit_price = stop_loss
@@ -1327,11 +2459,23 @@ async def _monitor_open_trades(settings: dict) -> int:
                 if side == "BUY":
                     pnl_pct = (exit_price - entry_price) / entry_price * 100
                     pnl_amount = (exit_price - entry_price) * quantity
+                    buy_leg = entry_price
+                    sell_leg = exit_price
                 else:
                     pnl_pct = (entry_price - exit_price) / entry_price * 100
                     pnl_amount = (entry_price - exit_price) * quantity
+                    buy_leg = exit_price
+                    sell_leg = entry_price
 
                 result_str = "WIN" if pnl_pct > 0 else ("LOSS" if pnl_pct < 0 else "BREAKEVEN")
+
+                # F3: compute Fyers charges using the trade's product_type.
+                # calc_brokerage expects total leg values (price * qty), not per-share.
+                buy_value = buy_leg * quantity
+                sell_value = sell_leg * quantity
+                charges = calc_brokerage(buy_value, sell_value, quantity, product_type=product_type)
+                total_charges = float(charges["total_charges"])
+                net_pnl = round(float(pnl_amount) - total_charges, 2)
 
                 async with async_session_factory() as db:
                     await db.execute(text(
@@ -1339,7 +2483,11 @@ async def _monitor_open_trades(settings: dict) -> int:
                         "exit_price = :exit_price, exit_time = :exit_time, "
                         "status = 'CLOSED', result = :result, "
                         "pnl_percent = :pnl_pct, pnl_amount = :pnl_amount, "
-                        "exit_reason = :exit_reason "
+                        "exit_reason = :exit_reason, "
+                        "brokerage = :brokerage, stt = :stt, "
+                        "exchange_charges = :exchange, gst = :gst, "
+                        "sebi_charges = :sebi, stamp_duty = :stamp, "
+                        "gross_pnl = :gross_pnl, net_pnl = :net_pnl "
                         "WHERE id = :id AND status = 'OPEN'"
                     ), {
                         "exit_price": round(exit_price, 2),
@@ -1348,6 +2496,14 @@ async def _monitor_open_trades(settings: dict) -> int:
                         "pnl_pct": round(pnl_pct, 2),
                         "pnl_amount": round(pnl_amount, 2),
                         "exit_reason": exit_reason,
+                        "brokerage": float(charges["brokerage"]),
+                        "stt": float(charges["stt"]),
+                        "exchange": float(charges["exchange_charges"]),
+                        "gst": float(charges["gst"]),
+                        "sebi": float(charges["sebi_charges"]),
+                        "stamp": float(charges["stamp_duty"]),
+                        "gross_pnl": round(float(pnl_amount), 2),
+                        "net_pnl": net_pnl,
                         "id": trade_id,
                     })
                     await db.commit()
@@ -1355,9 +2511,10 @@ async def _monitor_open_trades(settings: dict) -> int:
                 closed_count += 1
                 _add_log("AUTO_CLOSE", symbol,
                          f"Trade #{trade_id}: {exit_reason}, Exit={exit_price}, "
-                         f"P&L={pnl_amount:+.2f} ({pnl_pct:+.2f}%)")
+                         f"P&L={pnl_amount:+.2f} ({pnl_pct:+.2f}%) "
+                         f"net=\u20b9{net_pnl:+.2f} charges=\u20b9{total_charges:.2f}")
                 logger.info(f"Auto-closed trade #{trade_id}: {exit_reason} @ {exit_price}, "
-                             f"P&L={pnl_amount:+.2f}")
+                             f"P&L={pnl_amount:+.2f}, net=\u20b9{net_pnl:+.2f}")
 
                 _push_event("TRADE_CLOSED", {
                     "trade_id": trade_id,
@@ -1366,9 +2523,40 @@ async def _monitor_open_trades(settings: dict) -> int:
                     "exit_price": round(exit_price, 2),
                     "exit_reason": exit_reason,
                     "pnl_amount": round(pnl_amount, 2),
+                    "gross_pnl": round(float(pnl_amount), 2),
+                    "net_pnl": net_pnl,
+                    "total_charges": round(total_charges, 2),
                     "pnl_pct": round(pnl_pct, 2),
                     "result": result_str,
                 })
+
+                try:
+                    close_event = (
+                        audit.EVENT_INTRADAY_SQUARE_OFF
+                        if exit_reason == "INTRADAY_SQUARE_OFF"
+                        else audit.EVENT_TRADE_CLOSED
+                    )
+                    await audit.log_event(
+                        trade_id=trade_id, trade_type="PAPER",
+                        event_type=close_event,
+                        symbol=symbol,
+                        old_value={"status": "OPEN"},
+                        new_value={
+                            "status": "CLOSED",
+                            "exit_price": round(exit_price, 2),
+                            "result": result_str,
+                            "gross_pnl": round(float(pnl_amount), 2),
+                            "net_pnl": net_pnl,
+                        },
+                        reason=exit_reason,
+                        trigger_data={
+                            "charges": charges,
+                            "product_type": product_type,
+                            "ltp": ltp,
+                        },
+                    )
+                except Exception:
+                    pass
 
             except Exception as e:
                 logger.error(f"Auto-close error for trade #{trade_id}: {e}")
@@ -1404,7 +2592,8 @@ async def _monitor_live_open_trades() -> int:
     async with async_session_factory() as db:
         result = await db.execute(text(
             "SELECT id, trade_ref, symbol, direction, entry_price, quantity, "
-            "       stop_loss, target_price, entry_time "
+            "       stop_loss, target_price, entry_time, filled_quantity, "
+            "       avg_fill_price, product_type "
             "FROM live_trades WHERE status = 'OPEN'"
         ))
         open_trades = result.fetchall()
@@ -1430,11 +2619,18 @@ async def _monitor_live_open_trades() -> int:
         trade_ref = row[1]
         symbol = row[2]
         direction = row[3]  # LONG / SHORT
-        entry_price = float(row[4])
-        quantity = int(row[5] or 0)
+        # Exit P&L / order qty must use the actual filled entry state,
+        # not the row's original request. ``entry_price`` and ``quantity``
+        # columns are rewritten to reflect the fill at create time, so
+        # they're safe; but we prefer the explicit columns when present
+        # (older rows won't have them).
+        entry_price = float(row[10]) if row[10] is not None else float(row[4])
+        filled_qty = int(row[9]) if row[9] is not None else int(row[5] or 0)
+        quantity = filled_qty if filled_qty > 0 else int(row[5] or 0)
         stop_loss = float(row[6]) if row[6] is not None else None
         target_price = float(row[7]) if row[7] is not None else None
         entry_time = row[8]
+        product_type = str(row[11] or "INTRADAY").upper()
 
         price_data = prices.get(symbol) or {}
         ltp = float(price_data.get("ltp", 0) or 0)
@@ -1457,15 +2653,29 @@ async def _monitor_live_open_trades() -> int:
         if not exit_reason:
             continue
 
+        if quantity <= 0:
+            # Defensive: nothing actually filled on entry. Just flip to
+            # CLOSED locally; no exit order to place.
+            async with async_session_factory() as db:
+                await db.execute(text(
+                    "UPDATE live_trades SET status='CLOSED', "
+                    "exit_time=:t, exit_reason='NO_FILL' WHERE id=:id"
+                ), {"id": trade_id, "t": datetime.now(IST).replace(tzinfo=None)})
+                await db.commit()
+            continue
+
         exit_side = -1 if direction == "LONG" else 1
         exit_resp = await fyers_client.place_order_async(
             symbol=symbol,
             side=exit_side,
             qty=quantity,
             order_type=2,  # MARKET
-            product_type="INTRADAY",
+            product_type=product_type,
         )
-        logger.info(f"Fyers auto exit response for {trade_ref or trade_id}: {exit_resp}")
+        logger.info(
+            f"Fyers auto exit response for {trade_ref or trade_id} "
+            f"(qty={quantity}, product={product_type}): {exit_resp}"
+        )
         if not exit_resp or exit_resp.get("s") != "ok":
             err = exit_resp.get("message", "Unknown") if exit_resp else "No response"
             _add_log("LIVE_EXIT_FAILED", symbol,
@@ -1473,6 +2683,20 @@ async def _monitor_live_open_trades() -> int:
             continue
 
         fyers_exit_id = exit_resp.get("id", "") or ""
+
+        # Reconcile the exit order so P&L uses the real fill price /
+        # quantity (may be partial if liquidity was thin).
+        exit_fill = await fyers_client.reconcile_order_async(
+            fyers_exit_id, timeout_seconds=10.0, poll_interval_seconds=0.5
+        )
+        # Use the actual broker fill price for any status that actually
+        # executed shares — FILLED *or* PARTIAL. get_order_by_id returns a
+        # valid avg_price for both, and the entry path already treats them
+        # the same way, so keep P&L math consistent.
+        if exit_fill.get("status") in ("FILLED", "PARTIAL") and exit_fill.get("avg_price"):
+            exit_price = float(exit_fill["avg_price"])
+        if exit_fill.get("filled_qty"):
+            quantity = int(exit_fill["filled_qty"])
 
         if direction == "LONG":
             gross_pnl = (exit_price - entry_price) * quantity

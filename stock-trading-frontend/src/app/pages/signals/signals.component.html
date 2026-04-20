@@ -66,12 +66,19 @@
     <div class="signals-table" *ngIf="filteredSignals.length > 0">
       <table>
         <thead>
-          <tr><th>Symbol</th><th>Signal</th><th>Change%</th><th>Confidence</th><th>Score</th><th>LTP</th><th>SL</th><th>Target</th><th>Time</th><th>Action</th></tr>
+          <tr><th>Symbol</th><th>Signal</th><th>Analysis</th><th>Change%</th><th>Confidence</th><th>Score</th><th>LTP</th><th>SL</th><th>Target</th><th>Time</th><th>Action</th></tr>
         </thead>
         <tbody>
           <tr *ngFor="let s of filteredSignals" [class.highlight-buy]="(s.signal || '').includes('BUY')" [class.highlight-sell]="(s.signal || '').includes('SELL')">
             <td class="sym-cell">{{ s.name || s.symbol }}</td>
             <td><span class="signal-badge" [ngClass]="getSignalClass(s.signal || s.signal_type)">{{ s.signal || s.signal_type }}</span></td>
+            <td class="analysis-cell">
+              <span class="status-chip" [ngClass]="statusChipClass(s)"
+                    [title]="s.block_details || s.block_reason || statusLabel(s)">
+                {{ statusLabel(s) }}
+              </span>
+              <div class="status-details" *ngIf="s.block_details">{{ s.block_details }}</div>
+            </td>
             <td [ngClass]="{'positive': (s.change_pct || 0) > 0, 'negative': (s.change_pct || 0) < 0}">{{ s.change_pct | number:'1.2-2' }}%</td>
             <td>
               <div class="conf-mini-bar">
@@ -93,6 +100,87 @@
     <div class="no-data" *ngIf="filteredSignals.length === 0">
       <p>No {{filterType !== 'ALL' ? filterType + ' ' : ''}}signals found.</p>
       <p *ngIf="!scannerStatus?.scanner_running">Start the scanner to generate new signals.</p>
+    </div>
+  </div>
+
+  <!-- BLOCKED SIGNALS PANEL -->
+  <div class="glass-card rejected-panel" *ngIf="rejected.length > 0">
+    <div class="rejected-header">
+      <div class="rejected-title">
+        <span class="rejected-icon">&#9888;</span>
+        Blocked signals
+        <span class="rejected-count">{{ rejected.length }}</span>
+      </div>
+      <button class="rejected-toggle" (click)="showRejected = !showRejected">
+        {{ showRejected ? 'Hide' : 'Show' }}
+      </button>
+    </div>
+    <div class="rejected-sub" *ngIf="showRejected">
+      Signals the engine analysed but did <strong>not</strong> place, and the exact reason.
+    </div>
+    <div class="rejected-filters" *ngIf="showRejected && rejectedReasons.length > 1">
+      <button class="reject-chip" [class.active]="rejectedFilter === 'ALL'"
+              (click)="setRejectedFilter('ALL')">All</button>
+      <button *ngFor="let r of rejectedReasons"
+              class="reject-chip" [class.active]="rejectedFilter === r"
+              [ngClass]="rejectionChipClass(r)"
+              (click)="setRejectedFilter(r)">
+        {{ rejectionLabel(r) }}
+      </button>
+    </div>
+    <div class="rejected-table" *ngIf="showRejected">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Reason</th>
+            <th>Signal</th>
+            <th>Mode</th>
+            <th>Details</th>
+            <th>Time</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let r of filteredRejected">
+            <td class="sym-cell">{{ r.symbol }}</td>
+            <td>
+              <span class="reject-badge" [ngClass]="rejectionChipClass(r.reason)">
+                {{ rejectionLabel(r.reason) }}
+              </span>
+            </td>
+            <td>
+              <span class="signal-badge" [ngClass]="getSignalClass(r.signal)">
+                {{ r.signal || '—' }}
+              </span>
+              <span class="mini-score" *ngIf="r.score !== undefined && r.score !== null">
+                ({{ r.score | number:'1.0-1' }})
+              </span>
+            </td>
+            <td>
+              <span class="mode-tag" [class.mode-live]="r.trade_mode === 'LIVE'">
+                {{ r.trade_mode || '—' }}
+              </span>
+            </td>
+            <td class="reject-details">
+              <div>{{ r.details }}</div>
+              <div class="reject-extra" *ngIf="r.reason === 'BROKERAGE_FILTER' && r.extra">
+                Gross &#8377;{{ r.extra.gross_profit | number:'1.2-2' }} − charges
+                &#8377;{{ r.extra.total_charges | number:'1.2-2' }} =
+                <strong [class.negative]="r.extra.net_profit < r.extra.min_net_profit"
+                        [class.positive]="r.extra.net_profit >= r.extra.min_net_profit">
+                  &#8377;{{ r.extra.net_profit | number:'1.2-2' }}
+                </strong>
+                (need &#8805; &#8377;{{ r.extra.min_net_profit | number:'1.0-0' }} at qty={{ r.extra.qty }})
+              </div>
+              <div class="reject-extra" *ngIf="r.reason === 'CAPITAL_LIMIT' && r.extra">
+                Available &#8377;{{ r.extra.available_margin | number:'1.2-2' }}
+                <span *ngIf="r.extra.required"> / needed &#8377;{{ r.extra.required | number:'1.2-2' }}</span>
+              </div>
+            </td>
+            <td class="time-cell">{{ r.time | date:'HH:mm:ss' }}</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
   </div>
 </div>

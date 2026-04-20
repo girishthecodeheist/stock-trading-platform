@@ -15,6 +15,7 @@ from app.brokerage_calc import (
     is_trade_profitable_after_brokerage,
     min_qty_for_net_profit,
 )
+from app import auto_trade_engine
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/settings", tags=["Settings"])
@@ -40,6 +41,7 @@ class SettingsUpdate(BaseModel):
     max_trades_per_day: Optional[int] = None
     min_net_profit_per_trade: Optional[float] = None
     min_profit_to_cost_ratio: Optional[float] = None
+    product_type: Optional[str] = None  # INTRADAY | CNC
 
 
 @router.get("")
@@ -58,6 +60,15 @@ async def update_settings(body: SettingsUpdate, db: AsyncSession = Depends(get_d
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
         return {"success": False, "error": "No fields to update"}
+
+    if "product_type" in updates:
+        pt = str(updates["product_type"]).upper()
+        if pt not in ("INTRADAY", "CNC"):
+            return {
+                "success": False,
+                "error": "product_type must be 'INTRADAY' or 'CNC'",
+            }
+        updates["product_type"] = pt
 
     set_clauses = ", ".join(f"{k} = :{k}" for k in updates)
     updates["now"] = datetime.utcnow()
@@ -101,12 +112,21 @@ async def calculate_quantity(
     settings = dict(row)
     sl_pct = sl_percent if sl_percent is not None else settings["default_sl_percent"]
     tgt_pct = target_percent if target_percent is not None else settings["default_target_percent"]
-    capital = settings["simulated_capital"]
 
-    if mode.upper() == "LIVE":
+    mode_up = (mode or "PAPER").upper()
+    if mode_up == "LIVE":
+        # Use actual Fyers available balance (equityAmount from funds API),
+        # NOT simulated_capital. Previously the LIVE quick-trade modal was
+        # sizing off \u20b9100k "paper capital" and showing qty=33 on a \u20b95k
+        # Fyers account.
+        live_margin = await auto_trade_engine._get_live_available_margin()
+        capital = float(live_margin or 0)
+        capital_source = "live_broker"
         max_loss = abs(settings["day_max_loss_live"])
         profit_target = settings["day_profit_target_live"]
     else:
+        capital = float(settings["simulated_capital"] or 0)
+        capital_source = "simulated"
         max_loss = abs(settings["day_max_loss_paper"])
         profit_target = settings["day_profit_target_paper"]
 
@@ -130,8 +150,8 @@ async def calculate_quantity(
 
     # Brokerage-aware quantity floor: respect the user's configured net-profit
     # minimum (clamped by the loss/capital caps above).
-    min_net = float(settings.get("min_net_profit_per_trade") or 100.0)
-    min_ratio = float(settings.get("min_profit_to_cost_ratio") or 2.0)
+    min_net = float(settings.get("min_net_profit_per_trade") or 1.0)
+    min_ratio = float(settings.get("min_profit_to_cost_ratio") or 1.0)
     cap_qty = int(math.floor(min(qty_from_loss, qty_from_capital))) or optimal_qty
     target_price = entry_price * (1 + tgt_pct / 100.0)
     min_qty_net = min_qty_for_net_profit(
@@ -162,6 +182,8 @@ async def calculate_quantity(
         "max_loss_limit": max_loss,
         "profit_target": profit_target,
         "capital": capital,
+        "capital_source": capital_source,
+        "mode": mode_up,
         "breakdown": {
             "qty_from_loss_limit": int(math.floor(qty_from_loss)),
             "qty_from_profit_target": int(math.floor(qty_from_profit)),
@@ -200,8 +222,8 @@ async def brokerage_preview(
         "FROM trading_settings WHERE id=1"
     ))
     row = result.mappings().first()
-    min_net = float((row or {}).get("min_net_profit_per_trade") or 100.0)
-    min_ratio = float((row or {}).get("min_profit_to_cost_ratio") or 2.0)
+    min_net = float((row or {}).get("min_net_profit_per_trade") or 1.0)
+    min_ratio = float((row or {}).get("min_profit_to_cost_ratio") or 1.0)
 
     verdict = is_trade_profitable_after_brokerage(
         entry_price, target_price, qty,
