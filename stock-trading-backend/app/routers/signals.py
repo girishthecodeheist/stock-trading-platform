@@ -16,6 +16,7 @@ from app.fundamental_engine import get_fundamental_data
 from app.indicator_engine import compute_all_indicators
 from app.news_engine import get_news_sentiment
 from app.signal_engine import generate_signal
+from app.auto_trade_engine import _get_settings as _get_trading_settings
 
 logger = logging.getLogger(__name__)
 
@@ -120,11 +121,15 @@ async def analyze_symbol(
         sentiment = await _safe_fetch_sentiment(symbol)
 
     # Generate unified signal (technical + fundamental + sentiment).
+    # Honour the user's Indicators Control toggles so the /analyze screen
+    # score matches what the auto-trader sees on the next scan.
+    _settings_peek = await _get_trading_settings() or {}
     signal = generate_signal(
         indicators,
         fundamental=fundamental,
         sentiment=sentiment,
         instrument_type=instrument_type,
+        disabled_indicators=_settings_peek.get("disabled_indicators") or [],
     )
 
     # Save signal to database if significant
@@ -321,6 +326,10 @@ async def dashboard_scan(
         for sym, val in zip(scan_symbols, sentiment_results)
     }
 
+    # Honour per-user Indicators Control toggles on the dashboard scan too,
+    # so what the user sees here agrees with the auto-trader.
+    _dashboard_settings = await _get_trading_settings() or {}
+
     scan_results = []
     for stock in stocks[:limit]:
         symbol = stock["symbol"]
@@ -353,6 +362,7 @@ async def dashboard_scan(
                         fundamental=fundamental,
                         sentiment=sentiment,
                         instrument_type="EQUITY",
+                        disabled_indicators=_dashboard_settings.get("disabled_indicators") or [],
                     )
             except Exception:
                 pass

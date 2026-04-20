@@ -245,6 +245,16 @@ class TradingSettings(Base):
     # old 100 / 2.0 defaults. Prevents the migration from re-overwriting a
     # user who later explicitly chooses 100 / 2.0 via the settings UI.
     profit_floor_relaxed = Column(Boolean, default=False)
+    # User-controlled indicator toggles. ``disabled_indicators`` is a JSON
+    # array of string keys from ``app.indicator_catalog.ALL_INDICATORS`` —
+    # each listed key contributes 0 to the combined signal score.
+    # ``gate_overrides`` is a JSON dict {gate_key: numeric} that overrides
+    # the engine-default threshold for that specific gatekeeper filter
+    # (min_confidence, brokerage_filter floors, regime_confirm, etc.).
+    # Both default empty so existing behaviour is preserved for users who
+    # never touch the Indicators control page.
+    disabled_indicators = Column(JSON, default=list)
+    gate_overrides = Column(JSON, default=dict)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 

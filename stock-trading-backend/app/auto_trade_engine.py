@@ -725,11 +725,18 @@ async def _analyze_stock(stock: dict, timeframe: str = "15m") -> Optional[dict]:
                     _get_sentiment_cached(symbol),
                 )
 
+                # Indicators Control: read the user's disabled list from
+                # trading_settings (cached) and pass it in so the engine
+                # skips every toggled-off indicator for this scan cycle.
+                # Disabling is forward-only — past signals / trades aren't
+                # re-scored.
+                _tg_settings = await _get_settings() or {}
                 signal_data = generate_signal(
                     indicators,
                     fundamental=fundamental,
                     sentiment=sentiment,
                     instrument_type="EQUITY",
+                    disabled_indicators=_tg_settings.get("disabled_indicators") or [],
                 )
 
                 # Gap 8: attach volume info so downstream filters can use it
@@ -837,7 +844,12 @@ async def _confirm_with_daily_trend(symbol: str, intraday_signal: str) -> bool:
         df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
         df["volume"] = df["volume"].astype(float)
         indicators = compute_all_indicators(df)
-        daily_signal = generate_signal(indicators, instrument_type="EQUITY")
+        _tg_settings = await _get_settings() or {}
+        daily_signal = generate_signal(
+            indicators,
+            instrument_type="EQUITY",
+            disabled_indicators=_tg_settings.get("disabled_indicators") or [],
+        )
 
         daily_direction = daily_signal.get("signal", "NEUTRAL")
         daily_score = daily_signal.get("score", 0)
@@ -1016,9 +1028,24 @@ async def _place_auto_trade(
             return None
 
         # v4: MINIMUM SCORE/CONFIDENCE THRESHOLD
-        max_trades_day = settings.get("max_trades_per_day", MAX_TRADES_PER_DAY)
-        min_score = settings.get("min_score_for_trade", MIN_SCORE_FOR_TRADE)
-        min_confidence = settings.get("min_confidence_for_trade", MIN_CONFIDENCE_FOR_TRADE)
+        # Gate overrides (set via the Indicators Control page) win over the
+        # legacy dedicated columns, which in turn win over the module-level
+        # engine defaults — see ``app.indicator_catalog.resolve_gate``.
+        from app.indicator_catalog import resolve_gate as _resolve_gate
+        _gate_overrides = settings.get("gate_overrides") or {}
+        max_trades_day = int(_resolve_gate(
+            "max_trades_per_day", _gate_overrides, settings, MAX_TRADES_PER_DAY
+        ))
+        min_score = _resolve_gate(
+            "min_score", _gate_overrides, settings, MIN_SCORE_FOR_TRADE
+        )
+        min_confidence = _resolve_gate(
+            "min_confidence", _gate_overrides, settings, MIN_CONFIDENCE_FOR_TRADE
+        )
+        # Boolean-flavoured gates are stored as 0/1 in gate_overrides; default
+        # to enabled (1) when the user hasn't overridden them.
+        regime_confirm_enabled = bool(_gate_overrides.get("regime_confirm", 1))
+        duplicate_guard_enabled = bool(_gate_overrides.get("duplicate_guard", 1))
 
         trade_mode_peek = str(settings.get("trade_mode") or "PAPER").upper()
 
@@ -1070,8 +1097,10 @@ async def _place_auto_trade(
         # v5: REGIME GATE — don't take BUYs into a crashing Nifty or SELLs into a
         # surging one. Scan loop passes the shared snapshot; fall back to a
         # cached fetch for monitor-loop re-analysis entries.
+        # The user can disable this gate entirely via the Indicators Control
+        # page (gate_overrides["regime_confirm"] = 0).
         regime = market_regime or await _detect_market_regime()
-        if side == "BUY" and not regime.get("allow_buy", True):
+        if regime_confirm_enabled and side == "BUY" and not regime.get("allow_buy", True):
             _add_log(
                 "REGIME_BLOCK", symbol,
                 f"BUY blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
@@ -1083,7 +1112,7 @@ async def _place_auto_trade(
                 f"({regime.get('regime', 'UNKNOWN')})",
             )
             return None
-        if side == "SELL" and not regime.get("allow_sell", True):
+        if regime_confirm_enabled and side == "SELL" and not regime.get("allow_sell", True):
             _add_log(
                 "REGIME_BLOCK", symbol,
                 f"SELL blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
@@ -1112,8 +1141,8 @@ async def _place_auto_trade(
             )
             return None
 
-        # v4: COOLDOWN CHECK
-        if _is_on_cooldown(symbol):
+        # v4: COOLDOWN CHECK — skippable via the duplicate_guard gate toggle.
+        if duplicate_guard_enabled and _is_on_cooldown(symbol):
             last_time = _last_trade_time_per_symbol.get(symbol)
             elapsed = int((datetime.now(IST) - last_time).total_seconds()) if last_time else 0
             _add_log("COOLDOWN", symbol,
@@ -1278,12 +1307,18 @@ async def _place_auto_trade(
         # the smallest value that clears the configured net-profit floor
         # (capped by loss/margin budgets); otherwise apply the gate as a filter.
         if target and entry_price and target != entry_price:
-            min_net = float(
-                settings.get("min_net_profit_per_trade", MIN_NET_PROFIT_PER_TRADE) or 0
-            )
-            min_ratio = float(
-                settings.get("min_profit_to_cost_ratio", MIN_PROFIT_TO_COST_RATIO) or 0
-            )
+            # Brokerage-gate thresholds honour gate_overrides → settings column
+            # → engine default (resolve_gate). Previously these bypassed
+            # gate_overrides, so a user who relaxed the brokerage floor from
+            # the Indicators Control page still saw ₹1 / 1.0x enforced here.
+            min_net = float(_resolve_gate(
+                "min_net_profit_per_trade", _gate_overrides, settings,
+                MIN_NET_PROFIT_PER_TRADE,
+            ) or 0)
+            min_ratio = float(_resolve_gate(
+                "min_profit_to_cost_ratio", _gate_overrides, settings,
+                MIN_PROFIT_TO_COST_RATIO,
+            ) or 0)
 
             auto_qty = bool(settings.get("auto_quantity_enabled", True))
             if auto_qty and min_net > 0:
@@ -1929,7 +1964,18 @@ async def _scan_and_trade() -> int:
 
     # v4: Check daily trade limit. If hit, we still scan & publish signals so
     # the dashboard stays informative — we just skip the placement phase.
-    max_trades_day = settings.get("max_trades_per_day", MAX_TRADES_PER_DAY)
+    # Honour gate_overrides so the pre-filter matches the in-loop cap in
+    # ``_place_auto_trade`` (otherwise a user who bumped max_trades_per_day
+    # via the Indicators Control page would still see the scan flip into
+    # display-only mode at the old settings-column value).
+    from app.indicator_catalog import resolve_gate as _resolve_gate_top
+    _top_gate_overrides = settings.get("gate_overrides") or {}
+    max_trades_day = int(_resolve_gate_top(
+        "max_trades_per_day", _top_gate_overrides, settings, MAX_TRADES_PER_DAY
+    ))
+    max_active_trades = int(_resolve_gate_top(
+        "max_open_trades", _top_gate_overrides, settings, MAX_ACTIVE_TRADES
+    ))
     trades_today = await _get_trades_placed_today()
     daily_cap_hit = trades_today >= max_trades_day
     if daily_cap_hit:
@@ -1973,16 +2019,27 @@ async def _scan_and_trade() -> int:
 
     # v5.1: compute effective thresholds once per cycle so the signal row can
     # show "Score 42 < min 55" even when the user tweaked settings mid-session.
-    min_score = settings.get("min_score_for_trade", MIN_SCORE_FOR_TRADE)
-    min_confidence = settings.get("min_confidence_for_trade", MIN_CONFIDENCE_FOR_TRADE)
+    from app.indicator_catalog import resolve_gate as _resolve_gate
+    _gate_overrides = settings.get("gate_overrides") or {}
+    min_score = _resolve_gate(
+        "min_score", _gate_overrides, settings, MIN_SCORE_FOR_TRADE
+    )
+    min_confidence = _resolve_gate(
+        "min_confidence", _gate_overrides, settings, MIN_CONFIDENCE_FOR_TRADE
+    )
+    # Same boolean-flavoured gates ``_place_auto_trade`` reads — needed so
+    # the scan-loop pre-filter below respects the Indicators Control toggle
+    # instead of silently rejecting on cooldown even when duplicate_guard=0.
+    duplicate_guard_enabled = bool(_gate_overrides.get("duplicate_guard", 1))
+
     trade_mode_peek = str(settings.get("trade_mode") or "PAPER").upper()
 
     # --- Slot / cap gates (apply to every analyzed tradeable signal) --------
     open_count = await _get_open_trade_count()
-    slots_full = open_count >= MAX_ACTIVE_TRADES
-    slots = max(0, MAX_ACTIVE_TRADES - open_count)
+    slots_full = open_count >= max_active_trades
+    slots = max(0, max_active_trades - open_count)
     if slots_full:
-        _add_log("LIMIT", "", f"Max active trades ({MAX_ACTIVE_TRADES}) reached")
+        _add_log("LIMIT", "", f"Max active trades ({max_active_trades}) reached")
 
     # --- Pre-place rejection recording --------------------------------------
     # The scan loop used to silently drop NEUTRAL / weak / low-conf signals,
@@ -2041,7 +2098,7 @@ async def _scan_and_trade() -> int:
                 "Already have an open trade on this symbol",
             )
             continue
-        if _is_on_cooldown(sym):
+        if duplicate_guard_enabled and _is_on_cooldown(sym):
             last_time = _last_trade_time_per_symbol.get(sym)
             elapsed = int((datetime.now(IST) - last_time).total_seconds()) if last_time else 0
             _record_rejection(
@@ -2052,7 +2109,7 @@ async def _scan_and_trade() -> int:
         if slots_full:
             _record_rejection(
                 "OPEN_TRADES_FULL", sym, sd, trade_mode_peek,
-                f"Max {MAX_ACTIVE_TRADES} concurrent trades already open",
+                f"Max {max_active_trades} concurrent trades already open",
             )
             continue
         tradeable.append(item)
@@ -2954,14 +3011,27 @@ async def _engine_loop():
                         if closed > 0:
                             limits = await _check_daily_limits(settings)
                             if limits["trading_allowed"]:
+                                # Resolve slot/daily caps via gate_overrides →
+                                # settings column → engine default so the
+                                # monitor loop honours the Indicators Control
+                                # page without waiting for the next scan.
+                                from app.indicator_catalog import resolve_gate as _rg_mon
+                                _mon_overrides = settings.get("gate_overrides") or {}
+                                _mon_max_active = int(_rg_mon(
+                                    "max_open_trades", _mon_overrides, settings,
+                                    MAX_ACTIVE_TRADES,
+                                ))
                                 open_count = await _get_open_trade_count()
-                                if open_count < MAX_ACTIVE_TRADES:
+                                if open_count < _mon_max_active:
                                     # v4: Still check daily trade limit before re-scanning
                                     trades_today = await _get_trades_placed_today()
-                                    max_trades_day = settings.get("max_trades_per_day", MAX_TRADES_PER_DAY)
+                                    max_trades_day = int(_rg_mon(
+                                        "max_trades_per_day", _mon_overrides,
+                                        settings, MAX_TRADES_PER_DAY,
+                                    ))
                                     if trades_today < max_trades_day:
                                         _add_log("RESCAN", "",
-                                                 f"Trade closed, {MAX_ACTIVE_TRADES - open_count} slots, "
+                                                 f"Trade closed, {_mon_max_active - open_count} slots, "
                                                  f"{trades_today}/{max_trades_day} trades today, re-scanning")
                                         break
                                     else:
@@ -3025,9 +3095,15 @@ def get_engine_status() -> dict:
         "last_monitor_time": _last_monitor_time.isoformat() if _last_monitor_time else None,
         "last_reanalysis_time": _last_reanalysis_time.isoformat() if _last_reanalysis_time else None,
         "market_open": is_market_open(),
-        "max_active_trades": MAX_ACTIVE_TRADES,
-        "max_trades_per_day": (
-            (_cached_settings or {}).get("max_trades_per_day") or MAX_TRADES_PER_DAY
+        "max_active_trades": int(
+            ((_cached_settings or {}).get("gate_overrides") or {}).get("max_open_trades")
+            or (_cached_settings or {}).get("max_open_trades")
+            or MAX_ACTIVE_TRADES
+        ),
+        "max_trades_per_day": int(
+            ((_cached_settings or {}).get("gate_overrides") or {}).get("max_trades_per_day")
+            or (_cached_settings or {}).get("max_trades_per_day")
+            or MAX_TRADES_PER_DAY
         ),
         "trades_placed_today": _trades_placed_today,
         "signals_count": len(_last_signals),

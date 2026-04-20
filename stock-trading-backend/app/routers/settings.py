@@ -16,6 +16,17 @@ from app.brokerage_calc import (
     min_qty_for_net_profit,
 )
 from app import auto_trade_engine
+from app.indicator_catalog import (
+    ALL_INDICATORS,
+    FUNDAMENTAL_INDICATORS,
+    GATES,
+    SENTIMENT_INDICATORS,
+    TECHNICAL_INDICATORS,
+    is_valid_gate_key,
+    is_valid_indicator_key,
+    normalize_disabled_indicators,
+    normalize_gate_overrides,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/settings", tags=["Settings"])
@@ -265,3 +276,211 @@ async def brokerage_preview(
         "verdict": verdict,
         "charges_breakdown": charges,
     }
+
+
+# --- Indicators Control -------------------------------------------------------
+#
+# These endpoints back the Indicators page in the UI. The `GET` returns the
+# full catalog of indicators + gates with the user's current disabled list and
+# per-gate overrides, so the frontend can render toggle rows with context. The
+# `PUT` writes the new lists back to ``trading_settings`` and clears the
+# auto-trade engine's settings cache so the next scan picks them up.
+
+
+class DisabledIndicatorsBody(BaseModel):
+    """Full replacement of the user's disabled-indicators list.
+
+    Unknown keys are silently dropped (see ``normalize_disabled_indicators``).
+    """
+
+    disabled_indicators: list[str]
+
+
+class GateOverridesBody(BaseModel):
+    """Partial or full replacement of per-gate numeric threshold overrides."""
+
+    gate_overrides: dict
+
+
+@router.get("/indicators")
+async def get_indicators(db: AsyncSession = Depends(get_db)):
+    """Return the indicator catalog plus the user's current disabled list.
+
+    The response groups indicators by category (technical / fundamental /
+    sentiment) so the UI can render three labelled tables. Each row carries
+    ``enabled: bool`` derived from ``disabled_indicators`` so the frontend
+    doesn't have to compute the intersection itself.
+    """
+    result = await db.execute(
+        text("SELECT disabled_indicators FROM trading_settings WHERE id=1")
+    )
+    row = result.mappings().first()
+    raw = (row or {}).get("disabled_indicators") if row else None
+    disabled = set(normalize_disabled_indicators(raw))
+
+    def _serialize(items):
+        return [
+            {**entry, "enabled": entry["key"] not in disabled}
+            for entry in items
+        ]
+
+    return {
+        "success": True,
+        "disabled_indicators": sorted(disabled),
+        "categories": {
+            "technical": _serialize(TECHNICAL_INDICATORS),
+            "fundamental": _serialize(FUNDAMENTAL_INDICATORS),
+            "sentiment": _serialize(SENTIMENT_INDICATORS),
+        },
+    }
+
+
+@router.put("/indicators")
+async def put_indicators(
+    body: DisabledIndicatorsBody, db: AsyncSession = Depends(get_db)
+):
+    """Replace the user's disabled-indicators list in full.
+
+    Disabling an indicator is forward-only — past signals and placed trades
+    keep their original scores. Only the *next* scan cycle will skip the
+    listed keys.
+    """
+    clean = normalize_disabled_indicators(body.disabled_indicators)
+    import json as _json
+    await db.execute(
+        text(
+            "UPDATE trading_settings SET disabled_indicators = :v, "
+            "updated_at = :now WHERE id=1"
+        ),
+        {"v": _json.dumps(clean), "now": datetime.utcnow()},
+    )
+    await db.commit()
+    auto_trade_engine._cached_settings = None
+    auto_trade_engine._settings_cache_time = 0.0
+    logger.info(f"disabled_indicators updated: {clean}")
+    return {"success": True, "disabled_indicators": clean}
+
+
+@router.put("/indicators/{key}")
+async def toggle_indicator(
+    key: str, enabled: bool = Query(...), db: AsyncSession = Depends(get_db)
+):
+    """Flip a single indicator on/off without sending the whole list.
+
+    Convenience endpoint for checkbox-style UIs. Unknown keys 404.
+    """
+    if not is_valid_indicator_key(key):
+        return {"success": False, "error": f"Unknown indicator key: {key}"}
+    result = await db.execute(
+        text("SELECT disabled_indicators FROM trading_settings WHERE id=1")
+    )
+    row = result.mappings().first()
+    disabled = set(normalize_disabled_indicators(
+        (row or {}).get("disabled_indicators") if row else None
+    ))
+    if enabled:
+        disabled.discard(key)
+    else:
+        disabled.add(key)
+    clean = sorted(disabled)
+    import json as _json
+    await db.execute(
+        text(
+            "UPDATE trading_settings SET disabled_indicators = :v, "
+            "updated_at = :now WHERE id=1"
+        ),
+        {"v": _json.dumps(clean), "now": datetime.utcnow()},
+    )
+    await db.commit()
+    auto_trade_engine._cached_settings = None
+    auto_trade_engine._settings_cache_time = 0.0
+    return {"success": True, "key": key, "enabled": enabled,
+            "disabled_indicators": clean}
+
+
+@router.get("/gates")
+async def get_gates(db: AsyncSession = Depends(get_db)):
+    """Return gate catalog + the user's current numeric overrides.
+
+    Each row includes the effective value (override → settings column →
+    engine default) so the UI can show "Current: 30" alongside the input.
+    """
+    result = await db.execute(text("SELECT * FROM trading_settings WHERE id=1"))
+    row = result.mappings().first()
+    settings = dict(row) if row else {}
+    overrides = normalize_gate_overrides(settings.get("gate_overrides"))
+
+    gates_out = []
+    for gate in GATES:
+        current = overrides.get(gate["key"])
+        if current is None and gate.get("settings_field"):
+            current = settings.get(gate["settings_field"])
+        if current is None:
+            current = gate["default"]
+        gates_out.append({**gate, "override": overrides.get(gate["key"]),
+                          "current": current})
+
+    return {
+        "success": True,
+        "gate_overrides": overrides,
+        "gates": gates_out,
+    }
+
+
+@router.put("/gates")
+async def put_gates(body: GateOverridesBody, db: AsyncSession = Depends(get_db)):
+    """Replace the gate_overrides JSON in full (unknown keys dropped, values clamped)."""
+    clean = normalize_gate_overrides(body.gate_overrides)
+    import json as _json
+    await db.execute(
+        text(
+            "UPDATE trading_settings SET gate_overrides = :v, "
+            "updated_at = :now WHERE id=1"
+        ),
+        {"v": _json.dumps(clean), "now": datetime.utcnow()},
+    )
+    await db.commit()
+    auto_trade_engine._cached_settings = None
+    auto_trade_engine._settings_cache_time = 0.0
+    logger.info(f"gate_overrides updated: {clean}")
+    return {"success": True, "gate_overrides": clean}
+
+
+@router.put("/gates/{key}")
+async def put_gate(
+    key: str,
+    value: Optional[float] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set or clear a single gate override.
+
+    Pass ``?value=<number>`` to override; omit ``value`` to clear the
+    override and fall back to settings / engine default.
+    """
+    if not is_valid_gate_key(key):
+        return {"success": False, "error": f"Unknown gate key: {key}"}
+    result = await db.execute(
+        text("SELECT gate_overrides FROM trading_settings WHERE id=1")
+    )
+    row = result.mappings().first()
+    overrides = normalize_gate_overrides(
+        (row or {}).get("gate_overrides") if row else None
+    )
+    if value is None:
+        overrides.pop(key, None)
+    else:
+        overrides[key] = float(value)
+        overrides = normalize_gate_overrides(overrides)
+    import json as _json
+    await db.execute(
+        text(
+            "UPDATE trading_settings SET gate_overrides = :v, "
+            "updated_at = :now WHERE id=1"
+        ),
+        {"v": _json.dumps(overrides), "now": datetime.utcnow()},
+    )
+    await db.commit()
+    auto_trade_engine._cached_settings = None
+    auto_trade_engine._settings_cache_time = 0.0
+    return {"success": True, "key": key, "value": overrides.get(key),
+            "gate_overrides": overrides}

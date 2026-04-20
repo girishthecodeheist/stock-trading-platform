@@ -121,14 +121,38 @@ def _fetch_yfinance_data(yahoo_symbol: str) -> Dict[str, Any]:
     return result
 
 
-def _compute_fundamental_score(data: Dict[str, Any]) -> float:
-    """Compute a normalized fundamental score from -100 to +100."""
+def recompute_fundamental_score(
+    data: Dict[str, Any], disabled_metrics: Optional[set] = None
+) -> float:
+    """Re-derive the fundamental score from raw metrics, skipping ``disabled_metrics``.
+
+    Public wrapper around :func:`_compute_fundamental_score` so the signal
+    engine can respect per-metric toggles without refetching yfinance data.
+    Keys are drawn from :mod:`app.indicator_catalog` (e.g. ``fund_pe_ratio``,
+    ``fund_roe``). A disabled metric contributes 0 weight and 0 score for
+    this call only — the raw ``data`` dict is not mutated.
+    """
+    return _compute_fundamental_score(data, disabled_metrics)
+
+
+def _compute_fundamental_score(
+    data: Dict[str, Any], disabled_metrics: Optional[set] = None
+) -> float:
+    """Compute a normalized fundamental score from -100 to +100.
+
+    ``disabled_metrics`` is a set of keys from
+    ``app.indicator_catalog.FUNDAMENTAL_INDICATORS`` (e.g. ``fund_pe_ratio``,
+    ``fund_roe``) — each listed metric is excluded from both the weighted
+    sum *and* the weight denominator so the remaining enabled metrics
+    re-normalise cleanly.
+    """
+    disabled = disabled_metrics or set()
     scores = []
     weights = []
 
     # P/E ratio scoring
     pe = data.get("pe_ratio")
-    if pe is not None and pe > 0:
+    if pe is not None and pe > 0 and "fund_pe_ratio" not in disabled:
         if pe < 10:
             scores.append(80)
         elif pe < 15:
@@ -147,7 +171,7 @@ def _compute_fundamental_score(data: Dict[str, Any]) -> float:
 
     # P/B ratio scoring
     pb = data.get("pb_ratio")
-    if pb is not None and pb > 0:
+    if pb is not None and pb > 0 and "fund_pb_ratio" not in disabled:
         if pb < 1:
             scores.append(80)
         elif pb < 2:
@@ -162,7 +186,7 @@ def _compute_fundamental_score(data: Dict[str, Any]) -> float:
 
     # ROE scoring
     roe = data.get("roe")
-    if roe is not None:
+    if roe is not None and "fund_roe" not in disabled:
         if roe > 0.25:
             scores.append(80)
         elif roe > 0.15:
@@ -177,7 +201,7 @@ def _compute_fundamental_score(data: Dict[str, Any]) -> float:
 
     # ROA scoring
     roa = data.get("roa")
-    if roa is not None:
+    if roa is not None and "fund_roa" not in disabled:
         if roa > 0.15:
             scores.append(80)
         elif roa > 0.10:
@@ -192,7 +216,7 @@ def _compute_fundamental_score(data: Dict[str, Any]) -> float:
 
     # Debt/Equity scoring
     de = data.get("debt_to_equity")
-    if de is not None:
+    if de is not None and "fund_debt_to_equity" not in disabled:
         if de < 20:
             scores.append(70)
         elif de < 50:
@@ -207,7 +231,7 @@ def _compute_fundamental_score(data: Dict[str, Any]) -> float:
 
     # Profit margin
     pm = data.get("profit_margin")
-    if pm is not None:
+    if pm is not None and "fund_profit_margin" not in disabled:
         if pm > 0.20:
             scores.append(80)
         elif pm > 0.10:
@@ -222,7 +246,7 @@ def _compute_fundamental_score(data: Dict[str, Any]) -> float:
 
     # Revenue growth
     rg = data.get("revenue_growth")
-    if rg is not None:
+    if rg is not None and "fund_revenue_growth" not in disabled:
         if rg > 0.20:
             scores.append(80)
         elif rg > 0.10:
@@ -237,7 +261,7 @@ def _compute_fundamental_score(data: Dict[str, Any]) -> float:
 
     # Earnings growth
     eg = data.get("earnings_growth")
-    if eg is not None:
+    if eg is not None and "fund_earnings_growth" not in disabled:
         if eg > 0.20:
             scores.append(80)
         elif eg > 0.10:
@@ -250,7 +274,7 @@ def _compute_fundamental_score(data: Dict[str, Any]) -> float:
 
     # Current ratio
     cr = data.get("current_ratio")
-    if cr is not None:
+    if cr is not None and "fund_current_ratio" not in disabled:
         if cr > 2.0:
             scores.append(60)
         elif cr > 1.5:
@@ -263,7 +287,7 @@ def _compute_fundamental_score(data: Dict[str, Any]) -> float:
 
     # Beta scoring (lower beta = more stable)
     beta = data.get("beta")
-    if beta is not None:
+    if beta is not None and "fund_beta" not in disabled:
         if 0.8 <= beta <= 1.2:
             scores.append(40)
         elif 0.5 <= beta <= 1.5:
