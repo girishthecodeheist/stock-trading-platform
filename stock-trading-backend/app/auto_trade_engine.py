@@ -977,18 +977,33 @@ async def _place_auto_trade(
                 reward_distance = entry_price - target
                 risk_distance = stop_loss - entry_price
 
-            if risk_distance > 0:
-                rr_ratio = reward_distance / risk_distance
-                if rr_ratio < 1.5:
-                    _add_log("BAD_RR", symbol,
-                             f"Risk:Reward {rr_ratio:.2f} below 1.5 after capping. "
-                             f"Entry={entry_price}, SL={stop_loss}, Target={target}. Skipping.")
-                    _record_rejection(
-                        "BAD_RR", symbol, signal_data, trade_mode_peek,
-                        f"R:R {rr_ratio:.2f} < 1.5 after target capping "
-                        f"(entry={entry_price}, SL={stop_loss}, target={target})",
-                    )
-                    return None
+            # If target capping pushed the SL to the wrong side of entry
+            # (e.g. entry=98 but recent_low=101 clamped SL up to 101 on a
+            # BUY), risk_distance is zero/negative and the trade would fill
+            # into an instant SL hit on the next monitor tick. Reject these
+            # outright instead of silently skipping the R:R check.
+            if risk_distance <= 0:
+                _add_log("BAD_RR", symbol,
+                         f"Stop loss on wrong side of entry after capping. "
+                         f"Entry={entry_price}, SL={stop_loss}, Side={side}. Skipping.")
+                _record_rejection(
+                    "BAD_RR", symbol, signal_data, trade_mode_peek,
+                    f"Invalid SL placement: SL={stop_loss} vs entry={entry_price} "
+                    f"for {side} trade (risk_distance={risk_distance:.2f})",
+                )
+                return None
+
+            rr_ratio = reward_distance / risk_distance
+            if rr_ratio < 1.5:
+                _add_log("BAD_RR", symbol,
+                         f"Risk:Reward {rr_ratio:.2f} below 1.5 after capping. "
+                         f"Entry={entry_price}, SL={stop_loss}, Target={target}. Skipping.")
+                _record_rejection(
+                    "BAD_RR", symbol, signal_data, trade_mode_peek,
+                    f"R:R {rr_ratio:.2f} < 1.5 after target capping "
+                    f"(entry={entry_price}, SL={stop_loss}, target={target})",
+                )
+                return None
 
             min_target_pct = 0.3
             target_pct_actual = abs(reward_distance / entry_price * 100) if entry_price else 0
