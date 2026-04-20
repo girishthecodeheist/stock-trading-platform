@@ -459,7 +459,7 @@ def _analyze_sentiment(data: Dict[str, Any]) -> List[str]:
 
 def _get_fno_recommendation(score: float, confidence: float) -> Dict[str, Any]:
     """Generate PUT/CALL recommendation for F&O instruments."""
-    if score >= 30:
+    if score >= 40:
         return {
             "action": "CALL",
             "strength": "STRONG" if score >= 60 else "MODERATE",
@@ -473,7 +473,7 @@ def _get_fno_recommendation(score: float, confidence: float) -> Dict[str, Any]:
             "confidence": confidence,
             "reasoning": "Mildly bullish signals - consider CALL with caution",
         }
-    elif score <= -30:
+    elif score <= -40:
         return {
             "action": "PUT",
             "strength": "STRONG" if score <= -60 else "MODERATE",
@@ -499,13 +499,13 @@ def _get_fno_recommendation(score: float, confidence: float) -> Dict[str, Any]:
 def _classify(score: float) -> str:
     if score >= 60:
         return "STRONG BUY"
-    elif score >= 30:
+    elif score >= 40:
         return "BUY"
     elif score >= 10:
         return "WEAK BUY"
     elif score >= -10:
         return "NEUTRAL"
-    elif score >= -30:
+    elif score >= -40:
         return "WEAK SELL"
     elif score >= -60:
         return "SELL"
