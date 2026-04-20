@@ -171,6 +171,26 @@
         Last Scan: {{ autoTradeStatus?.last_scan_time }}
       </span>
     </div>
+    <!-- Signal quality summary: how many of the current scan's signals are
+         actually tradeable vs info-only, and the analysis-basis breakdown. -->
+    <div class="signal-quality-summary" *ngIf="signalQualitySummary.hasData">
+      <span class="quality-chip tradeable">
+        <span class="quality-label">Tradeable</span>
+        <span class="quality-value">{{ signalQualitySummary.tradeable }}</span>
+      </span>
+      <span class="quality-chip info-only">
+        <span class="quality-label">Info Only</span>
+        <span class="quality-value">{{ signalQualitySummary.infoOnly }}</span>
+      </span>
+      <span class="quality-chip tech-only">
+        <span class="quality-label">Tech-only</span>
+        <span class="quality-value">{{ signalQualitySummary.techOnly }}</span>
+      </span>
+      <span class="quality-chip comprehensive">
+        <span class="quality-label">Tech + Fund/Sent</span>
+        <span class="quality-value">{{ signalQualitySummary.comprehensive }}</span>
+      </span>
+    </div>
   </div>
 
   <!-- OPEN TRADES -->

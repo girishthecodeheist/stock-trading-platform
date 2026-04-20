@@ -305,4 +305,63 @@ export class SignalsComponent implements OnInit, OnDestroy {
     if (t.includes('SELL')) return '\u2198\uFE0F';
     return '\u2796';
   }
+
+  /**
+   * A signal is "tradeable" when it meets the auto-trade engine's gating
+   * thresholds. Anything that doesn't meet these thresholds is INFO-ONLY
+   * — visible on the Signals page for context, but the engine will skip it.
+   */
+  isTradeable(signal: any): boolean {
+    if (!signal) return false;
+    const score = Number(signal.score) || 0;
+    const confidence = Number(signal.confidence) || 0;
+    const type = (signal.signal || signal.signal_type || '').toString().toUpperCase();
+    return Math.abs(score) >= 40 && confidence >= 40 && type !== 'NEUTRAL';
+  }
+
+  /**
+   * Map the raw analysis_basis emitted by the backend to a short, readable
+   * tag for the table ("TECH", "TECH+FUND", "TECH+FUND+SENT", ...).
+   */
+  getAnalysisBasisLabel(basis: string): string {
+    const key = (basis || '').toLowerCase().trim();
+    const map: { [k: string]: string } = {
+      'technical': 'TECH',
+      'technical+fundamental': 'TECH+FUND',
+      'technical+sentiment': 'TECH+SENT',
+      'technical+fundamental+sentiment': 'TECH+FUND+SENT',
+      'heatmap_fallback': 'HEATMAP',
+      'combined': 'COMBINED',
+      'unknown': 'UNKNOWN',
+    };
+    if (map[key]) return map[key];
+    if (!key) return '';
+    // Fallback: crude token-based abbreviation for any future combinations.
+    return key
+      .split(/[+_\s]+/)
+      .map(t => {
+        if (t.startsWith('tech')) return 'TECH';
+        if (t.startsWith('fund')) return 'FUND';
+        if (t.startsWith('sent')) return 'SENT';
+        if (t.startsWith('heat')) return 'HEATMAP';
+        return t.toUpperCase();
+      })
+      .join('+');
+  }
+
+  /** True when at least one signal in the current result has a non-zero
+   *  technical_score — used to conditionally show the Tech Score column.
+   */
+  get hasTechScores(): boolean {
+    return (this.signals || []).some(
+      s => s && s.technical_score !== undefined && s.technical_score !== null && s.technical_score !== 0,
+    );
+  }
+
+  /** True when at least one signal has a non-zero sentiment_score. */
+  get hasSentScores(): boolean {
+    return (this.signals || []).some(
+      s => s && s.sentiment_score !== undefined && s.sentiment_score !== null && s.sentiment_score !== 0,
+    );
+  }
 }

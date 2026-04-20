@@ -25,6 +25,7 @@ export class DashboardComponent implements OnInit, OnDestroy {
   marketOpen = false;
   livePrices: { [symbol: string]: number } = {};
   autoTradeStatus: any = null;
+  signals: any[] = [];
   openTradeCharges: { [tradeId: number]: any } = {};
   editingCapital = false;
   editCapitalAmount: number | null = null;
@@ -101,7 +102,51 @@ export class DashboardComponent implements OnInit, OnDestroy {
         if (prev !== this.openLiveTrades.length) this.setupAutoRefresh();
       }),
       this.state.autoTradeStatus$.subscribe(v => { this.autoTradeStatus = v; }),
+      this.state.signals$.subscribe(v => { this.signals = v || []; }),
     );
+  }
+
+  /**
+   * Signal quality summary used in the Auto-Trade panel. Prefers the
+   * backend-provided tradeable_count / info_only_count if available
+   * (once the auto-trade status endpoint is extended), otherwise falls
+   * back to computing locally from cached signals.
+   */
+  get signalQualitySummary(): {
+    total: number;
+    tradeable: number;
+    infoOnly: number;
+    techOnly: number;
+    comprehensive: number;
+    hasData: boolean;
+  } {
+    const sigs = this.signals || [];
+    const total = this.autoTradeStatus?.signals_count ?? sigs.length;
+
+    let tradeable = this.autoTradeStatus?.tradeable_count;
+    let infoOnly = this.autoTradeStatus?.info_only_count;
+    if (tradeable == null || infoOnly == null) {
+      tradeable = sigs.filter(s => (Number(s?.confidence) || 0) >= 40).length;
+      infoOnly = sigs.filter(s => (Number(s?.confidence) || 0) < 40).length;
+    }
+
+    const techOnly = sigs.filter(s => {
+      const basis = (s?.analysis_basis || '').toString().toLowerCase();
+      return basis === 'technical' || basis === 'heatmap_fallback';
+    }).length;
+    const comprehensive = sigs.filter(s => {
+      const basis = (s?.analysis_basis || '').toString().toLowerCase();
+      return basis.includes('fundamental') || basis.includes('sentiment');
+    }).length;
+
+    return {
+      total,
+      tradeable,
+      infoOnly,
+      techOnly,
+      comprehensive,
+      hasData: total > 0,
+    };
   }
 
   connectSSE() {

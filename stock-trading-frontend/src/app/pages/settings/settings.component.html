@@ -189,6 +189,32 @@
   </div>
 
   <div class="glass-card settings-section">
+    <h3 class="section-title">Auto-Trade Engine</h3>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <label for="minScoreForTrade">Min Score for Trade</label>
+        <input id="minScoreForTrade" type="number" [(ngModel)]="settings.min_score_for_trade" min="0" max="100" step="1" />
+        <small class="toggle-hint">Minimum absolute score (|score| &ge;) required before the auto-trade engine places an order. Signals below this threshold are INFO-ONLY. Default 25.</small>
+      </div>
+      <div class="setting-row">
+        <label for="minConfidenceForTrade">Min Confidence for Trade</label>
+        <input id="minConfidenceForTrade" type="number" [(ngModel)]="settings.min_confidence_for_trade" min="0" max="100" step="1" />
+        <small class="toggle-hint">Minimum confidence (0-100) required for auto-trade placement. Default 40.</small>
+      </div>
+      <div class="setting-row">
+        <label for="maxTradesPerDayAuto">Max Trades per Day</label>
+        <input id="maxTradesPerDayAuto" type="number" [(ngModel)]="settings.max_trades_per_day" min="1" max="500" step="1" />
+        <small class="toggle-hint">Upper bound on new auto-placed trades per day (paper + live combined). Default 10.</small>
+      </div>
+      <div class="setting-row">
+        <label for="maxActiveTrades">Max Active Trades</label>
+        <input id="maxActiveTrades" type="number" [(ngModel)]="settings.max_active_trades" min="1" max="100" step="1" />
+        <small class="toggle-hint">Maximum simultaneously-open auto-trades. New picks are skipped once this cap is hit. Default 5.</small>
+      </div>
+    </div>
+  </div>
+
+  <div class="glass-card settings-section">
     <h3 class="section-title">Fyers Connection</h3>
     <div class="fyers-info">
       <div class="connection-row">

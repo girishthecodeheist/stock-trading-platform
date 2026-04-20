@@ -66,11 +66,32 @@
     <div class="signals-table" *ngIf="filteredSignals.length > 0">
       <table>
         <thead>
-          <tr><th>Symbol</th><th>Signal</th><th>Analysis</th><th>Change%</th><th>Confidence</th><th>Score</th><th>LTP</th><th>SL</th><th>Target</th><th>Time</th><th>Action</th></tr>
+          <tr>
+            <th>Symbol</th>
+            <th>Signal</th>
+            <th>Analysis</th>
+            <th>Change%</th>
+            <th>Confidence</th>
+            <th>Score</th>
+            <th *ngIf="hasTechScores">Tech Score</th>
+            <th *ngIf="hasSentScores">Sent Score</th>
+            <th>Tradeable</th>
+            <th>LTP</th>
+            <th>SL</th>
+            <th>Target</th>
+            <th>Time</th>
+            <th>Action</th>
+          </tr>
         </thead>
         <tbody>
           <tr *ngFor="let s of filteredSignals" [class.highlight-buy]="(s.signal || '').includes('BUY')" [class.highlight-sell]="(s.signal || '').includes('SELL')">
-            <td class="sym-cell">{{ s.name || s.symbol }}</td>
+            <td class="sym-cell">
+              <div class="sym-name">{{ s.name || s.symbol }}</div>
+              <span class="basis-badge" *ngIf="s.analysis_basis"
+                    [title]="'Analysis basis: ' + s.analysis_basis">
+                {{ getAnalysisBasisLabel(s.analysis_basis) }}
+              </span>
+            </td>
             <td><span class="signal-badge" [ngClass]="getSignalClass(s.signal || s.signal_type)">{{ s.signal || s.signal_type }}</span></td>
             <td class="analysis-cell">
               <span class="status-chip" [ngClass]="statusChipClass(s)"
@@ -81,13 +102,26 @@
             </td>
             <td [ngClass]="{'positive': (s.change_pct || 0) > 0, 'negative': (s.change_pct || 0) < 0}">{{ s.change_pct | number:'1.2-2' }}%</td>
             <td>
-              <div class="conf-mini-bar">
+              <div class="conf-mini-bar"
+                   [title]="s.weight_description || 'Confidence'">
                 <div class="conf-mini-fill" [style.width.%]="s.confidence || 0"
                      [ngClass]="{'green': (s.score || 0) > 0, 'red': (s.score || 0) < 0}"></div>
               </div>
-              <span class="conf-text-sm">{{s.confidence || 0}}%</span>
+              <span class="conf-text-sm" [title]="s.weight_description || ''">{{s.confidence || 0}}%</span>
             </td>
             <td [ngClass]="{'positive': (s.score || 0) > 0, 'negative': (s.score || 0) < 0}">{{ s.score }}</td>
+            <td *ngIf="hasTechScores" [ngClass]="{'positive': (s.technical_score || 0) > 0, 'negative': (s.technical_score || 0) < 0}">
+              <span *ngIf="s.technical_score !== undefined && s.technical_score !== null && s.technical_score !== 0; else emDash">{{ s.technical_score | number:'1.0-1' }}</span>
+              <ng-template #emDash>&mdash;</ng-template>
+            </td>
+            <td *ngIf="hasSentScores" [ngClass]="{'positive': (s.sentiment_score || 0) > 0, 'negative': (s.sentiment_score || 0) < 0}">
+              <span *ngIf="s.sentiment_score !== undefined && s.sentiment_score !== null && s.sentiment_score !== 0; else sentDash">{{ s.sentiment_score | number:'1.0-1' }}</span>
+              <ng-template #sentDash>&mdash;</ng-template>
+            </td>
+            <td>
+              <span *ngIf="isTradeable(s); else infoOnlyTpl" class="tradeable-badge">TRADEABLE</span>
+              <ng-template #infoOnlyTpl><span class="info-only-badge">INFO ONLY</span></ng-template>
+            </td>
             <td class="ltp-cell">&#8377;{{ s.ltp | number:'1.2-2' }}</td>
             <td class="negative">&#8377;{{ s.stop_loss | number:'1.2-2' }}</td>
             <td class="positive">&#8377;{{ s.target_1 | number:'1.2-2' }}</td>

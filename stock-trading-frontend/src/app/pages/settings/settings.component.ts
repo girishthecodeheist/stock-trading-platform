@@ -62,6 +62,10 @@ export class SettingsComponent implements OnInit {
       auto_trade_enabled: this.settings.auto_trade_enabled,
       auto_quantity_enabled: this.settings.auto_quantity_enabled,
       product_type: this.settings.product_type,
+      // Auto-Trade Engine thresholds
+      min_score_for_trade: this.settings.min_score_for_trade,
+      min_confidence_for_trade: this.settings.min_confidence_for_trade,
+      max_active_trades: this.settings.max_active_trades,
     };
     this.api.updateSettings(update).subscribe({
       next: () => {
