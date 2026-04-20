@@ -310,13 +310,20 @@ export class SignalsComponent implements OnInit, OnDestroy {
    * A signal is "tradeable" when it meets the auto-trade engine's gating
    * thresholds. Anything that doesn't meet these thresholds is INFO-ONLY
    * — visible on the Signals page for context, but the engine will skip it.
+   *
+   * Thresholds are read from the engine's status payload (so they track
+   * ``gate_overrides`` edits made on the Indicators Control / Settings
+   * page) with a 40/40 fallback to keep the badge defined even before
+   * the engine status has loaded.
    */
   isTradeable(signal: any): boolean {
     if (!signal) return false;
     const score = Number(signal.score) || 0;
     const confidence = Number(signal.confidence) || 0;
     const type = (signal.signal || signal.signal_type || '').toString().toUpperCase();
-    return Math.abs(score) >= 40 && confidence >= 40 && type !== 'NEUTRAL';
+    const minScore = Number(this.autoTradeStatus?.min_score_for_trade) || 40;
+    const minConf = Number(this.autoTradeStatus?.min_confidence_for_trade) || 40;
+    return Math.abs(score) >= minScore && confidence >= minConf && type !== 'NEUTRAL';
   }
 
   /**

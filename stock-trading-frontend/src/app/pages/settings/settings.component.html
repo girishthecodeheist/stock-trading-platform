@@ -204,12 +204,12 @@
       <div class="setting-row">
         <label for="maxTradesPerDayAuto">Max Trades per Day</label>
         <input id="maxTradesPerDayAuto" type="number" [(ngModel)]="settings.max_trades_per_day" min="1" max="500" step="1" />
-        <small class="toggle-hint">Upper bound on new auto-placed trades per day (paper + live combined). Default 10.</small>
+        <small class="toggle-hint">Upper bound on new auto-placed trades per day (paper + live combined). Shared with the "Max Trades / Day" field in Capital &amp; Position Sizing. Default 50.</small>
       </div>
       <div class="setting-row">
         <label for="maxActiveTrades">Max Active Trades</label>
-        <input id="maxActiveTrades" type="number" [(ngModel)]="settings.max_active_trades" min="1" max="100" step="1" />
-        <small class="toggle-hint">Maximum simultaneously-open auto-trades. New picks are skipped once this cap is hit. Default 5.</small>
+        <input id="maxActiveTrades" type="number" [(ngModel)]="settings.max_open_trades" min="1" max="100" step="1" />
+        <small class="toggle-hint">Maximum simultaneously-open auto-trades (persists to <code>max_open_trades</code>; shared with the "Max Open Trades" field in Capital &amp; Position Sizing). Default 5.</small>
       </div>
     </div>
   </div>

@@ -110,7 +110,9 @@ export class DashboardComponent implements OnInit, OnDestroy {
    * Signal quality summary used in the Auto-Trade panel. Prefers the
    * backend-provided tradeable_count / info_only_count if available
    * (once the auto-trade status endpoint is extended), otherwise falls
-   * back to computing locally from cached signals.
+   * back to computing locally from cached signals using the same three
+   * checks the engine uses: ``abs(score) >= min_score``,
+   * ``confidence >= min_confidence``, and ``signal != NEUTRAL``.
    */
   get signalQualitySummary(): {
     total: number;
@@ -126,8 +128,15 @@ export class DashboardComponent implements OnInit, OnDestroy {
     let tradeable = this.autoTradeStatus?.tradeable_count;
     let infoOnly = this.autoTradeStatus?.info_only_count;
     if (tradeable == null || infoOnly == null) {
-      tradeable = sigs.filter(s => (Number(s?.confidence) || 0) >= 40).length;
-      infoOnly = sigs.filter(s => (Number(s?.confidence) || 0) < 40).length;
+      const minScore = Number(this.autoTradeStatus?.min_score_for_trade) || 25;
+      const minConf = Number(this.autoTradeStatus?.min_confidence_for_trade) || 30;
+      tradeable = sigs.filter(s => {
+        const sc = Math.abs(Number(s?.score) || 0);
+        const conf = Number(s?.confidence) || 0;
+        const sig = (s?.signal || s?.signal_type || '').toString().toUpperCase();
+        return sc >= minScore && conf >= minConf && sig !== 'NEUTRAL';
+      }).length;
+      infoOnly = Math.max(0, total - tradeable);
     }
 
     const techOnly = sigs.filter(s => {
