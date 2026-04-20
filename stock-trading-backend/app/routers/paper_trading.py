@@ -99,8 +99,28 @@ async def create_trade(
     trade: dict = Body(...),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new paper trade."""
-    product_type = (trade.get("product_type") or "INTRADAY").upper()
+    """Create a new paper trade.
+
+    Product type resolution matches the live path (``POST /api/v1/live/trades``)
+    so a PAPER trade placed from the UI incurs the same MIS/CNC charges as
+    its LIVE equivalent would. When the request body doesn't pin a
+    ``product_type`` we fall back to ``trading_settings.product_type``
+    (INTRADAY/CNC) instead of the old hard-coded INTRADAY default — that
+    way the settings dropdown actually controls paper too.
+    """
+    product_type = (trade.get("product_type") or "").upper()
+    if not product_type:
+        try:
+            pt_row = await db.execute(text(
+                "SELECT product_type FROM trading_settings ORDER BY id ASC LIMIT 1"
+            ))
+            pt_val = pt_row.scalar()
+            if pt_val:
+                product_type = str(pt_val).upper()
+        except Exception:
+            pass
+    if product_type not in ("INTRADAY", "CNC", "DELIVERY"):
+        product_type = "INTRADAY"
     query = text("""
         INSERT INTO paper_trades (symbol, instrument_type, timeframe, side, entry_price,
             entry_time, quantity, stop_loss, target, status, signal_confidence,
