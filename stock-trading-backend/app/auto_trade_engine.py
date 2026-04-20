@@ -1979,14 +1979,18 @@ async def _scan_and_trade() -> int:
             trade_status = "PLACED"
             block_reason = None
             block_details = None
+        elif sd.get("signal", "NEUTRAL") == "NEUTRAL":
+            # NEUTRAL takes precedence over the BLOCKED branch: every NEUTRAL
+            # signal also has a NEUTRAL_SIGNAL rejection recorded, but the UI
+            # treats "no directional signal" as a distinct status from
+            # "signal existed but a gate killed it".
+            trade_status = "NEUTRAL"
+            block_reason = None
+            block_details = None
         elif rej:
             trade_status = "BLOCKED"
             block_reason = rej.get("reason")
             block_details = rej.get("details")
-        elif sd.get("signal", "NEUTRAL") == "NEUTRAL":
-            trade_status = "NEUTRAL"
-            block_reason = None
-            block_details = None
         else:
             # Made it past every recorded gate but no trade_id returned — the
             # placement attempt hit a broker-level error without recording a
