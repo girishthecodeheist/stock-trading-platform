@@ -185,6 +185,7 @@ export class SignalsComponent implements OnInit, OnDestroy {
       OPEN_TRADES_FULL: 'Max open trades reached',
       DUPLICATE_SYMBOL: 'Already open on this symbol',
       FYERS_REJECTED: 'Broker rejected order',
+      INVALID_SL: 'Invalid SL placement (would insta-exit)',
       FALLBACK_BLOCKED: 'Heatmap fallback (no indicators)',
       LOW_VOLUME: 'Low volume vs 20-bar average',
       BAD_RR: 'Risk/reward below 1.5',
@@ -202,7 +203,7 @@ export class SignalsComponent implements OnInit, OnDestroy {
     if (reason === 'LIVE_NOT_CONNECTED' || reason === 'FYERS_REJECTED') return 'reject-live';
     if (reason === 'COOLDOWN' || reason === 'DAILY_LIMIT') return 'reject-cooldown';
     if (reason === 'REGIME_BLOCK') return 'reject-regime';
-    if (reason === 'LOW_VOLUME' || reason === 'BAD_RR' || reason === 'TARGET_TOO_TIGHT') return 'reject-technical';
+    if (reason === 'LOW_VOLUME' || reason === 'BAD_RR' || reason === 'TARGET_TOO_TIGHT' || reason === 'INVALID_SL') return 'reject-technical';
     if (reason === 'NEUTRAL_SIGNAL') return 'reject-neutral';
     return 'reject-generic';
   }
