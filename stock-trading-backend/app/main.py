@@ -62,6 +62,7 @@ async def ensure_columns():
         ("trading_settings", "min_profit_to_cost_ratio", "ALTER TABLE trading_settings ADD COLUMN min_profit_to_cost_ratio FLOAT DEFAULT 1.0"),
         ("trading_settings", "profit_floor_relaxed", "ALTER TABLE trading_settings ADD COLUMN profit_floor_relaxed BOOLEAN DEFAULT false"),
         ("trading_settings", "product_type", "ALTER TABLE trading_settings ADD COLUMN product_type VARCHAR(10) DEFAULT 'INTRADAY'"),
+        ("trading_settings", "intraday_leverage", "ALTER TABLE trading_settings ADD COLUMN intraday_leverage FLOAT DEFAULT 5.0"),
         # live_trades — execution reconciliation columns (F4). Added so we
         # can tell FILLED from PARTIAL from REJECTED after place_order and
         # use actual filled qty on exit instead of blindly selling the

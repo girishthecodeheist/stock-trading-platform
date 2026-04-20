@@ -236,6 +236,11 @@ class TradingSettings(Base):
     #     "RED:'MIS' Orders are disallowed after system square off".
     #   CNC — delivery / full cash, no auto-square-off, valid 9:15-15:30 IST.
     product_type = Column(String(10), default="INTRADAY")
+    # Multiplier applied to available capital when sizing INTRADAY (MIS) orders
+    # so the quantity calculator mirrors the broker's leverage. 1.0 disables
+    # leverage; 5.0 is the typical Fyers MIS equity ceiling. Ignored entirely
+    # for CNC / delivery.
+    intraday_leverage = Column(Float, default=5.0)
     # Internal marker: set to true after the one-time migration relaxes the
     # old 100 / 2.0 defaults. Prevents the migration from re-overwriting a
     # user who later explicitly chooses 100 / 2.0 via the settings UI.

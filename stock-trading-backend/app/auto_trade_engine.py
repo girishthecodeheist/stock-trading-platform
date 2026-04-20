@@ -45,7 +45,7 @@ MAX_TRADES_PER_DAY = 50              # Default cap when ``trading_settings.max_t
 TRADE_COOLDOWN_SECS = 300            # 5 min cooldown between trades on same symbol
 SCAN_INTERVAL_SECS = 120             # Scan every 2 minutes (was 60s)
 MIN_SCORE_FOR_TRADE = 25             # Minimum absolute score to place trade
-MIN_CONFIDENCE_FOR_TRADE = 40        # Minimum confidence to place trade
+MIN_CONFIDENCE_FOR_TRADE = 30        # Minimum confidence to place trade (aligned with BUY/SELL bucket in signal_engine._classify)
 
 # v5: Brokerage-aware sizing floor. Overridden by
 # ``trading_settings.min_net_profit_per_trade`` / ``min_profit_to_cost_ratio``.
@@ -439,6 +439,25 @@ async def _get_live_available_margin() -> float:
     return 0.0
 
 
+def _buying_power(available_margin: float, settings: dict) -> float:
+    """Apply broker leverage multiplier to available cash for MIS sizing.
+
+    Fyers (and other Indian brokers) extend ~5x on equity intraday orders.
+    For CNC / delivery the multiplier is 1x. The exact value is user-tunable
+    via ``trading_settings.intraday_leverage`` so the engine can match whatever
+    the broker actually honours for the trader's specific plan.
+    """
+    product_type = str(settings.get("product_type") or "INTRADAY").upper()
+    raw = settings.get("intraday_leverage")
+    try:
+        lev = float(raw) if raw else 5.0
+    except (TypeError, ValueError):
+        lev = 5.0
+    if product_type != "INTRADAY":
+        lev = 1.0
+    return max(float(available_margin), 0.0) * lev
+
+
 async def _get_open_trade_count() -> int:
     """Count open trades across both paper_trades and live_trades.
 
@@ -517,24 +536,27 @@ async def _calculate_quantity(
         max_loss = abs(settings.get("day_max_loss_paper", 1000) or 0)
         profit_target = settings.get("day_profit_target_paper", 2000) or 0
 
+    buying_power = _buying_power(available_margin, settings)
+
     sl_per_share = entry_price * sl_pct / 100.0
     target_per_share = entry_price * tgt_pct / 100.0
 
     if sl_per_share <= 0 or target_per_share <= 0:
-        if entry_price <= available_margin:
+        if entry_price <= buying_power:
             return 1
         return 0
 
     qty_from_loss = max_loss / sl_per_share if sl_per_share > 0 and max_loss > 0 else float("inf")
     qty_from_profit = profit_target / target_per_share if target_per_share > 0 and profit_target > 0 else float("inf")
-    qty_from_margin = available_margin / entry_price if entry_price > 0 else 0
+    qty_from_margin = buying_power / entry_price if entry_price > 0 else 0
 
     optimal_qty = int(math.floor(min(qty_from_loss, qty_from_profit, qty_from_margin)))
 
     if optimal_qty <= 0:
         logger.info(
             f"Capital limit: qty=0 mode={trade_mode} "
-            f"margin={available_margin:.0f} price={entry_price:.2f} "
+            f"margin={available_margin:.0f} buying_power={buying_power:.0f} "
+            f"price={entry_price:.2f} "
             f"qty_from_loss={qty_from_loss:.2f} qty_from_profit={qty_from_profit:.2f} "
             f"qty_from_margin={qty_from_margin:.2f}"
         )
@@ -1230,17 +1252,22 @@ async def _place_auto_trade(
             )
             return None
 
+        buying_power = _buying_power(available_margin, settings)
         trade_cost = entry_price * quantity
-        if trade_cost > available_margin:
-            quantity = int(math.floor(available_margin / entry_price))
+        if trade_cost > buying_power:
+            quantity = int(math.floor(buying_power / entry_price))
             if quantity <= 0:
                 _add_log("CAPITAL_LIMIT", symbol,
                          f"Rejected after margin check: mode={trade_mode}, "
-                         f"margin={available_margin:.0f}")
+                         f"margin={available_margin:.0f} buying_power={buying_power:.0f}")
                 _record_rejection(
                     "CAPITAL_LIMIT", symbol, signal_data, trade_mode,
-                    f"Trade cost exceeds {trade_mode} margin \u20b9{available_margin:.0f}",
-                    extra={"available_margin": round(available_margin, 2)},
+                    f"Trade cost exceeds {trade_mode} buying power \u20b9{buying_power:.0f} "
+                    f"(cash \u20b9{available_margin:.0f})",
+                    extra={
+                        "available_margin": round(available_margin, 2),
+                        "buying_power": round(buying_power, 2),
+                    },
                 )
                 return None
             trade_cost = entry_price * quantity
@@ -1265,7 +1292,7 @@ async def _place_auto_trade(
                     else abs(settings.get("day_max_loss_live", 2000) or 0)
                 sl_per_share = entry_price * sl_pct / 100.0 if sl_pct > 0 else entry_price
                 qty_from_loss = int(math.floor(max_loss / sl_per_share)) if sl_per_share > 0 else 0
-                qty_from_margin = int(math.floor(available_margin / entry_price)) if entry_price > 0 else 0
+                qty_from_margin = int(math.floor(buying_power / entry_price)) if entry_price > 0 else 0
                 max_qty_cap = min(q for q in (qty_from_loss, qty_from_margin) if q > 0) \
                     if (qty_from_loss > 0 and qty_from_margin > 0) \
                     else max(qty_from_loss, qty_from_margin, 1)
