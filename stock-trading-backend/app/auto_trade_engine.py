@@ -1404,6 +1404,67 @@ async def _place_auto_trade(
                          f"qty {original_qty}\u2192{quantity} after DELIVERY auto-routing "
                          f"(1x cash \u20b9{available_margin:.0f}; {routing_reason})")
 
+                # Brokerage profitability was validated earlier at the original
+                # (leveraged) qty. Charges have fixed components (₹20/leg cap,
+                # exchange minimums), so net profit doesn't scale linearly with
+                # qty — a trade that cleared ₹100 net at 50 shares can easily
+                # go net-negative at 10. Re-run the check at the recapped qty
+                # with DELIVERY charges and reject if the floor no longer clears.
+                if target and entry_price and target != entry_price:
+                    rc_min_net = float(
+                        settings.get("min_net_profit_per_trade", MIN_NET_PROFIT_PER_TRADE) or 0
+                    )
+                    rc_min_ratio = float(
+                        settings.get("min_profit_to_cost_ratio", MIN_PROFIT_TO_COST_RATIO) or 0
+                    )
+                    rc_check = is_trade_profitable_after_brokerage(
+                        entry_price, target, quantity,
+                        min_profit_ratio=rc_min_ratio,
+                        min_net_profit=rc_min_net,
+                        product_type="DELIVERY",
+                    )
+                    if not rc_check["profitable"]:
+                        rc_reason = []
+                        if not rc_check.get("ratio_ok", True):
+                            rc_reason.append(
+                                f"ratio {rc_check['profit_to_cost_ratio']:.2f}<{rc_min_ratio}"
+                            )
+                        if not rc_check.get("net_ok", True):
+                            rc_reason.append(
+                                f"net \u20b9{rc_check['net_profit']:.2f}<\u20b9{rc_min_net:.0f}"
+                            )
+                        _add_log(
+                            "BROKERAGE_FILTER", symbol,
+                            f"Rejected after DELIVERY recap: gross=\u20b9"
+                            f"{rc_check['gross_profit']:.2f}, charges=\u20b9"
+                            f"{rc_check['total_charges']:.2f}, qty={quantity} "
+                            f"({', '.join(rc_reason) or 'n/a'})",
+                        )
+                        _record_rejection(
+                            "BROKERAGE_FILTER", symbol, signal_data, trade_mode,
+                            f"DELIVERY recap ({original_qty}\u2192{quantity}) no longer profitable: "
+                            f"net \u20b9{rc_check['net_profit']:.2f} "
+                            f"(gross \u20b9{rc_check['gross_profit']:.2f} \u2212 charges "
+                            f"\u20b9{rc_check['total_charges']:.2f}); "
+                            f"{', '.join(rc_reason) or 'below floor'}",
+                            extra={
+                                "qty": quantity,
+                                "original_qty": original_qty,
+                                "product_type": product_type,
+                                "routing_reason": routing_reason,
+                                "gross_profit": round(rc_check["gross_profit"], 2),
+                                "total_charges": round(rc_check["total_charges"], 2),
+                                "net_profit": round(rc_check["net_profit"], 2),
+                                "min_net_profit": rc_min_net,
+                                "min_profit_to_cost_ratio": rc_min_ratio,
+                                "profit_to_cost_ratio": round(
+                                    rc_check.get("profit_to_cost_ratio") or 0, 3
+                                ),
+                                "charges_breakdown": rc_check.get("charges_breakdown"),
+                            },
+                        )
+                        return None
+
         # Gap 5: persist a richer per-trade snapshot so the audit/journal view
         # can explain WHY each trade was placed (all key indicator values, plus
         # fundamental + sentiment summaries). We pick a fixed whitelist of keys
