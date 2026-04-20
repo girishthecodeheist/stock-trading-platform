@@ -238,15 +238,18 @@ def _add_log(action: str, symbol: str, details: str):
 
 # Reasons we expose to the UI as "blocked" — everything else is either a
 # success or an internal error and shouldn't show up on the rejected panel.
+# The signal-quality / strategy gates (heatmap fallback, low volume,
+# regime filter, trend conflict, R:R, target-tight, brokerage filter,
+# cooldown) have been removed so that every ``TRADEABLE`` signal
+# (abs(score) >= min_score, confidence >= min_confidence,
+# signal != NEUTRAL) is placed, bounded only by the Max Open Trades cap
+# and the real safety / broker gates below.
 _REJECTION_REASONS = {
     "WEAK_SIGNAL",
     "LOW_CONFIDENCE",
     "DAILY_LIMIT",
-    "COOLDOWN",
-    "TREND_CONFLICT",
     "LIVE_NOT_CONNECTED",
     "CAPITAL_LIMIT",
-    "BROKERAGE_FILTER",
     "TRADING_HALTED",
     "OPEN_TRADES_FULL",
     "DUPLICATE_SYMBOL",
@@ -254,19 +257,9 @@ _REJECTION_REASONS = {
     # not allowed", insufficient funds on the real account, instrument
     # banned for intraday, etc.). Surfaces the raw broker message.
     "FYERS_REJECTED",
-    # Newer gates — keep in sync with the rejection reasons that
-    # _place_auto_trade passes to _record_rejection, otherwise the
-    # UI's "Blocked signals" panel silently drops them.
-    "FALLBACK_BLOCKED",
-    "LOW_VOLUME",
-    "BAD_RR",
-    "TARGET_TOO_TIGHT",
-    # v5: Nifty-index regime gate. Blocks BUYs in a crashing market and
-    # SELLs in a surging one.
-    "REGIME_BLOCK",
-    # v5.1: Scan-level gates that previously dropped silently so the UI could
-    # never explain "why isn't this BUY being placed?". All per-signal gates
-    # now record a rejection and attach a status to the signals row.
+    # Scan-level sentinels — the "no direction" and "per-scan slot
+    # allocator" reasons still surface on the UI so the user can tell
+    # a NEUTRAL from a slot-overflow.
     "NEUTRAL_SIGNAL",
     "SLOT_FULL",
 }
@@ -1042,11 +1035,6 @@ async def _place_auto_trade(
         min_confidence = _resolve_gate(
             "min_confidence", _gate_overrides, settings, MIN_CONFIDENCE_FOR_TRADE
         )
-        # Boolean-flavoured gates are stored as 0/1 in gate_overrides; default
-        # to enabled (1) when the user hasn't overridden them.
-        regime_confirm_enabled = bool(_gate_overrides.get("regime_confirm", 1))
-        duplicate_guard_enabled = bool(_gate_overrides.get("duplicate_guard", 1))
-
         trade_mode_peek = str(settings.get("trade_mode") or "PAPER").upper()
 
         if abs(score) < min_score:
@@ -1067,63 +1055,12 @@ async def _place_auto_trade(
             )
             return None
 
-        # Gap 2: never auto-trade heatmap-fallback signals. They exist only
-        # because the real indicator pipeline couldn't be run (no Fyers auth
-        # or not enough candles), so they're fine to *display* but must not
-        # drive real placements.
-        if analysis_basis == "heatmap_fallback":
-            _add_log("FALLBACK_BLOCKED", symbol,
-                     "Heatmap fallback signal blocked from auto-trade "
-                     "(no technical analysis available)")
-            _record_rejection(
-                "FALLBACK_BLOCKED", symbol, signal_data, trade_mode_peek,
-                "Heatmap fallback signal blocked from auto-trade",
-            )
-            return None
-
-        # Gap 8 / v5: reject trades where the move isn't volume-confirmed. Low
-        # volume on a "strong" signal almost always means thin-book noise.
-        # Threshold tightened from 0.5 → 0.8 to drop more low-conviction setups.
-        trade_volume_ratio = signal_data.get("volume_ratio")
-        if trade_volume_ratio is not None and trade_volume_ratio < 0.8:
-            _add_log("LOW_VOLUME", symbol,
-                     f"Volume ratio {trade_volume_ratio:.2f} below minimum 0.8. Skipping.")
-            _record_rejection(
-                "LOW_VOLUME", symbol, signal_data, trade_mode_peek,
-                f"Volume ratio {trade_volume_ratio:.2f}x below 0.8x average",
-            )
-            return None
-
-        # v5: REGIME GATE — don't take BUYs into a crashing Nifty or SELLs into a
-        # surging one. Scan loop passes the shared snapshot; fall back to a
-        # cached fetch for monitor-loop re-analysis entries.
-        # The user can disable this gate entirely via the Indicators Control
-        # page (gate_overrides["regime_confirm"] = 0).
+        # Signal-quality / strategy gates (heatmap fallback, low volume,
+        # Nifty regime filter) were removed — any TRADEABLE signal is
+        # placed, bounded only by Max Open Trades and the safety/broker
+        # gates further down. The market regime is still resolved so it
+        # can be persisted on the trade snapshot for post-mortem analysis.
         regime = market_regime or await _detect_market_regime()
-        if regime_confirm_enabled and side == "BUY" and not regime.get("allow_buy", True):
-            _add_log(
-                "REGIME_BLOCK", symbol,
-                f"BUY blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
-                f"({regime.get('regime', 'UNKNOWN')})",
-            )
-            _record_rejection(
-                "REGIME_BLOCK", symbol, signal_data, trade_mode_peek,
-                f"BUY blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
-                f"({regime.get('regime', 'UNKNOWN')})",
-            )
-            return None
-        if regime_confirm_enabled and side == "SELL" and not regime.get("allow_sell", True):
-            _add_log(
-                "REGIME_BLOCK", symbol,
-                f"SELL blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
-                f"({regime.get('regime', 'UNKNOWN')})",
-            )
-            _record_rejection(
-                "REGIME_BLOCK", symbol, signal_data, trade_mode_peek,
-                f"SELL blocked: Nifty {regime.get('nifty_change_pct', 0):+.2f}% "
-                f"({regime.get('regime', 'UNKNOWN')})",
-            )
-            return None
 
         # v4: DAILY TRADE LIMIT
         _trades_placed_today = await _get_trades_placed_today()
@@ -1141,27 +1078,9 @@ async def _place_auto_trade(
             )
             return None
 
-        # v4: COOLDOWN CHECK — skippable via the duplicate_guard gate toggle.
-        if duplicate_guard_enabled and _is_on_cooldown(symbol):
-            last_time = _last_trade_time_per_symbol.get(symbol)
-            elapsed = int((datetime.now(IST) - last_time).total_seconds()) if last_time else 0
-            _add_log("COOLDOWN", symbol,
-                     f"On cooldown ({elapsed}s / {TRADE_COOLDOWN_SECS}s). Skipping.")
-            _record_rejection(
-                "COOLDOWN", symbol, signal_data, trade_mode_peek,
-                f"Re-entry cooldown: {elapsed}s / {TRADE_COOLDOWN_SECS}s",
-            )
-            return None
-
-        # v4: MULTI-TIMEFRAME CONFIRMATION
-        if analyzed_timeframe != "1D":
-            confirmed = await _confirm_with_daily_trend(symbol, signal_type)
-            if not confirmed:
-                _record_rejection(
-                    "TREND_CONFLICT", symbol, signal_data, trade_mode_peek,
-                    f"{analyzed_timeframe} {signal_type} conflicts with 1D trend",
-                )
-                return None
+        # Cooldown + multi-timeframe trend-conflict gates removed —
+        # every TRADEABLE signal is placed regardless of per-symbol
+        # re-entry timing or 1D-vs-intraday direction.
 
         # v4: REALISTIC TARGET CAPPING
         price_range = await _get_recent_price_range(symbol, days=5)
@@ -1170,57 +1089,10 @@ async def _place_auto_trade(
                 entry_price, stop_loss, target, side, price_range, atr
             )
 
-        # Gap 7: once targets are capped to recent price action, re-check the
-        # risk:reward. If capping crushed the reward side down to where R:R
-        # is below 1.5 (or the target distance collapsed to <0.3%), there's
-        # no edge left — skip the trade rather than placing a negative-EV one.
-        if stop_loss and target and entry_price:
-            if side == "BUY":
-                reward_distance = target - entry_price
-                risk_distance = entry_price - stop_loss
-            else:
-                reward_distance = entry_price - target
-                risk_distance = stop_loss - entry_price
-
-            # If target capping pushed the SL to the wrong side of entry
-            # (e.g. entry=98 but recent_low=101 clamped SL up to 101 on a
-            # BUY), risk_distance is zero/negative and the trade would fill
-            # into an instant SL hit on the next monitor tick. Reject these
-            # outright instead of silently skipping the R:R check.
-            if risk_distance <= 0:
-                _add_log("BAD_RR", symbol,
-                         f"Stop loss on wrong side of entry after capping. "
-                         f"Entry={entry_price}, SL={stop_loss}, Side={side}. Skipping.")
-                _record_rejection(
-                    "BAD_RR", symbol, signal_data, trade_mode_peek,
-                    f"Invalid SL placement: SL={stop_loss} vs entry={entry_price} "
-                    f"for {side} trade (risk_distance={risk_distance:.2f})",
-                )
-                return None
-
-            rr_ratio = reward_distance / risk_distance
-            if rr_ratio < 1.5:
-                _add_log("BAD_RR", symbol,
-                         f"Risk:Reward {rr_ratio:.2f} below 1.5 after capping. "
-                         f"Entry={entry_price}, SL={stop_loss}, Target={target}. Skipping.")
-                _record_rejection(
-                    "BAD_RR", symbol, signal_data, trade_mode_peek,
-                    f"R:R {rr_ratio:.2f} < 1.5 after target capping "
-                    f"(entry={entry_price}, SL={stop_loss}, target={target})",
-                )
-                return None
-
-            min_target_pct = 0.3
-            target_pct_actual = abs(reward_distance / entry_price * 100) if entry_price else 0
-            if target_pct_actual < min_target_pct:
-                _add_log("TARGET_TOO_TIGHT", symbol,
-                         f"Target distance {target_pct_actual:.2f}% below minimum "
-                         f"{min_target_pct}%. Skipping.")
-                _record_rejection(
-                    "TARGET_TOO_TIGHT", symbol, signal_data, trade_mode_peek,
-                    f"Target distance {target_pct_actual:.2f}% < min {min_target_pct}%",
-                )
-                return None
+        # BAD_RR / TARGET_TOO_TIGHT gates removed — target capping still
+        # runs (see _cap_targets_to_range above) but we no longer reject
+        # trades whose post-cap risk:reward falls below 1.5 or whose
+        # target distance is under 0.3%.
 
         sl_pct = settings.get("default_sl_percent", 1.0)
         tgt_pct = settings.get("default_target_percent", 1.0)
@@ -1345,51 +1217,10 @@ async def _place_auto_trade(
                     quantity = bumped
                     trade_cost = entry_price * quantity
 
-            brokerage_check = is_trade_profitable_after_brokerage(
-                entry_price, target, quantity,
-                min_profit_ratio=min_ratio,
-                min_net_profit=min_net,
-            )
-            if not brokerage_check["profitable"]:
-                reason = []
-                if not brokerage_check.get("ratio_ok", True):
-                    reason.append(f"ratio {brokerage_check['profit_to_cost_ratio']:.2f}<{min_ratio}")
-                if not brokerage_check.get("net_ok", True):
-                    reason.append(f"net ₹{brokerage_check['net_profit']:.2f}<₹{min_net:.0f}")
-                _add_log("BROKERAGE_FILTER", symbol,
-                         f"Rejected: gross=₹{brokerage_check['gross_profit']:.2f}, "
-                         f"charges=₹{brokerage_check['total_charges']:.2f}, "
-                         f"qty={quantity} ({', '.join(reason) or 'n/a'})")
-                _push_event("BROKERAGE_FILTER", {
-                    "symbol": symbol,
-                    "qty": quantity,
-                    "gross_profit": brokerage_check["gross_profit"],
-                    "total_charges": brokerage_check["total_charges"],
-                    "net_profit": brokerage_check["net_profit"],
-                    "min_net_profit": min_net,
-                    "min_required_ratio": min_ratio,
-                    "message": "Trade rejected: would not be profitable after charges"
-                })
-                _record_rejection(
-                    "BROKERAGE_FILTER", symbol, signal_data, trade_mode,
-                    f"Net \u20b9{brokerage_check['net_profit']:.2f} at qty={quantity} "
-                    f"(gross \u20b9{brokerage_check['gross_profit']:.2f} \u2212 charges "
-                    f"\u20b9{brokerage_check['total_charges']:.2f}); "
-                    f"{', '.join(reason) or 'below floor'}",
-                    extra={
-                        "qty": quantity,
-                        "gross_profit": round(brokerage_check["gross_profit"], 2),
-                        "total_charges": round(brokerage_check["total_charges"], 2),
-                        "net_profit": round(brokerage_check["net_profit"], 2),
-                        "min_net_profit": min_net,
-                        "min_profit_to_cost_ratio": min_ratio,
-                        "profit_to_cost_ratio": round(
-                            brokerage_check.get("profit_to_cost_ratio") or 0, 3
-                        ),
-                        "charges_breakdown": brokerage_check.get("charges_breakdown"),
-                    },
-                )
-                return None
+            # BROKERAGE_FILTER gate removed — the qty-bump above still runs
+            # so sizing aims at the net-profit floor, but we no longer
+            # reject a trade when brokerage charges exceed the projected
+            # profit.
 
         # F1 + F6: pick INTRADAY vs DELIVERY. The user-level default in
         # ``trading_settings.product_type`` is the fallback; auto-routing
@@ -1447,64 +1278,10 @@ async def _place_auto_trade(
             # net-negative as CNC even at the same qty. Charges also have fixed
             # components (₹20/leg cap, exchange minimums), so the check is
             # qty-sensitive too.
-            if target and entry_price and target != entry_price:
-                rc_min_net = float(
-                    settings.get("min_net_profit_per_trade", MIN_NET_PROFIT_PER_TRADE) or 0
-                )
-                rc_min_ratio = float(
-                    settings.get("min_profit_to_cost_ratio", MIN_PROFIT_TO_COST_RATIO) or 0
-                )
-                rc_check = is_trade_profitable_after_brokerage(
-                    entry_price, target, quantity,
-                    min_profit_ratio=rc_min_ratio,
-                    min_net_profit=rc_min_net,
-                    product_type="DELIVERY",
-                )
-                if not rc_check["profitable"]:
-                    rc_reason = []
-                    if not rc_check.get("ratio_ok", True):
-                        rc_reason.append(
-                            f"ratio {rc_check['profit_to_cost_ratio']:.2f}<{rc_min_ratio}"
-                        )
-                    if not rc_check.get("net_ok", True):
-                        rc_reason.append(
-                            f"net \u20b9{rc_check['net_profit']:.2f}<\u20b9{rc_min_net:.0f}"
-                        )
-                    qty_note = (
-                        f"{original_qty}\u2192{quantity}" if quantity != original_qty
-                        else f"qty={quantity}"
-                    )
-                    _add_log(
-                        "BROKERAGE_FILTER", symbol,
-                        f"Rejected under DELIVERY charges ({qty_note}): gross=\u20b9"
-                        f"{rc_check['gross_profit']:.2f}, charges=\u20b9"
-                        f"{rc_check['total_charges']:.2f} "
-                        f"({', '.join(rc_reason) or 'n/a'})",
-                    )
-                    _record_rejection(
-                        "BROKERAGE_FILTER", symbol, signal_data, trade_mode,
-                        f"Auto-routed to DELIVERY ({qty_note}) no longer profitable: "
-                        f"net \u20b9{rc_check['net_profit']:.2f} "
-                        f"(gross \u20b9{rc_check['gross_profit']:.2f} \u2212 charges "
-                        f"\u20b9{rc_check['total_charges']:.2f}); "
-                        f"{', '.join(rc_reason) or 'below floor'}",
-                        extra={
-                            "qty": quantity,
-                            "original_qty": original_qty,
-                            "product_type": product_type,
-                            "routing_reason": routing_reason,
-                            "gross_profit": round(rc_check["gross_profit"], 2),
-                            "total_charges": round(rc_check["total_charges"], 2),
-                            "net_profit": round(rc_check["net_profit"], 2),
-                            "min_net_profit": rc_min_net,
-                            "min_profit_to_cost_ratio": rc_min_ratio,
-                            "profit_to_cost_ratio": round(
-                                rc_check.get("profit_to_cost_ratio") or 0, 3
-                            ),
-                            "charges_breakdown": rc_check.get("charges_breakdown"),
-                        },
-                    )
-                    return None
+            # BROKERAGE_FILTER re-check under DELIVERY charges removed —
+            # auto-routing still flips INTRADAY → DELIVERY when appropriate,
+            # but we no longer reject the trade when DELIVERY charges push
+            # the net profit below the floor.
 
         # Gap 5: persist a richer per-trade snapshot so the audit/journal view
         # can explain WHY each trade was placed (all key indicator values, plus
@@ -2027,11 +1804,6 @@ async def _scan_and_trade() -> int:
     min_confidence = _resolve_gate(
         "min_confidence", _gate_overrides, settings, MIN_CONFIDENCE_FOR_TRADE
     )
-    # Same boolean-flavoured gates ``_place_auto_trade`` reads — needed so
-    # the scan-loop pre-filter below respects the Indicators Control toggle
-    # instead of silently rejecting on cooldown even when duplicate_guard=0.
-    duplicate_guard_enabled = bool(_gate_overrides.get("duplicate_guard", 1))
-
     trade_mode_peek = str(settings.get("trade_mode") or "PAPER").upper()
 
     # --- Slot / cap gates (apply to every analyzed tradeable signal) --------
@@ -2098,14 +1870,8 @@ async def _scan_and_trade() -> int:
                 "Already have an open trade on this symbol",
             )
             continue
-        if duplicate_guard_enabled and _is_on_cooldown(sym):
-            last_time = _last_trade_time_per_symbol.get(sym)
-            elapsed = int((datetime.now(IST) - last_time).total_seconds()) if last_time else 0
-            _record_rejection(
-                "COOLDOWN", sym, sd, trade_mode_peek,
-                f"Re-entry cooldown: {elapsed}s / {TRADE_COOLDOWN_SECS}s",
-            )
-            continue
+        # COOLDOWN gate removed — per-symbol re-entry timing no longer
+        # blocks the scan; Max Open Trades + DUPLICATE_SYMBOL still apply.
         if slots_full:
             _record_rejection(
                 "OPEN_TRADES_FULL", sym, sd, trade_mode_peek,
