@@ -25,6 +25,8 @@ from app import fyers_client
 from app.heatmap_poller import heatmap_poller
 from app.indicator_engine import compute_all_indicators
 from app.signal_engine import generate_signal
+from app.fundamental_engine import get_fundamental_data
+from app.news_engine import get_news_sentiment
 from app.brokerage_calc import (
     calc_brokerage,
     compare_intraday_vs_delivery,
@@ -126,6 +128,45 @@ _daily_target_met = False
 _trades_placed_today: int = 0
 _last_trade_time_per_symbol: Dict[str, datetime] = {}
 
+# Gap 1: In-memory caches for fundamental + sentiment data so the per-scan
+# analysis loop doesn't re-fetch them for every stock every 2 minutes.
+# Fundamentals don't change intraday; news sentiment refreshes a bit faster.
+_FUNDAMENTAL_CACHE_TTL_SECS = 10 * 60  # 10 minutes
+_SENTIMENT_CACHE_TTL_SECS = 5 * 60     # 5 minutes
+_fundamental_cache: Dict[str, tuple] = {}  # symbol -> (expires_at, data)
+_sentiment_cache: Dict[str, tuple] = {}    # symbol -> (expires_at, data)
+
+
+async def _get_fundamental_cached(symbol: str) -> Optional[dict]:
+    """Fetch fundamental data with a TTL cache to avoid hammering the API."""
+    now = time.time()
+    hit = _fundamental_cache.get(symbol)
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        data = await get_fundamental_data(symbol)
+    except Exception as ex:
+        logger.debug(f"Fundamental fetch failed for {symbol}: {ex}")
+        return None
+    _fundamental_cache[symbol] = (now + _FUNDAMENTAL_CACHE_TTL_SECS, data)
+    return data
+
+
+async def _get_sentiment_cached(symbol: str) -> Optional[dict]:
+    """Fetch news sentiment with a short TTL cache."""
+    now = time.time()
+    hit = _sentiment_cache.get(symbol)
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        data = await get_news_sentiment(symbol)
+    except Exception as ex:
+        logger.debug(f"Sentiment fetch failed for {symbol}: {ex}")
+        return None
+    _sentiment_cache[symbol] = (now + _SENTIMENT_CACHE_TTL_SECS, data)
+    return data
+
+
 # SSE subscribers: list of asyncio.Queue objects
 _sse_subscribers: list = []
 
@@ -213,6 +254,13 @@ _REJECTION_REASONS = {
     # not allowed", insufficient funds on the real account, instrument
     # banned for intraday, etc.). Surfaces the raw broker message.
     "FYERS_REJECTED",
+    # Newer gates — keep in sync with the rejection reasons that
+    # _place_auto_trade passes to _record_rejection, otherwise the
+    # UI's "Blocked signals" panel silently drops them.
+    "FALLBACK_BLOCKED",
+    "LOW_VOLUME",
+    "BAD_RR",
+    "TARGET_TOO_TIGHT",
 }
 
 
@@ -623,6 +671,9 @@ async def _analyze_stock(stock: dict, timeframe: str = "15m") -> Optional[dict]:
 
     signal_data = None
     analysis_basis = "heatmap_fallback"
+    indicators: Optional[dict] = None
+    fundamental: Optional[dict] = None
+    sentiment: Optional[dict] = None
 
     if fyers_client.is_authenticated():
         try:
@@ -632,7 +683,25 @@ async def _analyze_stock(stock: dict, timeframe: str = "15m") -> Optional[dict]:
                 df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
                 df["volume"] = df["volume"].astype(float)
                 indicators = compute_all_indicators(df)
-                signal_data = generate_signal(indicators, instrument_type="EQUITY")
+
+                # Gap 1: fetch fundamental + sentiment so generate_signal's
+                # 40/35/25 weighting is actually exercised. Both fetches are
+                # cached per-symbol to avoid slowing the 2-min scan loop.
+                fundamental = await _get_fundamental_cached(symbol)
+                sentiment = await _get_sentiment_cached(symbol)
+
+                signal_data = generate_signal(
+                    indicators,
+                    fundamental=fundamental,
+                    sentiment=sentiment,
+                    instrument_type="EQUITY",
+                )
+
+                # Gap 8: attach volume info so downstream filters can use it
+                # without re-peeking at the indicators dict.
+                if signal_data is not None:
+                    signal_data["volume"] = stock.get("volume", 0)
+                    signal_data["volume_ratio"] = indicators.get("volume_ratio")
 
                 has_tech = signal_data.get("technical_score", 0) != 0
                 has_fund = signal_data.get("fundamental_score", 0) != 0
@@ -705,6 +774,9 @@ async def _analyze_stock(stock: dict, timeframe: str = "15m") -> Optional[dict]:
         "signal_data": signal_data,
         "analysis_basis": analysis_basis,
         "analyzed_timeframe": timeframe,
+        "indicators": indicators,
+        "fundamental": fundamental,
+        "sentiment": sentiment,
     }
 
 
@@ -717,12 +789,14 @@ async def _confirm_with_daily_trend(symbol: str, intraday_signal: str) -> bool:
     Returns True if daily trend confirms the intraday signal.
     """
     if not fyers_client.is_authenticated():
-        return True  # Can't confirm, allow the trade
+        # Gap 10: can't confirm, REJECT rather than allowing the trade blind.
+        return False
 
     try:
         candles = await fyers_client.get_historical_data_async(symbol, timeframe="1D", days_back=20)
         if not candles or len(candles) < 10:
-            return True  # Not enough data, allow
+            # Gap 10: not enough data to confirm, REJECT.
+            return False
 
         df = pd.DataFrame(candles)
         df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
@@ -733,16 +807,17 @@ async def _confirm_with_daily_trend(symbol: str, intraday_signal: str) -> bool:
         daily_direction = daily_signal.get("signal", "NEUTRAL")
         daily_score = daily_signal.get("score", 0)
 
-        # Check for conflict
+        # Check for conflict. Gap 4: lowered conflict threshold from ±30 to ±15
+        # so even moderately opposing daily trend blocks the intraday trade.
         if "BUY" in intraday_signal.upper():
-            # Intraday wants to BUY - check daily isn't strongly bearish
-            if "SELL" in daily_direction.upper() and daily_score <= -30:
+            # Intraday wants to BUY - check daily isn't bearish
+            if "SELL" in daily_direction.upper() and daily_score <= -15:
                 _add_log("TREND_CONFLICT", symbol,
                          f"Intraday={intraday_signal} but Daily={daily_direction} (score={daily_score}). Skipping.")
                 return False
         elif "SELL" in intraday_signal.upper():
-            # Intraday wants to SELL - check daily isn't strongly bullish
-            if "BUY" in daily_direction.upper() and daily_score >= 30:
+            # Intraday wants to SELL - check daily isn't bullish
+            if "BUY" in daily_direction.upper() and daily_score >= 15:
                 _add_log("TREND_CONFLICT", symbol,
                          f"Intraday={intraday_signal} but Daily={daily_direction} (score={daily_score}). Skipping.")
                 return False
@@ -750,14 +825,18 @@ async def _confirm_with_daily_trend(symbol: str, intraday_signal: str) -> bool:
         return True
     except Exception as e:
         logger.debug(f"Daily trend confirmation failed for {symbol}: {e}")
-        return True  # On error, allow the trade
+        # Gap 10: on error, REJECT — never assume a daily trend is fine.
+        return False
 
 
 # --- Trade Placement ----------------------------------------------------------
 
 async def _place_auto_trade(
     symbol: str, signal_data: dict, settings: dict,
-    analysis_basis: str = "technical", analyzed_timeframe: str = "15m"
+    analysis_basis: str = "technical", analyzed_timeframe: str = "15m",
+    indicators: Optional[dict] = None,
+    fundamental: Optional[dict] = None,
+    sentiment: Optional[dict] = None,
 ) -> Optional[int]:
     """Auto-place a paper trade based on signal. Returns trade_id or None.
 
@@ -815,6 +894,32 @@ async def _place_auto_trade(
             )
             return None
 
+        # Gap 2: never auto-trade heatmap-fallback signals. They exist only
+        # because the real indicator pipeline couldn't be run (no Fyers auth
+        # or not enough candles), so they're fine to *display* but must not
+        # drive real placements.
+        if analysis_basis == "heatmap_fallback":
+            _add_log("FALLBACK_BLOCKED", symbol,
+                     "Heatmap fallback signal blocked from auto-trade "
+                     "(no technical analysis available)")
+            _record_rejection(
+                "FALLBACK_BLOCKED", symbol, signal_data, trade_mode_peek,
+                "Heatmap fallback signal blocked from auto-trade",
+            )
+            return None
+
+        # Gap 8: reject trades where the move isn't volume-confirmed. Low
+        # volume on a "strong" signal almost always means thin-book noise.
+        trade_volume_ratio = signal_data.get("volume_ratio")
+        if trade_volume_ratio is not None and trade_volume_ratio < 0.5:
+            _add_log("LOW_VOLUME", symbol,
+                     f"Volume ratio {trade_volume_ratio:.2f}x too low. Skipping.")
+            _record_rejection(
+                "LOW_VOLUME", symbol, signal_data, trade_mode_peek,
+                f"Volume ratio {trade_volume_ratio:.2f}x below 0.5x average",
+            )
+            return None
+
         # v4: DAILY TRADE LIMIT
         _trades_placed_today = await _get_trades_placed_today()
         if _trades_placed_today >= max_trades_day:
@@ -859,6 +964,58 @@ async def _place_auto_trade(
             stop_loss, target = _cap_targets_to_range(
                 entry_price, stop_loss, target, side, price_range, atr
             )
+
+        # Gap 7: once targets are capped to recent price action, re-check the
+        # risk:reward. If capping crushed the reward side down to where R:R
+        # is below 1.5 (or the target distance collapsed to <0.3%), there's
+        # no edge left — skip the trade rather than placing a negative-EV one.
+        if stop_loss and target and entry_price:
+            if side == "BUY":
+                reward_distance = target - entry_price
+                risk_distance = entry_price - stop_loss
+            else:
+                reward_distance = entry_price - target
+                risk_distance = stop_loss - entry_price
+
+            # If target capping pushed the SL to the wrong side of entry
+            # (e.g. entry=98 but recent_low=101 clamped SL up to 101 on a
+            # BUY), risk_distance is zero/negative and the trade would fill
+            # into an instant SL hit on the next monitor tick. Reject these
+            # outright instead of silently skipping the R:R check.
+            if risk_distance <= 0:
+                _add_log("BAD_RR", symbol,
+                         f"Stop loss on wrong side of entry after capping. "
+                         f"Entry={entry_price}, SL={stop_loss}, Side={side}. Skipping.")
+                _record_rejection(
+                    "BAD_RR", symbol, signal_data, trade_mode_peek,
+                    f"Invalid SL placement: SL={stop_loss} vs entry={entry_price} "
+                    f"for {side} trade (risk_distance={risk_distance:.2f})",
+                )
+                return None
+
+            rr_ratio = reward_distance / risk_distance
+            if rr_ratio < 1.5:
+                _add_log("BAD_RR", symbol,
+                         f"Risk:Reward {rr_ratio:.2f} below 1.5 after capping. "
+                         f"Entry={entry_price}, SL={stop_loss}, Target={target}. Skipping.")
+                _record_rejection(
+                    "BAD_RR", symbol, signal_data, trade_mode_peek,
+                    f"R:R {rr_ratio:.2f} < 1.5 after target capping "
+                    f"(entry={entry_price}, SL={stop_loss}, target={target})",
+                )
+                return None
+
+            min_target_pct = 0.3
+            target_pct_actual = abs(reward_distance / entry_price * 100) if entry_price else 0
+            if target_pct_actual < min_target_pct:
+                _add_log("TARGET_TOO_TIGHT", symbol,
+                         f"Target distance {target_pct_actual:.2f}% below minimum "
+                         f"{min_target_pct}%. Skipping.")
+                _record_rejection(
+                    "TARGET_TOO_TIGHT", symbol, signal_data, trade_mode_peek,
+                    f"Target distance {target_pct_actual:.2f}% < min {min_target_pct}%",
+                )
+                return None
 
         sl_pct = settings.get("default_sl_percent", 1.0)
         tgt_pct = settings.get("default_target_percent", 1.0)
@@ -1033,6 +1190,26 @@ async def _place_auto_trade(
         else:
             product_type = auto_product_type
 
+        # Gap 5: persist a richer per-trade snapshot so the audit/journal view
+        # can explain WHY each trade was placed (all key indicator values, plus
+        # fundamental + sentiment summaries). We pick a fixed whitelist of keys
+        # to avoid dumping the entire indicator DataFrame into JSON.
+        key_indicators: Dict[str, Any] = {}
+        if indicators:
+            for key in (
+                "rsi", "macd_line", "macd_signal", "macd_hist",
+                "sma_20", "sma_50", "sma_200", "ema_9", "ema_20",
+                "bb_upper", "bb_mid", "bb_lower", "bb_pct_b",
+                "atr", "adx", "di_plus", "di_minus",
+                "supertrend", "supertrend_direction",
+                "volume_ratio", "volume_trend", "vwap",
+                "stoch_k", "stoch_d", "williams_r", "cci", "mfi",
+                "obv_trend", "current_price", "trend_strength",
+                "support_1", "resistance_1", "guppy_signal",
+            ):
+                if key in indicators:
+                    key_indicators[key] = indicators[key]
+
         snapshot = {
             "auto_trade": True,
             "mode": trade_mode,
@@ -1044,6 +1221,11 @@ async def _place_auto_trade(
             "trade_cost": round(trade_cost, 2),
             "product_type": product_type,
             "product_type_reason": routing_reason,
+            "indicators": key_indicators,
+            "fundamental_score": fundamental.get("fundamental_score") if fundamental else None,
+            "sentiment_score": sentiment.get("sentiment_score") if sentiment else None,
+            "fundamental_signal": fundamental.get("fundamental_signal") if fundamental else None,
+            "sentiment_classification": sentiment.get("sentiment_classification") if sentiment else None,
         }
 
         full_reasons = list(reasons) if isinstance(reasons, list) else [str(reasons)]
@@ -1321,24 +1503,41 @@ async def _place_auto_trade(
 # --- Heatmap Top 20 -----------------------------------------------------------
 
 async def _get_top20_stocks() -> list:
-    """Get top 10 gainers + top 10 losers from heatmap = 20 stocks max."""
-    gainers = heatmap_poller.get_top_gainers(10)
-    losers = heatmap_poller.get_top_losers(10)
+    """Get stocks for analysis - mix of movers with room to run.
+
+    Gap 3: scan a wider universe (top 20 gainers + top 20 losers) and then
+    filter out:
+      * Stocks that already ran >MAX_CHANGE_PCT% (likely exhausted their move)
+      * Stocks barely moving (<MIN_CHANGE_PCT%, no momentum)
+      * Illiquid names (below minimum traded volume)
+    """
+    gainers = heatmap_poller.get_top_gainers(20)
+    losers = heatmap_poller.get_top_losers(20)
     if not gainers and not losers:
         try:
             await heatmap_poller.poll_heatmap()
-            gainers = heatmap_poller.get_top_gainers(10)
-            losers = heatmap_poller.get_top_losers(10)
+            gainers = heatmap_poller.get_top_gainers(20)
+            losers = heatmap_poller.get_top_losers(20)
         except Exception as e:
             logger.warning(f"Heatmap poll failed: {e}")
+
+    MAX_CHANGE_PCT = 4.0   # Skip stocks that already moved too much
+    MIN_CHANGE_PCT = 0.3   # Skip stocks barely moving
+    MIN_VOLUME = 100000    # Minimum traded volume (liquidity filter)
 
     seen: set = set()
     top20: list = []
     for s in gainers + losers:
         sym = s["symbol"]
-        if sym not in seen and s.get("ltp", 0) > 0:
+        abs_change = abs(s.get("change_pct", 0))
+        if (sym not in seen
+                and s.get("ltp", 0) > 0
+                and MIN_CHANGE_PCT <= abs_change <= MAX_CHANGE_PCT
+                and s.get("volume", 0) >= MIN_VOLUME):
             seen.add(sym)
             top20.append(s)
+        if len(top20) >= 20:
+            break
     return top20
 
 
@@ -1418,7 +1617,11 @@ async def _scan_and_trade() -> int:
         _last_scan_time = datetime.now(IST)
         return 0
 
-    _add_log("SCAN_START", "", f"Scanning top {len(top20)} stocks (10 gainers + 10 losers)")
+    _add_log(
+        "SCAN_START", "",
+        f"Scanning {len(top20)} stocks "
+        f"(filtered from top 20 gainers + top 20 losers)",
+    )
 
     # v4: Use 15m timeframe for intraday analysis
     analyzed: list = []
@@ -1475,7 +1678,10 @@ async def _scan_and_trade() -> int:
         trade_id = await _place_auto_trade(
             sym, pick["signal_data"], settings,
             analysis_basis=pick.get("analysis_basis", "technical"),
-            analyzed_timeframe=pick.get("analyzed_timeframe", "15m")
+            analyzed_timeframe=pick.get("analyzed_timeframe", "15m"),
+            indicators=pick.get("indicators"),
+            fundamental=pick.get("fundamental"),
+            sentiment=pick.get("sentiment"),
         )
         if trade_id:
             placed += 1
@@ -1551,6 +1757,41 @@ async def _monitor_open_trades(settings: dict) -> int:
         ltp = price_data.get("ltp", 0)
         if ltp <= 0:
             continue
+
+        # --- Gap 6: MFE/MAE Tracking ---
+        # Update highest/lowest observed price and max run-up / max drawdown
+        # so the trade journal can show how much of the move was captured.
+        # Use SQL GREATEST/LEAST to stay race-free across the monitor loop.
+        try:
+            if side == "BUY":
+                runup_pct = (ltp - entry_price) / entry_price * 100 if entry_price else 0
+                drawdown_pct = (
+                    (entry_price - ltp) / entry_price * 100
+                    if entry_price and ltp < entry_price else 0
+                )
+            else:
+                runup_pct = (entry_price - ltp) / entry_price * 100 if entry_price else 0
+                drawdown_pct = (
+                    (ltp - entry_price) / entry_price * 100
+                    if entry_price and ltp > entry_price else 0
+                )
+            async with async_session_factory() as db:
+                await db.execute(text(
+                    "UPDATE paper_trades SET "
+                    "highest_price = GREATEST(COALESCE(highest_price, 0), :ltp), "
+                    "lowest_price = LEAST(COALESCE(lowest_price, 999999), :ltp), "
+                    "max_runup = GREATEST(COALESCE(max_runup, 0), :runup), "
+                    "max_drawdown = GREATEST(COALESCE(max_drawdown, 0), :drawdown) "
+                    "WHERE id = :id AND status = 'OPEN'"
+                ), {
+                    "ltp": ltp,
+                    "runup": round(runup_pct, 2),
+                    "drawdown": round(drawdown_pct, 2),
+                    "id": trade_id,
+                })
+                await db.commit()
+        except Exception as e:
+            logger.debug(f"MFE/MAE update failed for trade #{trade_id}: {e}")
 
         # --- Trailing Profit Protection ---
         if target and stop_loss:
@@ -1653,7 +1894,102 @@ async def _monitor_open_trades(settings: dict) -> int:
                     elif side == "SELL" and "BUY" in new_signal.upper():
                         is_reversal = True
 
-                    if is_reversal and abs(new_score) >= 20:
+                    # Gap 9: on a *strong* reversal (|score| >= 40) close the
+                    # trade immediately at market instead of just tightening
+                    # the stop — waiting for the SL to get hit gives back more
+                    # of the move than the reversal score justifies.
+                    if is_reversal and abs(new_score) >= 40:
+                        try:
+                            if side == "BUY":
+                                pnl_pct = (ltp - entry_price) / entry_price * 100 if entry_price else 0
+                                pnl_amount = (ltp - entry_price) * quantity
+                                buy_leg = entry_price
+                                sell_leg = ltp
+                            else:
+                                pnl_pct = (entry_price - ltp) / entry_price * 100 if entry_price else 0
+                                pnl_amount = (entry_price - ltp) * quantity
+                                buy_leg = ltp
+                                sell_leg = entry_price
+
+                            if pnl_pct > 0:
+                                result_str = "WIN"
+                            elif pnl_pct < 0:
+                                result_str = "LOSS"
+                            else:
+                                result_str = "BREAKEVEN"
+
+                            # Mirror the SL/target close path: persist Fyers
+                            # charges so net_pnl / gross_pnl / brokerage columns
+                            # aren't NULL for reversal-exit trades.
+                            buy_value = buy_leg * quantity
+                            sell_value = sell_leg * quantity
+                            charges = calc_brokerage(
+                                buy_value, sell_value, quantity,
+                                product_type=product_type,
+                            )
+                            total_charges = float(charges["total_charges"])
+                            net_pnl = round(float(pnl_amount) - total_charges, 2)
+
+                            async with async_session_factory() as db:
+                                await db.execute(text(
+                                    "UPDATE paper_trades SET "
+                                    "exit_price = :exit_price, exit_time = :exit_time, "
+                                    "status = 'CLOSED', result = :result, "
+                                    "pnl_percent = :pnl_pct, pnl_amount = :pnl_amount, "
+                                    "exit_reason = :exit_reason, "
+                                    "brokerage = :brokerage, stt = :stt, "
+                                    "exchange_charges = :exchange, gst = :gst, "
+                                    "sebi_charges = :sebi, stamp_duty = :stamp, "
+                                    "gross_pnl = :gross_pnl, net_pnl = :net_pnl "
+                                    "WHERE id = :id AND status = 'OPEN'"
+                                ), {
+                                    "exit_price": round(ltp, 2),
+                                    "exit_time": datetime.now(IST).replace(tzinfo=None),
+                                    "result": result_str,
+                                    "pnl_pct": round(pnl_pct, 2),
+                                    "pnl_amount": round(pnl_amount, 2),
+                                    "exit_reason": "STRONG_REVERSAL_EXIT",
+                                    "brokerage": float(charges["brokerage"]),
+                                    "stt": float(charges["stt"]),
+                                    "exchange": float(charges["exchange_charges"]),
+                                    "gst": float(charges["gst"]),
+                                    "sebi": float(charges["sebi_charges"]),
+                                    "stamp": float(charges["stamp_duty"]),
+                                    "gross_pnl": round(float(pnl_amount), 2),
+                                    "net_pnl": net_pnl,
+                                    "id": trade_id,
+                                })
+                                await db.commit()
+
+                            closed_count += 1
+                            _add_log(
+                                "REVERSAL_CLOSE", symbol,
+                                f"Trade #{trade_id}: Strong reversal ({new_signal}, "
+                                f"score={new_score}). Closed at {ltp}, "
+                                f"P&L={pnl_amount:+.2f} net=\u20b9{net_pnl:+.2f} "
+                                f"charges=\u20b9{total_charges:.2f}",
+                            )
+                            _push_event("TRADE_CLOSED", {
+                                "trade_id": trade_id,
+                                "symbol": symbol,
+                                "side": side,
+                                "exit_price": round(ltp, 2),
+                                "exit_reason": "STRONG_REVERSAL_EXIT",
+                                "pnl_amount": round(pnl_amount, 2),
+                                "gross_pnl": round(float(pnl_amount), 2),
+                                "net_pnl": net_pnl,
+                                "total_charges": round(total_charges, 2),
+                                "pnl_pct": round(pnl_pct, 2),
+                                "result": result_str,
+                            })
+                            continue  # Skip remaining handling for this trade
+                        except Exception as e:
+                            logger.error(
+                                f"Strong reversal close failed for trade "
+                                f"#{trade_id}: {e}"
+                            )
+
+                    elif is_reversal and abs(new_score) >= 20:
                         if side == "BUY":
                             tighter_sl = round(ltp * 0.998, 2)
                         else:
