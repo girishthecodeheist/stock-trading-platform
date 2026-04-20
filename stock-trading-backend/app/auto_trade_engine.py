@@ -1602,7 +1602,11 @@ async def _scan_and_trade() -> int:
         _last_scan_time = datetime.now(IST)
         return 0
 
-    _add_log("SCAN_START", "", f"Scanning top {len(top20)} stocks (10 gainers + 10 losers)")
+    _add_log(
+        "SCAN_START", "",
+        f"Scanning {len(top20)} stocks "
+        f"(filtered from top 20 gainers + top 20 losers)",
+    )
 
     # v4: Use 15m timeframe for intraday analysis
     analyzed: list = []
@@ -1884,9 +1888,13 @@ async def _monitor_open_trades(settings: dict) -> int:
                             if side == "BUY":
                                 pnl_pct = (ltp - entry_price) / entry_price * 100 if entry_price else 0
                                 pnl_amount = (ltp - entry_price) * quantity
+                                buy_leg = entry_price
+                                sell_leg = ltp
                             else:
                                 pnl_pct = (entry_price - ltp) / entry_price * 100 if entry_price else 0
                                 pnl_amount = (entry_price - ltp) * quantity
+                                buy_leg = ltp
+                                sell_leg = entry_price
 
                             if pnl_pct > 0:
                                 result_str = "WIN"
@@ -1895,13 +1903,29 @@ async def _monitor_open_trades(settings: dict) -> int:
                             else:
                                 result_str = "BREAKEVEN"
 
+                            # Mirror the SL/target close path: persist Fyers
+                            # charges so net_pnl / gross_pnl / brokerage columns
+                            # aren't NULL for reversal-exit trades.
+                            buy_value = buy_leg * quantity
+                            sell_value = sell_leg * quantity
+                            charges = calc_brokerage(
+                                buy_value, sell_value, quantity,
+                                product_type=product_type,
+                            )
+                            total_charges = float(charges["total_charges"])
+                            net_pnl = round(float(pnl_amount) - total_charges, 2)
+
                             async with async_session_factory() as db:
                                 await db.execute(text(
                                     "UPDATE paper_trades SET "
                                     "exit_price = :exit_price, exit_time = :exit_time, "
                                     "status = 'CLOSED', result = :result, "
                                     "pnl_percent = :pnl_pct, pnl_amount = :pnl_amount, "
-                                    "exit_reason = :exit_reason "
+                                    "exit_reason = :exit_reason, "
+                                    "brokerage = :brokerage, stt = :stt, "
+                                    "exchange_charges = :exchange, gst = :gst, "
+                                    "sebi_charges = :sebi, stamp_duty = :stamp, "
+                                    "gross_pnl = :gross_pnl, net_pnl = :net_pnl "
                                     "WHERE id = :id AND status = 'OPEN'"
                                 ), {
                                     "exit_price": round(ltp, 2),
@@ -1910,6 +1934,14 @@ async def _monitor_open_trades(settings: dict) -> int:
                                     "pnl_pct": round(pnl_pct, 2),
                                     "pnl_amount": round(pnl_amount, 2),
                                     "exit_reason": "STRONG_REVERSAL_EXIT",
+                                    "brokerage": float(charges["brokerage"]),
+                                    "stt": float(charges["stt"]),
+                                    "exchange": float(charges["exchange_charges"]),
+                                    "gst": float(charges["gst"]),
+                                    "sebi": float(charges["sebi_charges"]),
+                                    "stamp": float(charges["stamp_duty"]),
+                                    "gross_pnl": round(float(pnl_amount), 2),
+                                    "net_pnl": net_pnl,
                                     "id": trade_id,
                                 })
                                 await db.commit()
@@ -1919,7 +1951,8 @@ async def _monitor_open_trades(settings: dict) -> int:
                                 "REVERSAL_CLOSE", symbol,
                                 f"Trade #{trade_id}: Strong reversal ({new_signal}, "
                                 f"score={new_score}). Closed at {ltp}, "
-                                f"P&L={pnl_amount:+.2f}",
+                                f"P&L={pnl_amount:+.2f} net=\u20b9{net_pnl:+.2f} "
+                                f"charges=\u20b9{total_charges:.2f}",
                             )
                             _push_event("TRADE_CLOSED", {
                                 "trade_id": trade_id,
@@ -1928,6 +1961,9 @@ async def _monitor_open_trades(settings: dict) -> int:
                                 "exit_price": round(ltp, 2),
                                 "exit_reason": "STRONG_REVERSAL_EXIT",
                                 "pnl_amount": round(pnl_amount, 2),
+                                "gross_pnl": round(float(pnl_amount), 2),
+                                "net_pnl": net_pnl,
+                                "total_charges": round(total_charges, 2),
                                 "pnl_pct": round(pnl_pct, 2),
                                 "result": result_str,
                             })
