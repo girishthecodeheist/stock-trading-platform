@@ -123,11 +123,20 @@ export class DashboardComponent implements OnInit, OnDestroy {
     hasData: boolean;
   } {
     const sigs = this.signals || [];
-    const total = this.autoTradeStatus?.signals_count ?? sigs.length;
 
     let tradeable = this.autoTradeStatus?.tradeable_count;
     let infoOnly = this.autoTradeStatus?.info_only_count;
-    if (tradeable == null || infoOnly == null) {
+    let total: number;
+    if (tradeable != null && infoOnly != null) {
+      // Engine-provided counts: authoritative, match ``signals_count``.
+      total = this.autoTradeStatus?.signals_count ?? (tradeable + infoOnly);
+    } else {
+      // Local-computation fallback: derive everything from the same
+      // ``sigs`` array so tradeable + infoOnly == total (mixing
+      // ``signals_count`` from the engine with a locally-filtered
+      // ``tradeable`` would produce an inconsistent info_only count when
+      // the engine rescans between Signals-page loads).
+      //
       // Use presence-based checks (not ``||``) so an explicit 0 override
       // — "accept all scores / confidences" — isn't silently replaced by
       // the default. This matches the backend's ``resolve_gate`` semantics
@@ -142,6 +151,7 @@ export class DashboardComponent implements OnInit, OnDestroy {
         const sig = (s?.signal || s?.signal_type || '').toString().toUpperCase();
         return sc >= minScore && conf >= minConf && sig !== 'NEUTRAL';
       }).length;
+      total = sigs.length;
       infoOnly = Math.max(0, total - tradeable);
     }
 
