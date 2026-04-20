@@ -139,6 +139,13 @@ export class DashboardComponent implements OnInit, OnDestroy {
       infoOnly = Math.max(0, total - tradeable);
     }
 
+    // Only render the summary when we actually have signal rows to reason
+    // about. The dashboard doesn't call ``refreshSignals`` itself, so
+    // ``signals_count`` from autoTradeStatus can be >0 while the local
+    // cache is empty (user hasn't opened the Signals page yet). Showing
+    // the widget in that state would misleadingly report Tradeable=0.
+    const hasData = total > 0 && sigs.length > 0;
+
     const techOnly = sigs.filter(s => {
       const basis = (s?.analysis_basis || '').toString().toLowerCase();
       return basis === 'technical' || basis === 'heatmap_fallback';
@@ -154,7 +161,7 @@ export class DashboardComponent implements OnInit, OnDestroy {
       infoOnly,
       techOnly,
       comprehensive,
-      hasData: total > 0,
+      hasData,
     };
   }
 

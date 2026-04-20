@@ -313,16 +313,20 @@ export class SignalsComponent implements OnInit, OnDestroy {
    *
    * Thresholds are read from the engine's status payload (so they track
    * ``gate_overrides`` edits made on the Indicators Control / Settings
-   * page) with a 40/40 fallback to keep the badge defined even before
-   * the engine status has loaded.
+   * page). The fallbacks match the engine defaults — ``MIN_SCORE_FOR_TRADE
+   * = 25`` and ``MIN_CONFIDENCE_FOR_TRADE = 30`` in
+   * ``auto_trade_engine.py`` — so the badge is still correct when status
+   * hasn't loaded yet.
    */
   isTradeable(signal: any): boolean {
     if (!signal) return false;
     const score = Number(signal.score) || 0;
     const confidence = Number(signal.confidence) || 0;
     const type = (signal.signal || signal.signal_type || '').toString().toUpperCase();
-    const minScore = Number(this.autoTradeStatus?.min_score_for_trade) || 40;
-    const minConf = Number(this.autoTradeStatus?.min_confidence_for_trade) || 40;
+    const statusMinScore = this.autoTradeStatus?.min_score_for_trade;
+    const statusMinConf = this.autoTradeStatus?.min_confidence_for_trade;
+    const minScore = statusMinScore != null ? Number(statusMinScore) : 25;
+    const minConf = statusMinConf != null ? Number(statusMinConf) : 30;
     return Math.abs(score) >= minScore && confidence >= minConf && type !== 'NEUTRAL';
   }
 

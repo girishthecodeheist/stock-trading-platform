@@ -2987,7 +2987,18 @@ def stop_engine():
 
 
 def get_engine_status() -> dict:
-    """Get current engine status."""
+    """Get current engine status.
+
+    Effective gate values are resolved via ``resolve_gate`` so the reported
+    thresholds match what the engine actually uses at decision time (the
+    plain ``or``-chain treats a user-configured ``0`` as falsy and would
+    silently fall through to the settings column / default).
+    """
+    from app.indicator_catalog import resolve_gate as _resolve_gate
+
+    _settings = _cached_settings or {}
+    _overrides = _settings.get("gate_overrides") or {}
+
     return {
         "engine_running": _engine_running,
         "daily_target_met": _daily_target_met,
@@ -2995,32 +3006,24 @@ def get_engine_status() -> dict:
         "last_monitor_time": _last_monitor_time.isoformat() if _last_monitor_time else None,
         "last_reanalysis_time": _last_reanalysis_time.isoformat() if _last_reanalysis_time else None,
         "market_open": is_market_open(),
-        "max_active_trades": int(
-            ((_cached_settings or {}).get("gate_overrides") or {}).get("max_open_trades")
-            or (_cached_settings or {}).get("max_open_trades")
-            or MAX_ACTIVE_TRADES
-        ),
-        "max_trades_per_day": int(
-            ((_cached_settings or {}).get("gate_overrides") or {}).get("max_trades_per_day")
-            or (_cached_settings or {}).get("max_trades_per_day")
-            or MAX_TRADES_PER_DAY
-        ),
+        "max_active_trades": int(_resolve_gate(
+            "max_open_trades", _overrides, _settings, MAX_ACTIVE_TRADES
+        )),
+        "max_trades_per_day": int(_resolve_gate(
+            "max_trades_per_day", _overrides, _settings, MAX_TRADES_PER_DAY
+        )),
         "trades_placed_today": _trades_placed_today,
         "signals_count": len(_last_signals),
         "settings_hot_reload": True,
         "trailing_profit_enabled": True,
         "reanalysis_interval_secs": RE_ANALYSIS_INTERVAL_SECS,
         "scan_interval_secs": SCAN_INTERVAL_SECS,
-        "min_score_for_trade": int(
-            ((_cached_settings or {}).get("gate_overrides") or {}).get("min_score")
-            or (_cached_settings or {}).get("min_score_for_trade")
-            or MIN_SCORE_FOR_TRADE
-        ),
-        "min_confidence_for_trade": int(
-            ((_cached_settings or {}).get("gate_overrides") or {}).get("min_confidence")
-            or (_cached_settings or {}).get("min_confidence_for_trade")
-            or MIN_CONFIDENCE_FOR_TRADE
-        ),
+        "min_score_for_trade": int(_resolve_gate(
+            "min_score", _overrides, _settings, MIN_SCORE_FOR_TRADE
+        )),
+        "min_confidence_for_trade": int(_resolve_gate(
+            "min_confidence", _overrides, _settings, MIN_CONFIDENCE_FOR_TRADE
+        )),
         "trade_cooldown_secs": TRADE_COOLDOWN_SECS,
         "brokerage_aware": True,
         "multi_timeframe": True,
