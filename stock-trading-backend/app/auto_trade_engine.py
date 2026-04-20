@@ -1858,7 +1858,15 @@ async def _scan_and_trade() -> int:
 
     # v4: Check daily trade limit. If hit, we still scan & publish signals so
     # the dashboard stays informative — we just skip the placement phase.
-    max_trades_day = settings.get("max_trades_per_day", MAX_TRADES_PER_DAY)
+    # Honour gate_overrides so the pre-filter matches the in-loop cap in
+    # ``_place_auto_trade`` (otherwise a user who bumped max_trades_per_day
+    # via the Indicators Control page would still see the scan flip into
+    # display-only mode at the old settings-column value).
+    from app.indicator_catalog import resolve_gate as _resolve_gate_top
+    _top_gate_overrides = settings.get("gate_overrides") or {}
+    max_trades_day = int(_resolve_gate_top(
+        "max_trades_per_day", _top_gate_overrides, settings, MAX_TRADES_PER_DAY
+    ))
     trades_today = await _get_trades_placed_today()
     daily_cap_hit = trades_today >= max_trades_day
     if daily_cap_hit:
@@ -1910,6 +1918,11 @@ async def _scan_and_trade() -> int:
     min_confidence = _resolve_gate(
         "min_confidence", _gate_overrides, settings, MIN_CONFIDENCE_FOR_TRADE
     )
+    # Same boolean-flavoured gates ``_place_auto_trade`` reads — needed so
+    # the scan-loop pre-filter below respects the Indicators Control toggle
+    # instead of silently rejecting on cooldown even when duplicate_guard=0.
+    duplicate_guard_enabled = bool(_gate_overrides.get("duplicate_guard", 1))
+
     trade_mode_peek = str(settings.get("trade_mode") or "PAPER").upper()
 
     # --- Slot / cap gates (apply to every analyzed tradeable signal) --------
@@ -1976,7 +1989,7 @@ async def _scan_and_trade() -> int:
                 "Already have an open trade on this symbol",
             )
             continue
-        if _is_on_cooldown(sym):
+        if duplicate_guard_enabled and _is_on_cooldown(sym):
             last_time = _last_trade_time_per_symbol.get(sym)
             elapsed = int((datetime.now(IST) - last_time).total_seconds()) if last_time else 0
             _record_rejection(
