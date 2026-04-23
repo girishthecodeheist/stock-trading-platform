@@ -401,7 +401,10 @@ async def _get_available_margin(settings: dict) -> float:
         open_exposure = float(exposure_result.scalar() or 0)
 
     available = capital + total_pnl - open_exposure
-    return max(available, 0)
+    # Cap at configured capital so accumulated historical P&L can never inflate
+    # buying power beyond simulated_capital (e.g. lowering capital after a
+    # profitable run must immediately shrink available margin).
+    return max(min(available, capital), 0)
 
 
 async def _get_live_available_margin() -> float:
