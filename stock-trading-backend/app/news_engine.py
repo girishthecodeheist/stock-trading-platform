@@ -5,6 +5,8 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List
 
+from app import fyers_client
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,6 +63,28 @@ async def get_news_sentiment(symbol: str) -> Dict[str, Any]:
 
 
 async def _fetch_news_headlines(symbol: str) -> List[Dict[str, str]]:
+    """Fetch news headlines with a 3-tier source chain.
+
+    Order: Fyers (when authenticated) -> yfinance -> Google News RSS. Each
+    tier is tried only if the previous one returned no usable results, so
+    the common "Fyers has news" path never incurs RSS/yfinance latency.
+    """
+    if fyers_client.is_authenticated():
+        try:
+            fyers_items = await fyers_client.get_news_async(symbol, limit=15)
+            if fyers_items:
+                return fyers_items
+        except Exception as e:
+            logger.debug(f"Fyers news fetch failed for {symbol}: {e}")
+
+    yf_items = await _fetch_yfinance_news(symbol)
+    if yf_items:
+        return yf_items
+
+    return await _fetch_google_news_rss(symbol)
+
+
+async def _fetch_yfinance_news(symbol: str) -> List[Dict[str, str]]:
     """Fetch news headlines using yfinance news feed."""
     try:
         import yfinance as yf
@@ -92,7 +116,55 @@ async def _fetch_news_headlines(symbol: str) -> List[Dict[str, str]]:
 
         return await asyncio.to_thread(_get_news)
     except Exception as e:
-        logger.error(f"Error fetching news for {symbol}: {e}")
+        logger.error(f"Error fetching yfinance news for {symbol}: {e}")
+        return []
+
+
+async def _fetch_google_news_rss(symbol: str, limit: int = 15) -> List[Dict[str, str]]:
+    """Fallback: parse Google News RSS for NSE-tagged stories on ``symbol``."""
+    url = f"https://news.google.com/rss/search?q={symbol}+NSE&hl=en-IN&gl=IN"
+
+    def _parse():
+        try:
+            import feedparser
+        except ImportError:
+            logger.warning("feedparser not installed, skipping Google News RSS fallback")
+            return []
+        try:
+            feed = feedparser.parse(url)
+        except Exception as e:
+            logger.debug(f"Google News RSS parse failed for {symbol}: {e}")
+            return []
+        entries = getattr(feed, "entries", None) or []
+        results: List[Dict[str, str]] = []
+        for item in entries[:limit]:
+            title = item.get("title", "")
+            if not title:
+                continue
+            pub_date = ""
+            published_parsed = item.get("published_parsed")
+            if published_parsed:
+                try:
+                    pub_date = datetime(*published_parsed[:6]).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    pub_date = item.get("published", "") or ""
+            else:
+                pub_date = item.get("published", "") or ""
+            source = "Google News"
+            src_obj = item.get("source")
+            if isinstance(src_obj, dict):
+                source = src_obj.get("title") or source
+            results.append({
+                "title": title,
+                "source": source,
+                "date": pub_date,
+            })
+        return results
+
+    try:
+        return await asyncio.to_thread(_parse)
+    except Exception as e:
+        logger.error(f"Error fetching Google News RSS for {symbol}: {e}")
         return []
 
 

@@ -152,3 +152,14 @@ async def comprehensive_analysis(
         "data_source": data_source,
         "analysis_time": datetime.utcnow().isoformat(),
     }
+
+
+@router.get("/news")
+async def news(symbol: str = Query(..., description="Symbol to fetch news for")):
+    """Return headlines + sentiment for ``symbol`` via the news_engine chain.
+
+    Exposes the same payload the dashboard / comprehensive endpoints consume
+    so the frontend can render headlines and per-headline sentiment on the
+    stock detail view without duplicating fetch logic.
+    """
+    return await get_news_sentiment(symbol)

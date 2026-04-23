@@ -477,6 +477,32 @@ def get_live_prices_batch(symbols: list[str]) -> dict:
         return {}
 
 
+def get_news(symbol: str, limit: int = 15) -> list[dict]:
+    """Fetch news for a symbol from Fyers API. Returns list of {title, source, date}.
+
+    The Fyers API v3 SDK does not expose a native news endpoint as of this
+    writing, so this function is intentionally structured as a stub: the
+    architecture is in place for ``news_engine`` to prefer Fyers-sourced
+    headlines when authenticated, and callers can fall back to other
+    providers (yfinance / Google News RSS) when this returns ``[]``.
+
+    Returns an empty list on any failure so downstream fallback chains can
+    treat "no Fyers news" and "Fyers news unavailable" identically without
+    special-casing.
+    """
+    if not _fyers_model:
+        return []
+    try:
+        # Placeholder for a future direct HTTP call to a Fyers news endpoint.
+        # When Fyers exposes one, replace this block with the actual request
+        # (using the authenticated access token) and map results to
+        # {"title", "source", "date"} dicts, capped at ``limit``.
+        return []
+    except Exception as e:
+        logger.debug(f"Fyers news fetch failed for {symbol}: {e}")
+        return []
+
+
 # --- Async wrappers ---------------------------------------------------------
 # The fyers_apiv3 SDK is synchronous. Every call (history/quotes/funds/...) does
 # blocking network I/O. If we call these directly from inside an async FastAPI
@@ -578,6 +604,11 @@ async def reconcile_order_async(
 async def get_market_depth_async(symbol: str) -> dict:
     """Async wrapper around ``get_market_depth``."""
     return await asyncio.to_thread(get_market_depth, symbol)
+
+
+async def get_news_async(symbol: str, limit: int = 15) -> list[dict]:
+    """Async wrapper around ``get_news``."""
+    return await asyncio.to_thread(get_news, symbol, limit)
 
 
 async def place_order_async(
