@@ -1,0 +1,66 @@
+<div class="news-page">
+  <div class="header-row">
+    <h1 class="page-title">News & Sentiment</h1>
+    <div class="search-box">
+      <input
+        type="text"
+        placeholder="Search symbol (e.g. RELIANCE, TCS)"
+        [(ngModel)]="symbolQuery"
+        (keyup.enter)="searchSymbol()"
+      />
+      <button class="btn-search" (click)="searchSymbol()" [disabled]="!symbolQuery.trim()">Search</button>
+    </div>
+  </div>
+
+  <div class="tabs-row">
+    <button class="tab-btn" [class.active]="activeTab === 'market'" (click)="selectTab('market')">Market</button>
+    <button class="tab-btn" [class.active]="activeTab === 'top_movers'" (click)="selectTab('top_movers')">Top Movers</button>
+    <button class="tab-btn" [class.active]="activeTab === 'symbol'" [disabled]="!symbolItem" (click)="selectTab('symbol')">
+      {{ symbolItem ? ('Symbol: ' + symbolItem.symbol) : 'Symbol' }}
+    </button>
+  </div>
+
+  <div *ngIf="loading || searching" class="loading-state">Loading news…</div>
+
+  <div *ngIf="!loading && !searching && currentItems.length === 0" class="no-data">
+    <p *ngIf="activeTab === 'symbol' && !symbolItem">Search for a symbol to see its news.</p>
+    <p *ngIf="activeTab !== 'symbol' || symbolItem">No news headlines available right now.</p>
+    <p class="error" *ngIf="lastError">{{ lastError }}</p>
+  </div>
+
+  <div class="news-grid">
+    <section *ngFor="let item of currentItems; trackBy: trackByIndex" class="news-card glass-card">
+      <header class="card-header">
+        <div class="card-symbol">
+          <span class="symbol-label">{{ item.symbol }}</span>
+          <span class="badge" [ngClass]="classificationClass(item.sentiment_classification)">
+            {{ item.sentiment_classification || 'NEUTRAL' }}
+          </span>
+        </div>
+        <div class="card-meta">
+          <span class="score">score: {{ item.sentiment_score | number:'1.1-2' }}</span>
+          <span class="count">{{ item.headline_count }} headline<span *ngIf="item.headline_count !== 1">s</span></span>
+        </div>
+        <div class="sent-breakdown" *ngIf="item.bullish_count !== undefined">
+          <span class="chip sent-bull">{{ item.bullish_count }} bullish</span>
+          <span class="chip sent-bear">{{ item.bearish_count }} bearish</span>
+          <span class="chip sent-neutral">{{ item.neutral_count }} neutral</span>
+        </div>
+      </header>
+
+      <ul class="headlines">
+        <li *ngFor="let h of item.headlines; trackBy: trackByIndex" class="headline">
+          <div class="headline-top">
+            <span class="headline-title">{{ h.title }}</span>
+            <span class="headline-badge" [ngClass]="sentimentClass(h.sentiment_label)">{{ h.sentiment_label }}</span>
+          </div>
+          <div class="headline-meta">
+            <span class="source">{{ h.source }}</span>
+            <span *ngIf="h.date" class="date">{{ h.date }}</span>
+            <span class="sent-score">{{ h.sentiment_score | number:'1.2-3' }}</span>
+          </div>
+        </li>
+      </ul>
+    </section>
+  </div>
+</div>

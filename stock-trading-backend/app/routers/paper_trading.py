@@ -14,16 +14,38 @@ from app import audit
 router = APIRouter(prefix="/api/paper-trades", tags=["paper-trading"])
 
 
+async def _resolve_active_session_id(db: AsyncSession) -> Optional[int]:
+    """Return the currently-ACTIVE session id, or ``None`` if no session exists."""
+    try:
+        row = (await db.execute(text(
+            "SELECT id FROM trading_sessions WHERE status = 'ACTIVE' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ))).scalar()
+        return int(row) if row else None
+    except Exception:
+        return None
+
+
 @router.get("")
 async def list_trades(
     status: Optional[str] = Query(None, description="OPEN or CLOSED"),
     symbol: Optional[str] = Query(None),
+    session_id: Optional[int] = Query(None, description="Filter by session id. Use -1 for legacy/unscoped rows; omit for active session; 'all' not supported here."),
+    include_all: bool = Query(False, description="If true, ignore session scoping and return every row."),
     limit: int = Query(100),
     db: AsyncSession = Depends(get_db),
 ):
-    """List paper trades."""
+    """List paper trades, defaulting to the active session.
+
+    Scoping precedence:
+      * ``include_all=true`` — no session filter at all.
+      * ``session_id`` explicitly provided — filter to that session (``-1``
+        means "rows with NULL session_id", i.e. the legacy bucket).
+      * Otherwise — filter to the currently-ACTIVE session (or NULL bucket
+        if no session has been created yet).
+    """
     clauses = ["1=1"]
-    params = {}
+    params: dict = {}
 
     if status:
         clauses.append("status = :status")
@@ -31,6 +53,21 @@ async def list_trades(
     if symbol:
         clauses.append("symbol = :symbol")
         params["symbol"] = symbol
+
+    if not include_all:
+        if session_id is not None:
+            if session_id < 0:
+                clauses.append("session_id IS NULL")
+            else:
+                clauses.append("session_id = :session_id_filter")
+                params["session_id_filter"] = session_id
+        else:
+            active = await _resolve_active_session_id(db)
+            if active is None:
+                clauses.append("session_id IS NULL")
+            else:
+                clauses.append("session_id = :active_session_id")
+                params["active_session_id"] = active
 
     where = " AND ".join(clauses)
     # Extended projection including product_type and charge breakdown so the
@@ -139,13 +176,14 @@ async def create_trade(
         product_type = "CNC"
     if product_type not in ("INTRADAY", "CNC"):
         product_type = "INTRADAY"
+    active_session_id = await _resolve_active_session_id(db)
     query = text("""
         INSERT INTO paper_trades (symbol, instrument_type, timeframe, side, entry_price,
             entry_time, quantity, stop_loss, target, status, signal_confidence,
-            signal_reasons, indicators_snapshot, product_type)
+            signal_reasons, indicators_snapshot, product_type, session_id)
         VALUES (:symbol, :instrument_type, :timeframe, :side, :entry_price,
             :entry_time, :quantity, :stop_loss, :target, 'OPEN', :signal_confidence,
-            :signal_reasons, :indicators_snapshot, :product_type)
+            :signal_reasons, :indicators_snapshot, :product_type, :session_id)
         RETURNING id
     """)
 
@@ -163,6 +201,7 @@ async def create_trade(
         "signal_reasons": json.dumps(trade.get("signal_reasons", [])),
         "indicators_snapshot": json.dumps(trade.get("indicators_snapshot", {})),
         "product_type": product_type,
+        "session_id": active_session_id,
     })
     await db.commit()
 
@@ -338,18 +377,41 @@ async def paper_trade_audit(
 async def get_analytics(
     date_from: Optional[str] = Query(None, description="Filter from date (YYYY-MM-DD)"),
     date_to: Optional[str] = Query(None, description="Filter to date (YYYY-MM-DD)"),
+    session_id: Optional[int] = Query(None, description="Scope to a session (use -1 for legacy/unscoped rows)."),
+    include_all: bool = Query(False, description="Ignore session scoping and include every row."),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get paper trading performance analytics with optional date filter."""
+    """Get paper trading performance analytics with optional date filter.
+
+    Session scoping mirrors ``GET /api/paper-trades``: defaults to the
+    active session; pass ``session_id`` to look at a specific session or
+    ``include_all=true`` to see lifetime analytics.
+    """
     # Build date filter clause
     date_clauses = []
-    date_params = {}
+    date_params: dict = {}
     if date_from:
         date_clauses.append("entry_time >= :date_from")
         date_params["date_from"] = date_from
     if date_to:
         date_clauses.append("entry_time <= :date_to::date + interval '1 day'")
         date_params["date_to"] = date_to
+
+    if not include_all:
+        if session_id is not None:
+            if session_id < 0:
+                date_clauses.append("session_id IS NULL")
+            else:
+                date_clauses.append("session_id = :session_id_filter")
+                date_params["session_id_filter"] = session_id
+        else:
+            active = await _resolve_active_session_id(db)
+            if active is None:
+                date_clauses.append("session_id IS NULL")
+            else:
+                date_clauses.append("session_id = :active_session_id")
+                date_params["active_session_id"] = active
+
     date_where = (" AND " + " AND ".join(date_clauses)) if date_clauses else ""
 
     # Total trades

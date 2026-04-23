@@ -224,16 +224,98 @@ def get_last_signals() -> list:
 
 
 def _add_log(action: str, symbol: str, details: str):
-    """Add to in-memory log."""
+    """Add to in-memory log + persist an engine-level audit row.
+
+    The in-memory ring buffer stays the primary UI source (fast, cheap).
+    We *also* fire-and-forget a persistent ``trade_audit_log`` row tagged
+    with the active session_id so the session analytics endpoint can
+    reconstruct engine activity after a restart. The DB write is schedule-
+    then-forget so audit failures never block the scanner loop.
+    """
     global _auto_trade_log
-    _auto_trade_log.append({
+    entry = {
         "time": datetime.now(IST).isoformat(),
         "action": action,
         "symbol": symbol,
         "details": details,
-    })
+    }
+    _auto_trade_log.append(entry)
     if len(_auto_trade_log) > 200:
         _auto_trade_log = _auto_trade_log[-200:]
+
+    try:
+        asyncio.get_running_loop().create_task(_persist_engine_log(entry))
+    except RuntimeError:
+        # No running loop (startup / shutdown path) — skip persistence.
+        pass
+
+
+async def _persist_engine_log(entry: dict) -> None:
+    """Best-effort insert of an engine log event into ``trade_audit_log``."""
+    try:
+        session_id = await _get_active_session_id()
+        async with async_session_factory() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO trade_audit_log "
+                    "(trade_id, trade_type, event_type, symbol, timestamp, "
+                    " reason, session_id) "
+                    "VALUES (0, 'ENGINE', :event_type, :symbol, :ts, "
+                    " :reason, :session_id)"
+                ),
+                {
+                    "event_type": f"ENGINE_{entry['action']}",
+                    "symbol": entry.get("symbol") or None,
+                    "ts": datetime.utcnow(),
+                    "reason": entry.get("details"),
+                    "session_id": session_id,
+                },
+            )
+            await db.commit()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug(f"Engine audit persist failed: {e}")
+
+
+async def _get_active_session_id() -> Optional[int]:
+    """Return the id of the currently-ACTIVE ``trading_sessions`` row.
+
+    Used by margin / exposure / daily-count queries to scope paper trades
+    to a single session. ``None`` means no session has been created yet —
+    in which case we treat every paper trade (session_id IS NULL or
+    otherwise) as part of the global bucket.
+    """
+    try:
+        async with async_session_factory() as db:
+            row = (
+                await db.execute(
+                    text(
+                        "SELECT id FROM trading_sessions "
+                        "WHERE status = 'ACTIVE' "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    )
+                )
+            ).scalar()
+            return int(row) if row else None
+    except Exception as e:
+        logger.debug(f"Active session lookup failed: {e}")
+        return None
+
+
+def _session_scope_clause(session_id: Optional[int], alias: str = "") -> tuple[str, dict]:
+    """Return a SQL fragment + bind params that filter to the active session.
+
+    When no session exists we filter to ``session_id IS NULL`` so legacy
+    rows (which all have NULL session_id) still count. Once the user has
+    created at least one session, only rows tagged with the active
+    session's id contribute.
+
+    ``alias`` is an optional table alias (with trailing dot) so this can
+    be stitched into JOINed queries: ``_session_scope_clause(sid, "pt.")``.
+    """
+    col = f"{alias}session_id" if alias else "session_id"
+    if session_id is None:
+        return f"{col} IS NULL", {}
+    return f"{col} = :active_session_id", {"active_session_id": session_id}
 
 
 # Reasons we expose to the UI as "blocked" — everything else is either a
@@ -381,19 +463,26 @@ def _cleanup_cooldown_map() -> None:
 # --- Capital & Margin ---------------------------------------------------------
 
 async def _get_available_margin(settings: dict) -> float:
-    """Calculate available margin = simulated_capital + total_realized_pnl - open_exposure."""
+    """Calculate available margin = simulated_capital + total_realized_pnl - open_exposure.
+
+    Scoped to the currently-ACTIVE ``trading_sessions`` row so a fresh
+    session starts from its declared ``starting_capital`` instead of
+    inheriting P&L from every earlier run.
+    """
     capital = float(settings.get("simulated_capital", 100000))
+    session_id = await _get_active_session_id()
+    scope_sql, scope_params = _session_scope_clause(session_id)
     async with async_session_factory() as db:
         pnl_result = await db.execute(text(
-            "SELECT COALESCE(SUM(pnl_amount), 0) as total_pnl "
-            "FROM paper_trades WHERE status != 'OPEN'"
-        ))
+            f"SELECT COALESCE(SUM(pnl_amount), 0) as total_pnl "
+            f"FROM paper_trades WHERE status != 'OPEN' AND {scope_sql}"
+        ), scope_params)
         total_pnl = float(pnl_result.scalar() or 0)
 
         exposure_result = await db.execute(text(
-            "SELECT COALESCE(SUM(entry_price * quantity), 0) as exposure "
-            "FROM paper_trades WHERE status = 'OPEN'"
-        ))
+            f"SELECT COALESCE(SUM(entry_price * quantity), 0) as exposure "
+            f"FROM paper_trades WHERE status = 'OPEN' AND {scope_sql}"
+        ), scope_params)
         open_exposure = float(exposure_result.scalar() or 0)
 
     available = capital + total_pnl - open_exposure
@@ -457,22 +546,29 @@ def _buying_power(available_margin: float, settings: dict) -> float:
 async def _get_open_trade_count() -> int:
     """Count open trades across both paper_trades and live_trades.
 
-    The engine enforces a single MAX_ACTIVE_TRADES budget regardless of mode
-    so that a user who flips from PAPER to LIVE mid-session can't accidentally
-    blow past the slot limit.
+    Paper trades are scoped to the active session so a new session
+    starts with a clean slot budget.
     """
+    session_id = await _get_active_session_id()
+    scope_sql, scope_params = _session_scope_clause(session_id)
     async with async_session_factory() as db:
-        paper = await db.execute(text("SELECT COUNT(*) FROM paper_trades WHERE status = 'OPEN'"))
+        paper = await db.execute(
+            text(f"SELECT COUNT(*) FROM paper_trades WHERE status = 'OPEN' AND {scope_sql}"),
+            scope_params,
+        )
         live = await db.execute(text("SELECT COUNT(*) FROM live_trades WHERE status = 'OPEN'"))
         return int(paper.scalar() or 0) + int(live.scalar() or 0)
 
 
 async def _has_open_trade_for_symbol(symbol: str) -> bool:
     """Check if there is an open trade for ``symbol`` in either mode."""
+    session_id = await _get_active_session_id()
+    scope_sql, scope_params = _session_scope_clause(session_id)
+    params = {**scope_params, "symbol": symbol}
     async with async_session_factory() as db:
         paper = await db.execute(
-            text("SELECT COUNT(*) FROM paper_trades WHERE symbol = :symbol AND status = 'OPEN'"),
-            {"symbol": symbol},
+            text(f"SELECT COUNT(*) FROM paper_trades WHERE symbol = :symbol AND status = 'OPEN' AND {scope_sql}"),
+            params,
         )
         if (paper.scalar() or 0) > 0:
             return True
@@ -489,13 +585,18 @@ async def _get_trades_placed_today() -> int:
     Paper trades are flagged via ``is_auto_trade``. Live trades don't have
     that column, so we identify auto-placed ones by ``strategy = 'AUTO'``
     which :func:`_place_auto_trade` writes when in LIVE mode.
+
+    Paper-side count is scoped to the active session.
     """
     today = datetime.now(IST).date()
+    session_id = await _get_active_session_id()
+    scope_sql, scope_params = _session_scope_clause(session_id)
+    params = {**scope_params, "today": today}
     async with async_session_factory() as db:
         paper = await db.execute(text(
-            "SELECT COUNT(*) FROM paper_trades "
-            "WHERE is_auto_trade = true AND DATE(entry_time) = :today"
-        ), {"today": today})
+            f"SELECT COUNT(*) FROM paper_trades "
+            f"WHERE is_auto_trade = true AND DATE(entry_time) = :today AND {scope_sql}"
+        ), params)
         live = await db.execute(text(
             "SELECT COUNT(*) FROM live_trades "
             "WHERE strategy = 'AUTO' AND DATE(entry_time) = :today"
@@ -1563,14 +1664,15 @@ async def _place_auto_trade(
             quantity = effective_qty
             entry_price = effective_entry
         else:
+            active_session_id = await _get_active_session_id()
             async with async_session_factory() as db:
                 result = await db.execute(text(
                     "INSERT INTO paper_trades (symbol, instrument_type, timeframe, side, entry_price, "
                     "entry_time, quantity, stop_loss, target, status, signal_confidence, "
-                    "signal_reasons, indicators_snapshot, is_auto_trade, product_type) "
+                    "signal_reasons, indicators_snapshot, is_auto_trade, product_type, session_id) "
                     "VALUES (:symbol, 'EQUITY', :timeframe, :side, :entry_price, "
                     ":entry_time, :quantity, :stop_loss, :target, 'OPEN', :signal_confidence, "
-                    ":signal_reasons, :indicators_snapshot, true, :product_type) "
+                    ":signal_reasons, :indicators_snapshot, true, :product_type, :session_id) "
                     "RETURNING id"
                 ), {
                     "symbol": symbol,
@@ -1585,6 +1687,7 @@ async def _place_auto_trade(
                     "signal_reasons": json.dumps(full_reasons),
                     "indicators_snapshot": json.dumps(snapshot),
                     "product_type": product_type,
+                    "session_id": active_session_id,
                 })
                 await db.commit()
                 trade_id = result.scalar()
@@ -1712,12 +1815,15 @@ async def _check_daily_limits(settings: dict) -> Dict[str, Any]:
     max_loss = abs(settings.get("day_max_loss_paper", 0))
     today = datetime.now(IST).date()
 
+    session_id = await _get_active_session_id()
+    scope_sql, scope_params = _session_scope_clause(session_id)
+    params = {**scope_params, "today": today}
     async with async_session_factory() as db:
         result = await db.execute(text(
-            "SELECT COALESCE(SUM(pnl_amount), 0) AS total_pnl "
-            "FROM paper_trades "
-            "WHERE status = 'CLOSED' AND DATE(exit_time) = :today"
-        ), {"today": today})
+            f"SELECT COALESCE(SUM(pnl_amount), 0) AS total_pnl "
+            f"FROM paper_trades "
+            f"WHERE status = 'CLOSED' AND DATE(exit_time) = :today AND {scope_sql}"
+        ), params)
         total_pnl = float(result.scalar() or 0)
 
     if profit_target > 0 and total_pnl >= profit_target:
@@ -2018,13 +2124,15 @@ async def _monitor_open_trades(settings: dict) -> int:
     if not fyers_client.is_authenticated():
         return 0
 
+    session_id = await _get_active_session_id()
+    scope_sql, scope_params = _session_scope_clause(session_id)
     async with async_session_factory() as db:
         result = await db.execute(text(
-            "SELECT id, symbol, side, entry_price, quantity, stop_loss, target, "
-            "entry_time, indicators_snapshot, "
-            "COALESCE(product_type, 'INTRADAY') AS product_type "
-            "FROM paper_trades WHERE status = 'OPEN'"
-        ))
+            f"SELECT id, symbol, side, entry_price, quantity, stop_loss, target, "
+            f"entry_time, indicators_snapshot, "
+            f"COALESCE(product_type, 'INTRADAY') AS product_type "
+            f"FROM paper_trades WHERE status = 'OPEN' AND {scope_sql}"
+        ), scope_params)
         open_trades = result.fetchall()
 
     if not open_trades:

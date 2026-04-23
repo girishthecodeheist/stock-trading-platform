@@ -272,6 +272,50 @@ export class ApiService {
     return `${this.baseUrl}/api/v1/scanner/open-trades/stream?interval=${interval}`;
   }
 
+  // News
+  getNewsFeed(limit: number = 8): Observable<any> {
+    const params = new HttpParams().set('limit', String(limit));
+    return this.http.get(`${this.baseUrl}/api/v1/news/feed`, { params });
+  }
+
+  getSymbolNews(symbol: string): Observable<any> {
+    return this.http.get(`${this.baseUrl}/api/v1/news/symbol/${encodeURIComponent(symbol)}`);
+  }
+
+  getMarketNews(): Observable<any> {
+    return this.http.get(`${this.baseUrl}/api/v1/news/market`);
+  }
+
+  // Trading Sessions (paper)
+  getSessions(): Observable<any> {
+    return this.http.get(`${this.baseUrl}/api/v1/sessions`);
+  }
+
+  getActiveSession(): Observable<any> {
+    return this.http.get(`${this.baseUrl}/api/v1/sessions/active`);
+  }
+
+  getSession(id: number): Observable<any> {
+    return this.http.get(`${this.baseUrl}/api/v1/sessions/${id}`);
+  }
+
+  createSession(data: { session_name: string; starting_capital: number; notes?: string }): Observable<any> {
+    return this.http.post(`${this.baseUrl}/api/v1/sessions`, data);
+  }
+
+  closeSession(id: number): Observable<any> {
+    return this.http.post(`${this.baseUrl}/api/v1/sessions/${id}/close`, {});
+  }
+
+  getSessionAnalytics(id: number): Observable<any> {
+    return this.http.get(`${this.baseUrl}/api/v1/sessions/${id}/analytics`);
+  }
+
+  getSessionAudit(id: number, limit: number = 500): Observable<any> {
+    const params = new HttpParams().set('limit', String(limit));
+    return this.http.get(`${this.baseUrl}/api/v1/sessions/${id}/audit`, { params });
+  }
+
   // SSE stream URL for auto-trade events (TRADE_PLACED, TRADE_CLOSED, etc.)
   getAutoTradeEventsStreamUrl(): string {
     return `${this.baseUrl}/api/v1/scanner/auto-trade/events`;

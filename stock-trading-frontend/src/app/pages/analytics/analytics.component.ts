@@ -1,7 +1,9 @@
 import { Component, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { HttpClient, HttpParams } from '@angular/common/http';
 import { ApiService } from '../../services/api.service';
+import { environment } from '../../../environments/environment';
 
 @Component({
   selector: 'app-analytics',
@@ -18,13 +20,46 @@ export class AnalyticsComponent implements OnInit {
   dateFrom: string = '';
   dateTo: string = '';
 
-  constructor(private api: ApiService) {}
+  sessions: any[] = [];
+  activeSessionId: number | null = null;
+  // 'ACTIVE' / 'ALL' / -1 (legacy) / numeric session id. Paper tab only.
+  filterSession: 'ACTIVE' | 'ALL' | number = 'ACTIVE';
 
-  ngOnInit() { this.loadAnalytics(); }
+  constructor(private api: ApiService, private http: HttpClient) {}
+
+  ngOnInit() {
+    this.api.getSessions().subscribe({
+      next: (rows) => {
+        this.sessions = rows || [];
+        const active = this.sessions.find((s: any) => s.status === 'ACTIVE');
+        this.activeSessionId = active ? active.id : null;
+        this.loadAnalytics();
+      },
+      error: () => { this.loadAnalytics(); }
+    });
+  }
+
+  onSessionFilterChange() { this.loadAnalytics(); }
+
+  private paperParams(): HttpParams {
+    let params = new HttpParams();
+    if (this.dateFrom) params = params.set('date_from', this.dateFrom);
+    if (this.dateTo) params = params.set('date_to', this.dateTo);
+    if (this.filterSession === 'ALL') {
+      params = params.set('include_all', 'true');
+    } else if (this.filterSession === 'ACTIVE') {
+      if (this.activeSessionId != null) {
+        params = params.set('session_id', String(this.activeSessionId));
+      }
+    } else if (typeof this.filterSession === 'number') {
+      params = params.set('session_id', String(this.filterSession));
+    }
+    return params;
+  }
 
   loadAnalytics() {
     this.loading = true;
-    this.api.getAnalytics(this.dateFrom, this.dateTo).subscribe({
+    this.http.get(`${environment.apiUrl}/api/paper-trades/analytics`, { params: this.paperParams() }).subscribe({
       next: (data) => { this.paperAnalytics = data; this.loading = false; },
       error: () => { this.loading = false; }
     });

@@ -1,0 +1,112 @@
+<div class="session-manager" [class.variant-compact]="variant === 'compact'" [class.variant-full]="variant === 'full'">
+  <div class="session-card glass-card">
+    <div class="session-row">
+      <div class="session-info">
+        <div class="label">Active session</div>
+        <div class="session-name" *ngIf="activeSession; else noSession">
+          {{ activeSession.session_name }}
+        </div>
+        <ng-template #noSession>
+          <div class="session-name muted">No session — trades use global bucket</div>
+        </ng-template>
+      </div>
+
+      <div class="session-stats" *ngIf="activeSession">
+        <div class="stat">
+          <div class="stat-label">Starting</div>
+          <div class="stat-value">&#8377;{{ activeSession.starting_capital | number:'1.0-0' }}</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">P&amp;L</div>
+          <div class="stat-value" [ngClass]="pnlClass(runningPnl)">
+            {{ runningPnl >= 0 ? '+' : '' }}&#8377;{{ runningPnl | number:'1.0-2' }}
+          </div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Current</div>
+          <div class="stat-value">&#8377;{{ runningCapital | number:'1.0-2' }}</div>
+        </div>
+        <div class="stat" *ngIf="activeSession.summary">
+          <div class="stat-label">Trades</div>
+          <div class="stat-value">
+            {{ activeSession.summary.open_trades }}/{{ activeSession.summary.total_trades }}
+          </div>
+        </div>
+      </div>
+
+      <div class="session-actions">
+        <button class="btn btn-primary" (click)="openNewDialog()">New Session</button>
+        <button class="btn btn-ghost" *ngIf="activeSession" (click)="closeCurrent()">Close</button>
+        <button class="btn btn-ghost" *ngIf="variant === 'full'" (click)="showHistory = !showHistory">
+          {{ showHistory ? 'Hide' : 'History' }}
+        </button>
+      </div>
+    </div>
+
+    <div class="session-history" *ngIf="variant === 'full' && showHistory">
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Status</th>
+            <th>Started</th>
+            <th>Starting</th>
+            <th>P&amp;L</th>
+            <th>Trades</th>
+            <th>Wins / Losses</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let s of sessions; trackBy: trackById" [class.active-row]="s.status === 'ACTIVE'">
+            <td>{{ s.session_name }}</td>
+            <td><span class="status" [class.status-active]="s.status === 'ACTIVE'">{{ s.status }}</span></td>
+            <td>{{ s.created_at }}</td>
+            <td>&#8377;{{ s.starting_capital | number:'1.0-0' }}</td>
+            <td [ngClass]="pnlClass(s.summary?.total_pnl ?? s.total_pnl)">
+              <ng-container *ngIf="(s.summary?.total_pnl ?? s.total_pnl) !== null && (s.summary?.total_pnl ?? s.total_pnl) !== undefined; else dash">
+                &#8377;{{ (s.summary?.total_pnl ?? s.total_pnl) | number:'1.0-2' }}
+              </ng-container>
+              <ng-template #dash>—</ng-template>
+            </td>
+            <td>{{ s.summary?.total_trades ?? s.total_trades ?? 0 }}</td>
+            <td>{{ s.summary?.win_count ?? s.win_count ?? 0 }} / {{ s.summary?.loss_count ?? s.loss_count ?? 0 }}</td>
+          </tr>
+          <tr *ngIf="sessions.length === 0">
+            <td colspan="7" class="empty">No sessions yet.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="modal-overlay" *ngIf="showDialog" (click)="cancelNew()">
+    <div class="modal-card glass-card" (click)="$event.stopPropagation()">
+      <h3>Start a new trading session</h3>
+      <p class="warn" *ngIf="activeSession">
+        This will close the active session <strong>{{ activeSession.session_name }}</strong> and square off any open paper trades.
+      </p>
+
+      <label>
+        <span>Session name</span>
+        <input type="text" [(ngModel)]="newName" placeholder="e.g. Momentum test — Apr 23" />
+      </label>
+
+      <label>
+        <span>Starting capital (&#8377;)</span>
+        <input type="number" [(ngModel)]="newCapital" min="1" />
+      </label>
+
+      <label>
+        <span>Notes (optional)</span>
+        <textarea [(ngModel)]="newNotes" rows="2"></textarea>
+      </label>
+
+      <div class="modal-actions">
+        <button class="btn btn-ghost" (click)="cancelNew()" [disabled]="creating">Cancel</button>
+        <button class="btn btn-primary" (click)="confirmNew()" [disabled]="creating">
+          {{ creating ? 'Starting…' : 'Start session' }}
+        </button>
+      </div>
+    </div>
+  </div>
+</div>

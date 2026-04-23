@@ -79,6 +79,11 @@ class PaperTrade(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     trade_ref = Column(String(25), unique=True, nullable=True)
+    # Optional FK-style pointer to ``trading_sessions.id`` so paper P&L,
+    # exposure, and daily-trade counts can be scoped to a single "run".
+    # Nullable to keep historical rows queryable (they share the global /
+    # legacy bucket).
+    session_id = Column(Integer, nullable=True, index=True)
     symbol = Column(String(100), nullable=False, index=True)
     display_symbol = Column(String(30), nullable=True)
     instrument_type = Column(String(20), default="EQUITY")
@@ -288,6 +293,36 @@ class TradeAuditLog(Base):
     # Renamed from `metadata` because SQLAlchemy's DeclarativeBase reserves
     # that attribute name on Base subclasses.
     extra_metadata = Column(JSON, nullable=True)
+    # Populated for session-scoped events (SESSION_STARTED, SESSION_CLOSED,
+    # plus any trade-level events placed while an ACTIVE session exists).
+    # Nullable so rows predating the session feature stay queryable.
+    session_id = Column(Integer, nullable=True, index=True)
+
+
+class TradingSession(Base):
+    """A single paper-trading "run" — a named bucket of capital + trades.
+
+    Starting a new session closes any ACTIVE session (squaring off open
+    paper trades in the closing session) and resets the auto-trade engine's
+    daily counters so the new session starts from a clean slate. Paper
+    trades, P&L, exposure, and daily-trade counts are scoped to the
+    currently-ACTIVE session via ``PaperTrade.session_id``.
+    """
+
+    __tablename__ = "trading_sessions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_name = Column(String(100), nullable=False)
+    starting_capital = Column(Float, nullable=False, default=100000.0)
+    status = Column(String(20), default="ACTIVE")  # ACTIVE, CLOSED
+    created_at = Column(DateTime, default=datetime.utcnow)
+    closed_at = Column(DateTime, nullable=True)
+    closing_capital = Column(Float, nullable=True)
+    total_pnl = Column(Float, nullable=True)
+    total_trades = Column(Integer, nullable=True)
+    win_count = Column(Integer, nullable=True)
+    loss_count = Column(Integer, nullable=True)
+    notes = Column(Text, nullable=True)
 
 
 class TradingDaySnapshot(Base):

@@ -11,6 +11,17 @@
       <label class="date-label">To:</label>
       <input type="date" [(ngModel)]="dateTo" (change)="loadAnalytics()" class="date-input" />
     </div>
+    <div class="date-filter" *ngIf="activeTab === 'paper'">
+      <label class="date-label">Session:</label>
+      <select [(ngModel)]="filterSession" (change)="onSessionFilterChange()" class="date-input">
+        <option value="ACTIVE">Active</option>
+        <option value="ALL">All (lifetime)</option>
+        <option [ngValue]="-1">Legacy / pre-session</option>
+        <option *ngFor="let s of sessions" [ngValue]="s.id">
+          {{ s.session_name }}{{ s.status === 'ACTIVE' ? ' (active)' : '' }}
+        </option>
+      </select>
+    </div>
     <button class="btn-refresh" (click)="loadAnalytics()">Refresh</button>
   </div>
 

@@ -7,11 +7,12 @@ import { Subscription } from 'rxjs';
 import { ApiService } from '../../services/api.service';
 import { StateService } from '../../services/state.service';
 import { SseService } from '../../services/sse.service';
+import { SessionManagerComponent } from '../../components/session-manager/session-manager.component';
 
 @Component({
   selector: 'app-dashboard',
   standalone: true,
-  imports: [CommonModule, FormsModule, RouterLink],
+  imports: [CommonModule, FormsModule, RouterLink, SessionManagerComponent],
   templateUrl: './dashboard.component.html',
   styleUrl: './dashboard.component.scss'
 })
