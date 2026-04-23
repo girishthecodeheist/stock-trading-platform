@@ -1,7 +1,9 @@
 import { Component, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { HttpClient, HttpParams } from '@angular/common/http';
 import { ApiService } from '../../services/api.service';
+import { environment } from '../../../environments/environment';
 
 @Component({
   selector: 'app-trades',
@@ -16,17 +18,48 @@ export class TradesComponent implements OnInit {
   allTrades: any[] = [];
   filterMode: string = 'ALL';
   filterStatus: string = 'ALL';
+  sessions: any[] = [];
+  activeSessionId: number | null = null;
+  // 'ACTIVE' → active session, 'ALL' → lifetime across sessions, -1 → legacy/unscoped, or a session id number.
+  filterSession: 'ACTIVE' | 'ALL' | number = 'ACTIVE';
   loading = true;
 
-  constructor(private api: ApiService) {}
+  constructor(private api: ApiService, private http: HttpClient) {}
 
-  ngOnInit() { this.loadTrades(); }
+  ngOnInit() {
+    this.api.getSessions().subscribe({
+      next: (rows) => {
+        this.sessions = rows || [];
+        const active = this.sessions.find((s: any) => s.status === 'ACTIVE');
+        this.activeSessionId = active ? active.id : null;
+        this.loadTrades();
+      },
+      error: () => { this.loadTrades(); }
+    });
+  }
+
+  onSessionFilterChange() { this.loadTrades(); }
+
+  private paperParams(): HttpParams {
+    let params = new HttpParams();
+    if (this.filterSession === 'ALL') {
+      params = params.set('include_all', 'true');
+    } else if (this.filterSession === 'ACTIVE') {
+      if (this.activeSessionId != null) {
+        params = params.set('session_id', String(this.activeSessionId));
+      }
+    } else if (typeof this.filterSession === 'number') {
+      params = params.set('session_id', String(this.filterSession));
+    }
+    return params;
+  }
 
   loadTrades() {
     this.loading = true;
     let done = 0;
     const checkDone = () => { done++; if (done >= 2) this.loading = false; };
-    this.api.getPaperTrades().subscribe({
+
+    this.http.get<any[]>(`${environment.apiUrl}/api/paper-trades`, { params: this.paperParams() }).subscribe({
       next: (res) => {
         this.paperTrades = (res || []).map((t: any) => ({ ...t, _mode: 'PAPER' }));
         this.mergeAndFilter();

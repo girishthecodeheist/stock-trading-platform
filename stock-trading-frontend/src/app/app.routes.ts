@@ -10,6 +10,7 @@ export const routes: Routes = [
   { path: 'analytics', loadComponent: () => import('./pages/analytics/analytics.component').then(m => m.AnalyticsComponent) },
   { path: 'settings', loadComponent: () => import('./pages/settings/settings.component').then(m => m.SettingsComponent) },
   { path: 'trade-journal', loadComponent: () => import('./pages/trade-journal/trade-journal.component').then(m => m.TradeJournalComponent) },
+  { path: 'news', loadComponent: () => import('./pages/news/news.component').then(m => m.NewsComponent) },
   { path: 'paper-trading', redirectTo: 'trades', pathMatch: 'full' },
   { path: '**', redirectTo: 'dashboard' },
 ];

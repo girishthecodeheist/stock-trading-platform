@@ -12,6 +12,7 @@ from app.database import init_db, async_session_factory
 from app.routers import instruments, candles, signals, paper_trading, fyers, analysis
 from app.routers import heatmap, trade_mode, settings, funds, limits, live_trades, scanner
 from app.routers import audit as audit_router
+from app.routers import news, sessions
 from app import fyers_client
 from app import auto_trade_engine
 
@@ -87,9 +88,52 @@ async def ensure_columns():
         ("paper_trades", "stamp_duty", "ALTER TABLE paper_trades ADD COLUMN stamp_duty FLOAT DEFAULT 0"),
         ("paper_trades", "gross_pnl", "ALTER TABLE paper_trades ADD COLUMN gross_pnl FLOAT"),
         ("paper_trades", "net_pnl", "ALTER TABLE paper_trades ADD COLUMN net_pnl FLOAT"),
+        # Per-session paper-trading scope. ``paper_trades.session_id`` points at
+        # ``trading_sessions.id``; ``trade_audit_log.session_id`` tags audit
+        # rows (SESSION_STARTED, SESSION_CLOSED, plus trade events placed
+        # while a session is active).
+        ("paper_trades", "session_id", "ALTER TABLE paper_trades ADD COLUMN session_id INTEGER"),
+        ("trade_audit_log", "session_id", "ALTER TABLE trade_audit_log ADD COLUMN session_id INTEGER"),
+    ]
+
+    # Indexed standalone DDL for the session-scope columns so filter-by-session
+    # queries on paper_trades / trade_audit_log don't table-scan once a user
+    # has accumulated many sessions.
+    session_indexes = [
+        ("paper_trades", "ix_paper_trades_session_id",
+         "CREATE INDEX IF NOT EXISTS ix_paper_trades_session_id ON paper_trades(session_id)"),
+        ("trade_audit_log", "ix_trade_audit_log_session_id",
+         "CREATE INDEX IF NOT EXISTS ix_trade_audit_log_session_id ON trade_audit_log(session_id)"),
     ]
 
     async with async_session_factory() as db:
+        # Create the trading_sessions table on first boot. ``create_all`` via
+        # init_db() already does this, but we re-run it here so older
+        # deployments pick it up without a manual migration.
+        try:
+            await db.execute(text(
+                """
+                CREATE TABLE IF NOT EXISTS trading_sessions (
+                    id SERIAL PRIMARY KEY,
+                    session_name VARCHAR(100) NOT NULL,
+                    starting_capital FLOAT NOT NULL DEFAULT 100000.0,
+                    status VARCHAR(20) DEFAULT 'ACTIVE',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    closed_at TIMESTAMP,
+                    closing_capital FLOAT,
+                    total_pnl FLOAT,
+                    total_trades INTEGER,
+                    win_count INTEGER,
+                    loss_count INTEGER,
+                    notes TEXT
+                )
+                """
+            ))
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            logger.warning(f"Migration skip (trading_sessions table): {e}")
+
         for table, column, ddl in migrations:
             try:
                 check = text("""
@@ -104,6 +148,14 @@ async def ensure_columns():
             except Exception as e:
                 await db.rollback()
                 logger.warning(f"Migration skip {table}.{column}: {e}")
+
+        for table, index, ddl in session_indexes:
+            try:
+                await db.execute(text(ddl))
+                await db.commit()
+            except Exception as e:
+                await db.rollback()
+                logger.warning(f"Migration skip index {table}.{index}: {e}")
 
         # Truly-one-time: users who were seeded with the original conservative
         # profit floor (net \u2265 \u20b9100, gross \u2265 2\u00d7 charges) were finding the
@@ -328,6 +380,8 @@ app.include_router(limits.router)
 app.include_router(live_trades.router)
 app.include_router(scanner.router)
 app.include_router(audit_router.router)
+app.include_router(news.router)
+app.include_router(sessions.router)
 
 
 @app.get("/healthz")

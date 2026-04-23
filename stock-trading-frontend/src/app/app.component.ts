@@ -58,6 +58,10 @@ import { ToastComponent } from './components/toast/toast.component';
             <span class="nav-icon">&#x1F4DD;</span>
             <span class="nav-label">Journal</span>
           </a>
+          <a routerLink="/news" routerLinkActive="active" class="nav-item">
+            <span class="nav-icon">&#x1F4F0;</span>
+            <span class="nav-label">News</span>
+          </a>
           <a routerLink="/settings" routerLinkActive="active" class="nav-item">
             <span class="nav-icon">&#x2699;</span>
             <span class="nav-label">Settings</span>

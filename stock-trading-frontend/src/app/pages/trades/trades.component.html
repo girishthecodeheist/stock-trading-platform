@@ -23,6 +23,17 @@
         <option value="CLOSED">Closed</option>
       </select>
     </div>
+    <div class="filter-group">
+      <label>Session:</label>
+      <select [(ngModel)]="filterSession" (change)="onSessionFilterChange()">
+        <option value="ACTIVE">Active session</option>
+        <option value="ALL">All sessions (lifetime)</option>
+        <option [ngValue]="-1">Legacy / pre-session</option>
+        <option *ngFor="let s of sessions" [ngValue]="s.id">
+          {{ s.session_name }}{{ s.status === 'ACTIVE' ? ' (active)' : '' }}
+        </option>
+      </select>
+    </div>
     <div class="trade-summary">Total: {{ allTrades.length }} trades</div>
   </div>
   <div class="glass-card">

@@ -24,9 +24,23 @@ _combined_funds_cache: dict = {"data": None, "timestamp": 0.0}
 COMBINED_FUNDS_CACHE_TTL = 5  # seconds
 
 
+async def _active_session_scope(db: AsyncSession) -> tuple:
+    """Return (session_id, sql_fragment, bind_params) for the active session."""
+    try:
+        row = (await db.execute(text(
+            "SELECT id FROM trading_sessions WHERE status = 'ACTIVE' ORDER BY created_at DESC LIMIT 1"
+        ))).scalar()
+        session_id = int(row) if row else None
+    except Exception:
+        session_id = None
+    if session_id is None:
+        return session_id, "session_id IS NULL", {}
+    return session_id, "session_id = :active_session_id", {"active_session_id": session_id}
+
+
 @router.get("/paper")
 async def get_paper_funds(db: AsyncSession = Depends(get_db)):
-    """Get paper (simulated) fund summary."""
+    """Get paper (simulated) fund summary — scoped to the active session."""
     settings_result = await db.execute(text("SELECT * FROM trading_settings WHERE id=1"))
     settings = settings_result.mappings().first()
     if not settings:
@@ -35,12 +49,14 @@ async def get_paper_funds(db: AsyncSession = Depends(get_db)):
     capital = float(settings["simulated_capital"])
     today = datetime.now(IST).date()
 
+    _sid, scope_sql, scope_params = await _active_session_scope(db)
+
     # Open trades exposure
-    open_result = await db.execute(text("""
+    open_result = await db.execute(text(f"""
         SELECT COALESCE(SUM(entry_price * quantity), 0) as exposure,
                COUNT(*) as open_count
-        FROM paper_trades WHERE status = 'OPEN'
-    """))
+        FROM paper_trades WHERE status = 'OPEN' AND {scope_sql}
+    """), scope_params)
     open_row = open_result.mappings().first()
     open_exposure = float(open_row["exposure"]) if open_row else 0
     open_count = int(open_row["open_count"]) if open_row else 0
@@ -48,29 +64,30 @@ async def get_paper_funds(db: AsyncSession = Depends(get_db)):
     # Realized P&L — both gross (legacy ``pnl_amount``) and net after the
     # Fyers charge breakdown (F3). Old rows with NULL net_pnl fall back to
     # pnl_amount so total_pnl remains meaningful on historical data.
-    total_pnl_result = await db.execute(text("""
+    total_pnl_result = await db.execute(text(f"""
         SELECT COALESCE(SUM(pnl_amount), 0)                    AS total_gross,
                COALESCE(SUM(COALESCE(net_pnl, pnl_amount)), 0) AS total_net,
                COALESCE(SUM(COALESCE(brokerage, 0) + COALESCE(stt, 0) +
                             COALESCE(exchange_charges, 0) + COALESCE(gst, 0) +
                             COALESCE(sebi_charges, 0) + COALESCE(stamp_duty, 0)), 0) AS total_charges
-        FROM paper_trades WHERE status != 'OPEN'
-    """))
+        FROM paper_trades WHERE status != 'OPEN' AND {scope_sql}
+    """), scope_params)
     tot = total_pnl_result.mappings().first()
     total_pnl = float(tot["total_gross"] or 0) if tot else 0
     total_net_pnl = float(tot["total_net"] or 0) if tot else 0
     total_brokerage = float(tot["total_charges"] or 0) if tot else 0
 
     # Today's realized P&L (gross + net + today's charges)
-    today_pnl_result = await db.execute(text("""
+    today_params = {**scope_params, "today": today}
+    today_pnl_result = await db.execute(text(f"""
         SELECT COALESCE(SUM(pnl_amount), 0)                    AS today_gross,
                COALESCE(SUM(COALESCE(net_pnl, pnl_amount)), 0) AS today_net,
                COALESCE(SUM(COALESCE(brokerage, 0) + COALESCE(stt, 0) +
                             COALESCE(exchange_charges, 0) + COALESCE(gst, 0) +
                             COALESCE(sebi_charges, 0) + COALESCE(stamp_duty, 0)), 0) AS today_charges
         FROM paper_trades
-        WHERE status != 'OPEN' AND DATE(exit_time) = :today
-    """), {"today": today})
+        WHERE status != 'OPEN' AND DATE(exit_time) = :today AND {scope_sql}
+    """), today_params)
     td = today_pnl_result.mappings().first()
     today_pnl = float(td["today_gross"] or 0) if td else 0
     today_net_pnl = float(td["today_net"] or 0) if td else 0
