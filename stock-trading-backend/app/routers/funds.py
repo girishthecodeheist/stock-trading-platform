@@ -83,7 +83,7 @@ async def get_paper_funds(db: AsyncSession = Depends(get_db)):
         "success": True,
         "mode": "PAPER",
         "simulated_capital": capital,
-        "available_margin": round(capital + total_net_pnl - open_exposure, 2),
+        "available_margin": round(min(capital + total_net_pnl - open_exposure, capital), 2),
         "open_exposure": round(open_exposure, 2),
         "open_trade_count": open_count,
         "total_realized_pnl": round(total_pnl, 2),
