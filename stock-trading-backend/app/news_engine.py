@@ -4,6 +4,7 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Any, Dict, List
+from urllib.parse import quote_plus
 
 from app import fyers_client
 
@@ -121,8 +122,14 @@ async def _fetch_yfinance_news(symbol: str) -> List[Dict[str, str]]:
 
 
 async def _fetch_google_news_rss(symbol: str, limit: int = 15) -> List[Dict[str, str]]:
-    """Fallback: parse Google News RSS for NSE-tagged stories on ``symbol``."""
-    url = f"https://news.google.com/rss/search?q={symbol}+NSE&hl=en-IN&gl=IN"
+    """Fallback: parse Google News RSS for NSE-tagged stories on ``symbol``.
+
+    ``symbol`` is URL-encoded so real Indian tickers like ``M&M`` / ``L&T``
+    (which contain `&`) and cleaned names with spaces (e.g. ``TATA MOTORS``)
+    don't break the ``q=`` query parameter.
+    """
+    query = f"{quote_plus(symbol)}+NSE"
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN"
 
     def _parse():
         try:
