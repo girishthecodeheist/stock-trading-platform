@@ -144,7 +144,7 @@
       </div>
       <div class="setting-row">
         <label for="productType">Order Product Type</label>
-        <select id="productType" [(ngModel)]="settings.product_type" aria-label="Live order product type">
+        <select id="productType" [(ngModel)]="settings.product_type" aria-label="Order product type (Paper + Live)">
           <option value="INTRADAY">INTRADAY (MIS &mdash; 5&times; leverage)</option>
           <option value="CNC">CNC (Delivery &mdash; full cash)</option>
         </select>
@@ -152,7 +152,9 @@
           INTRADAY uses MIS leverage but Fyers auto-squares-off at 15:15 IST and
           rejects new MIS orders after that cutoff. CNC can be placed any time
           during market hours (9:15&ndash;15:30 IST), but requires full cash and
-          holds positions overnight. Applies to live orders only.
+          holds positions overnight. Applies to both Paper and Live trades &mdash;
+          Paper trades mirror the same MIS/CNC charges and leverage sizing so
+          the simulated P&amp;L matches what Live would produce.
         </small>
       </div>
     </div>
